@@ -1,0 +1,93 @@
+version: '3'
+
+services:
+  meta_simulator:
+    build:
+      context: .
+      dockerfile: meta_simulator/Dockerfile
+    ports:
+      - "5000:5000"
+    restart: unless-stopped
+    networks:
+      - cloudsim_network
+    volumes:
+      - ./meta_simulator:/app/meta_simulator
+      - ./protos:/app/protos
+
+  simulator_adaptor:
+    build:
+      context: .
+      dockerfile: simulator_adaptor/Dockerfile
+    depends_on:
+      - meta_simulator
+    restart: unless-stopped
+    networks:
+      - cloudsim_network
+      - ros_network
+    environment:
+      - ROS_DOMAIN_ID=1
+      - META_SIMULATOR_URL=http://meta_simulator:5000
+      - ADAPTOR_ID=simulator_adaptor_1
+      - PYTHONPATH=/app
+    volumes:
+      - ./simulator_adaptor:/app/simulator_adaptor
+      - ./protos:/app/protos
+
+  algorithm_adaptor:
+    build:
+      context: .
+      dockerfile: algorithm_adaptor/Dockerfile
+    depends_on:
+      - meta_simulator
+    restart: unless-stopped
+    networks:
+      - cloudsim_network
+      - ros_network
+    environment:
+      - ROS_DOMAIN_ID=1  # Same domain to allow discovery
+      - META_SIMULATOR_URL=http://meta_simulator:5000
+      - ADAPTOR_ID=algorithm_adaptor_1
+      - PYTHONPATH=/app
+    volumes:
+      - ./algorithm_adaptor:/app/algorithm_adaptor
+      - ./protos:/app/protos
+
+  network_simulator_adaptor:
+    build:
+      context: .
+      dockerfile: network_simulator_adaptor/Dockerfile
+    depends_on:
+      - meta_simulator
+    restart: unless-stopped
+    networks:
+      - cloudsim_network
+    environment:
+      - META_SIMULATOR_URL=http://meta_simulator:5000
+      - ADAPTOR_ID=network_simulator_adaptor
+      - NETWORK_SIMULATOR_TYPE=simple
+      - PYTHONPATH=/app
+    volumes:
+      - ./network_simulator_adaptor:/app/network_simulator_adaptor
+      - ./protos:/app/protos
+
+  # Example simulator for testing
+  example_simulator:
+    build:
+      context: .
+      dockerfile: simulator_adaptor/Dockerfile  # Reuse the ROS image
+    networks:
+      - ros_network
+    environment:
+      - ROS_DOMAIN_ID=1  # Same domain to allow discovery
+    volumes:
+      - ./example_simulator:/app/example_simulator
+    command: ["python3", "/app/example_simulator/setup_test_topics.py"]
+    depends_on:
+      - simulator_adaptor
+      - algorithm_adaptor
+
+networks:
+  cloudsim_network:
+    driver: bridge
+  ros_network:
+    driver: bridge 
