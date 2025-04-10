@@ -50,10 +50,10 @@ class AlgorithmAdaptor(Node):
         self.running = True
         self.timing_data = {}  # message_id -> start_time
         
-        # Track subscriptions and publishers
-        self.subscriptions = {}  # topic_name -> subscription
-        self.publishers = {}     # topic_name -> publisher
-        self.msg_types = {}      # topic_name -> message_type
+        # Track subscriptions and publishers - fix naming conflict
+        self._topic_subscriptions = {}  # topic_name -> subscription
+        self._topic_publishers = {}     # topic_name -> publisher
+        self._topic_msg_types = {}      # topic_name -> message_type
         
         # Start topic discovery and create initial subscriptions
         self.discover_timer = self.create_timer(self.topic_discovery_interval, self.discover_topics)
@@ -101,9 +101,9 @@ class AlgorithmAdaptor(Node):
                     
                 msg_type_str = topic_types[0]  # Use the first type
                 
-                if topic_name not in self.subscriptions and topic_name not in self.publishers:
+                if topic_name not in self._topic_subscriptions and topic_name not in self._topic_publishers:
                     # Determine if this is an input or output topic
-                    if topic_name.endswith('/out') or topic_name.endswith('/response'):
+                    if topic_name.endswith('/out') or topic_name.endswith('/response') or topic_name.endswith('/output'):
                         # This is likely an output topic, create a subscription
                         self.create_topic_subscription(topic_name, msg_type_str)
                     else:
@@ -147,13 +147,13 @@ class AlgorithmAdaptor(Node):
             logger.info(f"Creating subscription for {topic_name} with type {msg_type.__name__}")
             
             # Create the subscription
-            self.subscriptions[topic_name] = self.create_subscription(
+            self._topic_subscriptions[topic_name] = self.create_subscription(
                 msg_type,
                 topic_name,
                 lambda msg, tn=topic_name: self.handle_algorithm_output(msg, tn),
                 10
             )
-            self.msg_types[topic_name] = msg_type
+            self._topic_msg_types[topic_name] = msg_type
             
         except Exception as e:
             logger.error(f"Failed to create subscription for {topic_name}: {e}")
@@ -170,12 +170,12 @@ class AlgorithmAdaptor(Node):
             logger.info(f"Creating publisher for {topic_name} with type {msg_type.__name__}")
             
             # Create the publisher
-            self.publishers[topic_name] = self.create_publisher(
+            self._topic_publishers[topic_name] = self.create_publisher(
                 msg_type,
                 topic_name,
                 10
             )
-            self.msg_types[topic_name] = msg_type
+            self._topic_msg_types[topic_name] = msg_type
             
         except Exception as e:
             logger.error(f"Failed to create publisher for {topic_name}: {e}")
@@ -234,7 +234,7 @@ class AlgorithmAdaptor(Node):
             
             # Find an appropriate publisher
             target_topic = None
-            for topic in self.publishers.keys():
+            for topic in self._topic_publishers.keys():
                 # Try to find a topic that might match the state
                 if 'state' in topic.lower() or 'input' in topic.lower():
                     target_topic = topic
@@ -242,8 +242,8 @@ class AlgorithmAdaptor(Node):
             
             if not target_topic:
                 # Just use the first available publisher if no match
-                if self.publishers:
-                    target_topic = next(iter(self.publishers.keys()))
+                if self._topic_publishers:
+                    target_topic = next(iter(self._topic_publishers.keys()))
                 else:
                     logger.error("No publishers available to forward state")
                     return
@@ -251,7 +251,7 @@ class AlgorithmAdaptor(Node):
             logger.info(f"Forwarding state to algorithm topic: {target_topic}")
             
             # Create message instance
-            msg_type = self.msg_types[target_topic]
+            msg_type = self._topic_msg_types[target_topic]
             ros_msg = msg_type()
             
             # Start timing for latency measurement
@@ -286,7 +286,7 @@ class AlgorithmAdaptor(Node):
                             ros_msg.data = state_data
             
             # Publish message to algorithm
-            self.publishers[target_topic].publish(ros_msg)
+            self._topic_publishers[target_topic].publish(ros_msg)
             
         except Exception as e:
             logger.error(f"Error forwarding state to algorithm: {str(e)}")

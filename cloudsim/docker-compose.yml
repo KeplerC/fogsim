@@ -23,9 +23,9 @@ services:
     restart: unless-stopped
     networks:
       - cloudsim_network
-      - ros_network
+      - simulator_ros_network
     environment:
-      - ROS_DOMAIN_ID=1
+      - ROS_DOMAIN_ID=1  # Simulator domain
       - META_SIMULATOR_URL=http://meta_simulator:5000
       - ADAPTOR_ID=simulator_adaptor_1
       - PYTHONPATH=/app
@@ -42,9 +42,9 @@ services:
     restart: unless-stopped
     networks:
       - cloudsim_network
-      - ros_network
+      - algorithm_ros_network
     environment:
-      - ROS_DOMAIN_ID=1  # Same domain to allow discovery
+      - ROS_DOMAIN_ID=2  # Algorithm domain
       - META_SIMULATOR_URL=http://meta_simulator:5000
       - ADAPTOR_ID=algorithm_adaptor_1
       - PYTHONPATH=/app
@@ -76,18 +76,34 @@ services:
       context: .
       dockerfile: simulator_adaptor/Dockerfile  # Reuse the ROS image
     networks:
-      - ros_network
+      - simulator_ros_network
     environment:
-      - ROS_DOMAIN_ID=1  # Same domain to allow discovery
+      - ROS_DOMAIN_ID=1  # Same domain as simulator_adaptor
     volumes:
       - ./example_simulator:/app/example_simulator
     command: ["python3", "/app/example_simulator/setup_test_topics.py"]
     depends_on:
       - simulator_adaptor
+
+  # Example algorithm for testing
+  example_algorithm:
+    build:
+      context: .
+      dockerfile: algorithm_adaptor/Dockerfile  # Reuse the ROS image
+    networks:
+      - algorithm_ros_network
+    environment:
+      - ROS_DOMAIN_ID=2  # Same domain as algorithm_adaptor
+    volumes:
+      - ./example_simulator:/app/example_simulator  # Reuse the same script for simplicity
+    command: ["python3", "/app/example_simulator/setup_test_topics.py"]
+    depends_on:
       - algorithm_adaptor
 
 networks:
   cloudsim_network:
     driver: bridge
-  ros_network:
+  simulator_ros_network:
+    driver: bridge
+  algorithm_ros_network:
     driver: bridge 

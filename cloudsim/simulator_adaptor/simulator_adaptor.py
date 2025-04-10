@@ -51,10 +51,10 @@ class SimulatorAdaptor(Node):
         self.last_poll_time = 0
         self.running = True
         
-        # Track subscriptions and publishers
-        self.subscriptions = {}  # topic_name -> subscription
-        self.publishers = {}     # topic_name -> publisher
-        self.msg_types = {}      # topic_name -> message_type
+        # Track subscriptions and publishers - fix naming conflict
+        self._topic_subscriptions = {}  # topic_name -> subscription
+        self._topic_publishers = {}     # topic_name -> publisher
+        self._topic_msg_types = {}      # topic_name -> message_type
         
         # Start topic discovery and create initial subscriptions
         self.discover_timer = self.create_timer(self.topic_discovery_interval, self.discover_topics)
@@ -102,7 +102,7 @@ class SimulatorAdaptor(Node):
                     
                 msg_type_str = topic_types[0]  # Use the first type
                 
-                if topic_name not in self.subscriptions and topic_name not in self.publishers:
+                if topic_name not in self._topic_subscriptions and topic_name not in self._topic_publishers:
                     # Determine if this is an input or output topic
                     if topic_name.endswith('/in') or topic_name.endswith('/cmd'):
                         # This is likely an input topic, create a publisher
@@ -148,13 +148,13 @@ class SimulatorAdaptor(Node):
             logger.info(f"Creating subscription for {topic_name} with type {msg_type.__name__}")
             
             # Create the subscription
-            self.subscriptions[topic_name] = self.create_subscription(
+            self._topic_subscriptions[topic_name] = self.create_subscription(
                 msg_type,
                 topic_name,
                 lambda msg, tn=topic_name: self.handle_simulator_message(msg, tn),
                 10
             )
-            self.msg_types[topic_name] = msg_type
+            self._topic_msg_types[topic_name] = msg_type
             
         except Exception as e:
             logger.error(f"Failed to create subscription for {topic_name}: {e}")
@@ -171,12 +171,12 @@ class SimulatorAdaptor(Node):
             logger.info(f"Creating publisher for {topic_name} with type {msg_type.__name__}")
             
             # Create the publisher
-            self.publishers[topic_name] = self.create_publisher(
+            self._topic_publishers[topic_name] = self.create_publisher(
                 msg_type,
                 topic_name,
                 10
             )
-            self.msg_types[topic_name] = msg_type
+            self._topic_msg_types[topic_name] = msg_type
             
         except Exception as e:
             logger.error(f"Failed to create publisher for {topic_name}: {e}")
@@ -224,6 +224,9 @@ class SimulatorAdaptor(Node):
         if 'algorithm_command' in message:
             # Forward command to simulator
             self.forward_command_to_simulator(message)
+        elif 'algorithm_response' in message:
+            # Forward response to simulator
+            self.forward_response_to_simulator(message)
         
         # Add other message types as needed
     
@@ -235,15 +238,15 @@ class SimulatorAdaptor(Node):
             
             # Find an appropriate publisher based on command type
             target_topic = None
-            for topic in self.publishers.keys():
+            for topic in self._topic_publishers.keys():
                 if command_type.lower() in topic.lower():
                     target_topic = topic
                     break
             
             if not target_topic:
                 # Just use the first available publisher if no match
-                if self.publishers:
-                    target_topic = next(iter(self.publishers.keys()))
+                if self._topic_publishers:
+                    target_topic = next(iter(self._topic_publishers.keys()))
                 else:
                     logger.error("No publishers available to forward command")
                     return
@@ -251,7 +254,7 @@ class SimulatorAdaptor(Node):
             logger.info(f"Forwarding command to simulator topic: {target_topic}")
             
             # Create message instance
-            msg_type = self.msg_types[target_topic]
+            msg_type = self._topic_msg_types[target_topic]
             ros_msg = msg_type()
             
             # Try to populate message fields from command data
@@ -262,10 +265,63 @@ class SimulatorAdaptor(Node):
                 ros_msg.data = command_data.get('command_data', b'')
             
             # Publish message
-            self.publishers[target_topic].publish(ros_msg)
+            self._topic_publishers[target_topic].publish(ros_msg)
             
         except Exception as e:
             logger.error(f"Error forwarding command to simulator: {str(e)}")
+    
+    def forward_response_to_simulator(self, message):
+        """Forward response to the appropriate simulator topic"""
+        try:
+            response_data = message.get('algorithm_response', {})
+            
+            # Find an appropriate publisher
+            target_topic = None
+            for topic in self._topic_publishers.keys():
+                if 'response' in topic.lower() or 'feedback' in topic.lower():
+                    target_topic = topic
+                    break
+            
+            if not target_topic:
+                # Just use the first available publisher if no match
+                if self._topic_publishers:
+                    target_topic = next(iter(self._topic_publishers.keys()))
+                else:
+                    logger.error("No publishers available to forward response")
+                    return
+            
+            logger.info(f"Forwarding response to simulator topic: {target_topic}")
+            
+            # Create message instance
+            msg_type = self._topic_msg_types[target_topic]
+            ros_msg = msg_type()
+            
+            # Try to populate message fields from response data
+            response_bytes = response_data.get('response_data', b'')
+            if isinstance(response_bytes, bytes):
+                try:
+                    # Try to convert bytes to dict
+                    response_dict = json.loads(response_bytes.decode('utf-8'))
+                    
+                    # Try to set message fields from dict
+                    if hasattr(ros_msg, 'data'):
+                        if isinstance(ros_msg.data, str):
+                            ros_msg.data = json.dumps(response_dict)
+                        elif isinstance(ros_msg.data, bytes):
+                            ros_msg.data = response_bytes
+                except Exception as e:
+                    logger.error(f"Failed to parse response data: {e}")
+                    if hasattr(ros_msg, 'data'):
+                        if isinstance(ros_msg.data, str):
+                            ros_msg.data = str(response_bytes)
+                        elif isinstance(ros_msg.data, bytes):
+                            ros_msg.data = response_bytes
+            
+            # Publish message
+            self._topic_publishers[target_topic].publish(ros_msg)
+            
+        except Exception as e:
+            logger.error(f"Error forwarding response to simulator: {str(e)}")
     
     def handle_simulator_message(self, msg, topic_name):
         """Handle message from simulator"""
