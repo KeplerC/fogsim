@@ -65,8 +65,15 @@ class GymCoSimulator(BaseCoSimulator):
     
     def render(self, mode: str = 'human') -> None:
         """Render the current state of the simulation."""
-        # self.robotics_simulator.render(mode=mode)
-        pass
+        try:
+            # New Gymnasium API (may not accept mode parameter)
+            self.robotics_simulator.render()
+        except TypeError:
+            try:
+                # Old Gym API (requires mode parameter)
+                self.robotics_simulator.render(mode=mode)
+            except Exception as e:
+                print(f"Render failed: {e}")
     
     def _handle_message(self, message: Any) -> None:
         """

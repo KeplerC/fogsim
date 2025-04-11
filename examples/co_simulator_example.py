@@ -27,7 +27,7 @@ def run_gym_example():
     network_sim = NS3NetworkSimulator()
     
     # Create Gym environment
-    env = gym.make('CartPole-v1')
+    env = gym.make('CartPole-v1', render_mode="human")
     
     # Create co-simulator
     co_sim = GymCoSimulator(network_sim, env)
