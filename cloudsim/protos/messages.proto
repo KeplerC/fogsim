@@ -6,6 +6,9 @@ service MetaSimulator {
   // Polling for both Environment Adaptor and Algorithm Adaptor
   rpc Poll(PollRequest) returns (PollResponse) {}
   
+  // Add message sending capability
+  rpc SendMessage(Message) returns (StatusResponse) {}
+  
   // Advance simulation time
   rpc AdvanceTime(TimeRequest) returns (StatusResponse) {}
   
@@ -60,10 +63,8 @@ message Message {
   string message_id = 1;
   string source_id = 2;
   string topic = 3;
-  oneof content {
-    SimulatorState simulator_state = 4;
-    AlgorithmResponse algorithm_response = 5;
-  }
+  string message_type = 4;   // ROS message type name
+  bytes data = 5;            // Binary serialized message data
 }
 
 message AlgorithmResponse {

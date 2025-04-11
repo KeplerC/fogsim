@@ -230,9 +230,9 @@ class AlgorithmAdaptor(Node):
     def process_message(self, message):
         """Process incoming message from meta simulator"""
         try:
-            # Check message type and forward accordingly
-            if message.HasField('simulator_state'):
-                self.forward_state_to_algorithm(message)
+            # With the binary serialization approach, we don't need to check for specific message types
+            # Just forward all messages from simulator adaptor to algorithm
+            self.forward_state_to_algorithm(message)
             
         except Exception as e:
             logger.error(f"Error processing message: {str(e)}")
@@ -254,36 +254,20 @@ class AlgorithmAdaptor(Node):
                 logger.warning(f"No message type for topic: {topic}")
                 return
             
-            # Convert protobuf simulator state to message
-            sim_state = message.simulator_state
-            
-            # Create a ROS message
-            if msg_type == String:
-                # Convert the simulator state to a JSON string
-                json_data = {
-                    'current_time': {
-                        'seconds': sim_state.current_time.seconds,
-                        'nanoseconds': sim_state.current_time.nanoseconds
-                    },
-                    'pending_messages': sim_state.pending_messages,
-                    'registered_adaptors': list(sim_state.registered_adaptors)
-                }
-                ros_msg = String(data=json.dumps(json_data))
-            else:
-                # For custom message types, attempt to fill message fields
-                ros_msg = msg_type()
-                
-                # Try to set timestamp if the message has one
-                if hasattr(ros_msg, 'stamp') and hasattr(ros_msg.stamp, 'sec') and hasattr(ros_msg.stamp, 'nanosec'):
-                    ros_msg.stamp.sec = sim_state.current_time.seconds
-                    ros_msg.stamp.nanosec = sim_state.current_time.nanoseconds
+            try:
+                # Deserialize binary data directly
+                import pickle
+                if message.data:
+                    ros_msg = pickle.loads(message.data)
                     
-                # If it's a more complex message type, try to convert and set fields
-                # This is just a basic example - you'd need to adapt this to your specific message types
-            
-            # Publish to ROS topic
-            self._topic_publishers[topic].publish(ros_msg)
-            logger.info(f"Published simulator state to topic: {topic}")
+                    # Publish to ROS topic
+                    self._topic_publishers[topic].publish(ros_msg)
+                    logger.info(f"Published binary message to topic: {topic}")
+                else:
+                    logger.warning(f"Received empty message data for topic: {topic}")
+            except Exception as e:
+                logger.error(f"Error deserializing message for {topic}: {e}")
+                return
             
         except Exception as e:
             logger.error(f"Error forwarding state to algorithm: {str(e)}")
@@ -291,42 +275,27 @@ class AlgorithmAdaptor(Node):
     def handle_algorithm_output(self, msg, topic_name):
         """Handle algorithm output from ROS topic"""
         try:
-            # Convert ROS message to algorithm response
-            data_format = 'json'
+            # Serialize ROS message to binary
+            import pickle
+            serialized_data = pickle.dumps(msg)
             
-            if isinstance(msg, String):
-                # String message, just use the data
-                data = msg.data
-            else:
-                # Convert the message to an ordered dict and then to JSON
-                msg_dict = message_to_ordereddict(msg)
-                data = json.dumps(msg_dict)
-            
-            # Create algorithm response
-            algo_response = {
-                'data': data,
-                'data_format': data_format
-            }
-            
-            # Create message to send
-            message = {
-                'source_id': self.adaptor_id,
-                'topic': topic_name,
-                'algorithm_response': algo_response
-            }
-            
-            # Convert to protobuf
-            proto_msg = messages_pb2.Message(
+            # Create protobuf message with binary data
+            message = messages_pb2.Message(
                 source_id=self.adaptor_id,
                 topic=topic_name,
-                algorithm_response=messages_pb2.AlgorithmResponse(
-                    data=data,
-                    data_format=data_format
-                )
+                message_type=msg.__class__.__module__ + '.' + msg.__class__.__name__,
+                data=serialized_data
             )
             
-            # We will send this with the next Poll request
-            # The meta simulator will deliver it to subscribers
+            # Send the message to the meta simulator using SendMessage method
+            try:
+                response = self.stub.SendMessage(message)
+                if response.success:
+                    logger.info(f"Sent binary message to meta simulator for topic: {topic_name}")
+                else:
+                    logger.warning(f"Failed to send message: {response.message}")
+            except Exception as e:
+                logger.error(f"Error sending message to meta simulator: {e}")
             
             logger.info(f"Processed algorithm output from topic: {topic_name}")
             

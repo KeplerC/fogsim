@@ -229,9 +229,9 @@ class SimulatorAdaptor(Node):
     def process_message(self, message):
         """Process incoming message from meta simulator"""
         try:
-            # Check message type and forward accordingly
-            if message.HasField('algorithm_response'):
-                self.forward_response_to_simulator(message)
+            # With the binary serialization approach, we don't need to check for specific message types
+            # Just forward all messages from algorithm adaptor to simulator
+            self.forward_response_to_simulator(message)
             
         except Exception as e:
             logger.error(f"Error processing message: {str(e)}")
@@ -253,40 +253,20 @@ class SimulatorAdaptor(Node):
                 logger.warning(f"No message type for topic: {topic}")
                 return
             
-            # Get algorithm response data
-            algo_response = message.algorithm_response
-            data = algo_response.data
-            data_format = algo_response.data_format
-            
-            # Create a ROS message
-            if msg_type == String:
-                # If the publisher is a string type, just pass through the data
-                ros_msg = String(data=data)
-            else:
-                # For custom message types, attempt to parse the data
-                if data_format == 'json':
-                    try:
-                        # Parse JSON data
-                        json_data = json.loads(data)
-                        
-                        # Create a message instance
-                        ros_msg = msg_type()
-                        
-                        # Try to populate the message from the JSON
-                        # This is a simplified approach - for complex messages you'd need more logic
-                        for field_name, field_value in json_data.items():
-                            if hasattr(ros_msg, field_name):
-                                setattr(ros_msg, field_name, field_value)
-                    except Exception as e:
-                        logger.error(f"Error parsing JSON data for {topic}: {e}")
-                        return
+            try:
+                # Deserialize binary data directly
+                import pickle
+                if message.data:
+                    ros_msg = pickle.loads(message.data)
+                    
+                    # Publish to ROS topic
+                    self._topic_publishers[topic].publish(ros_msg)
+                    logger.info(f"Published binary message to topic: {topic}")
                 else:
-                    logger.warning(f"Unsupported data format: {data_format}")
-                    return
-            
-            # Publish to ROS topic
-            self._topic_publishers[topic].publish(ros_msg)
-            logger.info(f"Published algorithm response to topic: {topic}")
+                    logger.warning(f"Received empty message data for topic: {topic}")
+            except Exception as e:
+                logger.error(f"Error deserializing message for {topic}: {e}")
+                return
             
         except Exception as e:
             logger.error(f"Error forwarding response to simulator: {str(e)}")
@@ -294,41 +274,29 @@ class SimulatorAdaptor(Node):
     def handle_simulator_message(self, msg, topic_name):
         """Handle message from simulator"""
         try:
-            # Convert ROS message to simulator state
+            # Serialize ROS message to binary
+            import pickle
+            serialized_data = pickle.dumps(msg)
             
-            # Create a timestamp for the message
-            timestamp = messages_pb2.TimeStamp(
-                seconds=self.current_time['seconds'],
-                nanoseconds=self.current_time['nanoseconds']
-            )
-            
-            # Convert message to a JSON representation if it's not a string
-            if isinstance(msg, String):
-                # String message, just use the data
-                data = msg.data
-                data_format = "string"
-            else:
-                # Convert the message to an ordered dict and then to JSON
-                msg_dict = message_to_ordereddict(msg)
-                data = json.dumps(msg_dict)
-                data_format = "json"
-            
-            # Create the simulator state protobuf message
-            sim_state = messages_pb2.SimulatorState(
-                current_time=timestamp
-            )
-            
-            # Create the message protobuf
-            proto_msg = messages_pb2.Message(
+            # Create the message protobuf with binary data
+            message = messages_pb2.Message(
                 source_id=self.adaptor_id,
                 topic=topic_name,
-                simulator_state=sim_state
+                message_type=msg.__class__.__module__ + '.' + msg.__class__.__name__,
+                data=serialized_data
             )
             
-            logger.info(f"Processed simulator message from topic: {topic_name}")
+            # Send the message to the meta simulator using SendMessage method
+            try:
+                response = self.stub.SendMessage(message)
+                if response.success:
+                    logger.info(f"Sent binary message to meta simulator for topic: {topic_name}")
+                else:
+                    logger.warning(f"Failed to send message: {response.message}")
+            except Exception as e:
+                logger.error(f"Error sending message to meta simulator: {e}")
             
-            # The message will be sent with the next Poll request
-            # No need to explicitly send it since we're using streamlined polling
+            logger.info(f"Processed simulator message from topic: {topic_name}")
             
         except Exception as e:
             logger.error(f"Error handling simulator message: {str(e)}")

@@ -41,6 +41,15 @@ class MetaSimulator(messages_pb2_grpc.MetaSimulatorServicer):
                 self.adaptors.add(adaptor_id)
                 logger.info(f"Registered adaptor via Poll: {adaptor_id}")
         
+        # Check if this request is sending a message (empty topics list with algorithm_response or simulator_state)
+        is_sending_message = False
+        if hasattr(context, 'invocation_metadata'):
+            # Extract metadata to see if this is a message-sending request
+            metadata = dict(context.invocation_metadata())
+            if 'send_message' in metadata and metadata['send_message'] == 'true':
+                is_sending_message = True
+                logger.info("Detected message-sending request")
+        
         # Get messages for time and topics
         messages = []
         with self.lock:
@@ -76,6 +85,15 @@ class MetaSimulator(messages_pb2_grpc.MetaSimulatorServicer):
                         if proto_msg:
                             messages.append(proto_msg)
             
+            # Handle adding new messages from the request context
+            # This supports the "sending" part of our bidirectional communication
+            if not topics and hasattr(context, 'additional_context'):
+                # This would be set by the client when sending a message
+                if 'message' in context.additional_context:
+                    message = context.additional_context['message']
+                    self.add_message(message)
+                    logger.info(f"Added message from Poll request, source: {message.get('source_id', 'unknown')}")
+            
             # Create response
             response = messages_pb2.PollResponse(
                 success=True,
@@ -84,6 +102,42 @@ class MetaSimulator(messages_pb2_grpc.MetaSimulatorServicer):
             )
             
             return response
+    
+    def SendMessage(self, request, context):
+        """gRPC SendMessage implementation - store messages sent by adaptors"""
+        try:
+            with self.lock:
+                # Extract the message from the request
+                message = {
+                    'source_id': request.source_id,
+                    'topic': request.topic,
+                    'message_type': request.message_type,
+                    'binary_data': request.data
+                }
+                
+                # Store the message
+                message_id = self.add_message(message)
+                logger.info(f"Added binary message from SendMessage, ID: {message_id}, source: {message['source_id']}, topic: {message['topic']}")
+                
+                # Return success response
+                return messages_pb2.StatusResponse(
+                    success=True,
+                    message=f"Message stored with ID: {message_id}",
+                    current_time=messages_pb2.TimeStamp(
+                        seconds=self.current_time['seconds'],
+                        nanoseconds=self.current_time['nanoseconds']
+                    )
+                )
+        except Exception as e:
+            logger.error(f"Error in SendMessage: {e}")
+            return messages_pb2.StatusResponse(
+                success=False,
+                message=f"Error: {str(e)}",
+                current_time=messages_pb2.TimeStamp(
+                    seconds=self.current_time['seconds'],
+                    nanoseconds=self.current_time['nanoseconds']
+                )
+            )
     
     def AdvanceTime(self, request, context):
         """gRPC AdvanceTime implementation - advances simulation time"""
@@ -142,13 +196,6 @@ class MetaSimulator(messages_pb2_grpc.MetaSimulatorServicer):
         # Check if message has a topic that matches
         if 'topic' in message and message['topic'] in topics:
             return True
-            
-        # Check for simulator state with matching frame_id as topic
-        if 'simulator_state' in message:
-            simulator_state = message.get('simulator_state', {})
-            frame_id = simulator_state.get('frame_id', '')
-            if frame_id in topics:
-                return True
                 
         return False
     
@@ -158,33 +205,10 @@ class MetaSimulator(messages_pb2_grpc.MetaSimulatorServicer):
             proto_msg = messages_pb2.Message(
                 message_id=message_id,
                 source_id=message.get('source_id', ''),
-                topic=message.get('topic', '')
+                topic=message.get('topic', ''),
+                message_type=message.get('message_type', ''),
+                data=message.get('binary_data', b'')
             )
-            
-            # Set content based on message type
-            if 'simulator_state' in message:
-                simulator_state = message.get('simulator_state', {})
-                # Convert simulator state to proto
-                state_proto = messages_pb2.SimulatorState(
-                    current_time=messages_pb2.TimeStamp(
-                        seconds=simulator_state.get('current_time', {}).get('seconds', 0),
-                        nanoseconds=simulator_state.get('current_time', {}).get('nanoseconds', 0)
-                    ),
-                    pending_messages=simulator_state.get('pending_messages', 0)
-                )
-                if 'registered_adaptors' in simulator_state:
-                    state_proto.registered_adaptors.extend(simulator_state['registered_adaptors'])
-                
-                proto_msg.simulator_state.CopyFrom(state_proto)
-                
-            elif 'algorithm_response' in message:
-                algo_response = message.get('algorithm_response', {})
-                # Convert algorithm response to proto
-                algo_proto = messages_pb2.AlgorithmResponse(
-                    data=algo_response.get('data', ''),
-                    data_format=algo_response.get('data_format', 'json')
-                )
-                proto_msg.algorithm_response.CopyFrom(algo_proto)
             
             return proto_msg
         except Exception as e:
