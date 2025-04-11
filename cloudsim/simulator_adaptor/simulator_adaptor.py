@@ -16,6 +16,7 @@ import re
 from rclpy.qos import QoSProfile
 from std_msgs.msg import String
 import subprocess
+import base64
 from rosidl_runtime_py import message_to_ordereddict, get_message_interfaces
 from rosidl_runtime_py.utilities import get_message
 
@@ -262,7 +263,14 @@ class SimulatorAdaptor(Node):
             if hasattr(ros_msg, 'data') and isinstance(ros_msg.data, str):
                 ros_msg.data = str(command_data)
             elif hasattr(ros_msg, 'data') and isinstance(ros_msg.data, bytes):
-                ros_msg.data = command_data.get('command_data', b'')
+                # If binary data is base64 encoded in the message
+                if isinstance(command_data.get('command_data'), str):
+                    try:
+                        ros_msg.data = base64.b64decode(command_data.get('command_data', ''))
+                    except Exception:
+                        ros_msg.data = command_data.get('command_data', '').encode()
+                else:
+                    ros_msg.data = command_data.get('command_data', b'')
             
             # Publish message
             self._topic_publishers[target_topic].publish(ros_msg)
@@ -298,6 +306,13 @@ class SimulatorAdaptor(Node):
             
             # Try to populate message fields from response data
             response_bytes = response_data.get('response_data', b'')
+            # Handle both string (base64) and bytes cases
+            if isinstance(response_bytes, str):
+                try:
+                    response_bytes = base64.b64decode(response_bytes)
+                except Exception:
+                    response_bytes = response_bytes.encode()
+            
             if isinstance(response_bytes, bytes):
                 try:
                     # Try to convert bytes to dict
@@ -338,14 +353,17 @@ class SimulatorAdaptor(Node):
                 else:
                     msg_dict = {'data': str(msg)}
             
-            # Create simulator state message
+            # Convert the message to JSON string
+            json_data = json.dumps(msg_dict)
+            
+            # Create simulator state message - use base64 encoding for binary data
             simulator_state = {
                 'timestamp': {
                     'seconds': int(self.get_clock().now().seconds_nanoseconds()[0]),
                     'nanoseconds': int(self.get_clock().now().seconds_nanoseconds()[1])
                 },
                 'frame_id': topic_name,
-                'state_data': json.dumps(msg_dict).encode()
+                'state_data_b64': base64.b64encode(json_data.encode()).decode('ascii')
             }
             
             # Send state to meta simulator

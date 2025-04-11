@@ -12,6 +12,7 @@ import logging
 from google.protobuf.json_format import MessageToDict, ParseDict
 import importlib
 import re
+import base64
 from rclpy.qos import QoSProfile
 from std_msgs.msg import String
 import subprocess
@@ -258,32 +259,54 @@ class AlgorithmAdaptor(Node):
             start_time = time.time_ns()
             self.timing_data[message_id] = start_time
             
-            # Try to populate message fields from state data
-            state_data = simulator_state.get('state_data', b'')
-            if isinstance(state_data, bytes):
+            # Handle both the legacy and new base64 formats
+            if 'state_data_b64' in simulator_state:
+                # Base64-encoded data
                 try:
-                    # Try to convert bytes to dict
-                    state_dict = json.loads(state_data.decode('utf-8'))
+                    state_data_b64 = simulator_state.get('state_data_b64', '')
+                    json_data = base64.b64decode(state_data_b64).decode('utf-8')
+                    state_dict = json.loads(json_data)
                     
                     # Try to set message fields from dict
                     if hasattr(ros_msg, 'data'):
                         if isinstance(ros_msg.data, str):
                             ros_msg.data = json.dumps(state_dict)
                         elif isinstance(ros_msg.data, bytes):
-                            ros_msg.data = state_data
+                            ros_msg.data = json_data.encode()
                     else:
                         # For more complex messages, try to recursively set fields
                         for key, value in state_dict.items():
                             if hasattr(ros_msg, key):
                                 setattr(ros_msg, key, value)
                 except Exception as e:
-                    logger.error(f"Failed to parse state data: {e}")
-                    # Fallback to setting data field if available
-                    if hasattr(ros_msg, 'data'):
-                        if isinstance(ros_msg.data, str):
-                            ros_msg.data = str(state_data)
-                        elif isinstance(ros_msg.data, bytes):
-                            ros_msg.data = state_data
+                    logger.error(f"Failed to parse base64 state data: {e}")
+            elif 'state_data' in simulator_state:
+                # Legacy format (bytes or string)
+                state_data = simulator_state.get('state_data', b'')
+                if isinstance(state_data, bytes):
+                    try:
+                        # Try to convert bytes to dict
+                        state_dict = json.loads(state_data.decode('utf-8'))
+                        
+                        # Try to set message fields from dict
+                        if hasattr(ros_msg, 'data'):
+                            if isinstance(ros_msg.data, str):
+                                ros_msg.data = json.dumps(state_dict)
+                            elif isinstance(ros_msg.data, bytes):
+                                ros_msg.data = state_data
+                        else:
+                            # For more complex messages, try to recursively set fields
+                            for key, value in state_dict.items():
+                                if hasattr(ros_msg, key):
+                                    setattr(ros_msg, key, value)
+                    except Exception as e:
+                        logger.error(f"Failed to parse state data: {e}")
+                        # Fallback to setting data field if available
+                        if hasattr(ros_msg, 'data'):
+                            if isinstance(ros_msg.data, str):
+                                ros_msg.data = str(state_data)
+                            elif isinstance(ros_msg.data, bytes):
+                                ros_msg.data = state_data
             
             # Publish message to algorithm
             self._topic_publishers[target_topic].publish(ros_msg)
@@ -306,9 +329,13 @@ class AlgorithmAdaptor(Node):
                 else:
                     msg_dict = {'data': str(msg)}
             
+            # Convert to JSON and then base64 encode
+            json_data = json.dumps(msg_dict)
+            b64_data = base64.b64encode(json_data.encode()).decode('ascii')
+            
             # Create the algorithm response
             algorithm_response = {
-                'response_data': json.dumps(msg_dict).encode(),
+                'response_data_b64': b64_data,
                 'compute_time_ns': 0,  # Will be calculated
                 'status': 'success'
             }
