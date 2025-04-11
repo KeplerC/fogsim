@@ -19,6 +19,7 @@ import subprocess
 import base64
 from rosidl_runtime_py import message_to_ordereddict, get_message_interfaces
 from rosidl_runtime_py.utilities import get_message
+from rclpy.topic_endpoint_info import TopicEndpointTypeEnum
 
 # Add the parent directory to the path for importing protos
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -35,9 +36,9 @@ class SimulatorAdaptor(Node):
         # Get configuration from parameters
         self.declare_parameter('meta_simulator_url', 'http://meta_simulator:5000')
         self.declare_parameter('adaptor_id', 'simulator_adaptor_1')
-        self.declare_parameter('simulator_topic_prefix', '/simulator/')
-        self.declare_parameter('poll_interval', 0.1)  # seconds
-        self.declare_parameter('topic_discovery_interval', 5.0)  # seconds
+        self.declare_parameter('simulator_topic_prefix', '')
+        self.declare_parameter('poll_interval', float(os.environ.get('POLL_INTERVAL', '0.1')))  # Get from env var with default 0.1s
+        self.declare_parameter('topic_discovery_interval', float(os.environ.get('TOPIC_DISCOVERY_INTERVAL', '5.0')))  # Get from env var
         
         # Get parameters
         self.meta_simulator_url = self.get_parameter('meta_simulator_url').value
@@ -96,6 +97,18 @@ class SimulatorAdaptor(Node):
             
             logger.info(f"Discovered simulator topics: {simulator_topics}")
             
+            # Count publishers and subscribers for each topic
+            pub_counts = {}
+            sub_counts = {}
+            
+            # Get publisher and subscriber counts for each topic individually
+            for topic_name, _ in simulator_topics:
+                # Count publishers for this topic
+                pub_counts[topic_name] = self.count_publishers(topic_name)
+                
+                # Count subscribers for this topic
+                sub_counts[topic_name] = self.count_subscribers(topic_name)
+            
             # Process each simulator topic
             for topic_name, topic_types in simulator_topics:
                 if not topic_types:
@@ -104,14 +117,21 @@ class SimulatorAdaptor(Node):
                 msg_type_str = topic_types[0]  # Use the first type
                 
                 if topic_name not in self._topic_subscriptions and topic_name not in self._topic_publishers:
-                    # Determine if this is an input or output topic
-                    if topic_name.endswith('/in') or topic_name.endswith('/cmd'):
-                        # This is likely an input topic, create a publisher
-                        self.create_topic_publisher(topic_name, msg_type_str)
-                    else:
-                        # This is likely an output topic, create a subscription
-                        self.create_topic_subscription(topic_name, msg_type_str)
+                    # Determine if this is an input or output topic based on publisher/subscriber counts
+                    # If there are more publishers than subscribers, it's likely an output topic
+                    # If there are more subscribers than publishers, it's likely an input topic
+                    pub_count = pub_counts.get(topic_name, 0)
+                    sub_count = sub_counts.get(topic_name, 0)
                     
+                    logger.info(f"Topic {topic_name}: {pub_count} publishers, {sub_count} subscribers")
+                    
+                    if pub_count > sub_count:
+                        # This is likely an output topic that we should subscribe to
+                        self.create_topic_subscription(topic_name, msg_type_str)
+                    else:
+                        # This is likely an input topic that we should publish to
+                        self.create_topic_publisher(topic_name, msg_type_str)
+                
         except Exception as e:
             logger.error(f"Error discovering topics: {str(e)}")
     
@@ -191,10 +211,14 @@ class SimulatorAdaptor(Node):
                 continue
             
             try:
+                # Get a list of topics we're interested in - topics we publish to (receive algorithm responses for)
+                topics_we_subscribe_to = list(self._topic_publishers.keys())
+                
+                # Add topic information to the poll request
                 response = requests.post(
                     f"{self.meta_simulator_url}/poll",
                     json={
-                        'adaptor_id': self.adaptor_id,
+                        'topics': topics_we_subscribe_to,
                         'last_update_time': self.current_time
                     }
                 )
@@ -208,6 +232,10 @@ class SimulatorAdaptor(Node):
                         # Process messages if any
                         for msg in data.get('messages', []):
                             self.process_message(msg)
+                        
+                        # Log if no messages were received but we're expecting some
+                        if not data.get('messages') and topics_we_subscribe_to:
+                            logger.debug(f"No messages received for topics: {topics_we_subscribe_to}")
                 else:
                     logger.error(f"Failed to poll: {response.text}")
             
@@ -235,12 +263,11 @@ class SimulatorAdaptor(Node):
         """Forward command to the appropriate simulator topic"""
         try:
             command_data = message.get('algorithm_command', {})
-            command_type = command_data.get('command_type', '')
             
-            # Find an appropriate publisher based on command type
+            # Find an appropriate publisher
             target_topic = None
             for topic in self._topic_publishers.keys():
-                if command_type.lower() in topic.lower():
+                if 'command' in topic.lower() or 'action' in topic.lower() or 'control' in topic.lower():
                     target_topic = topic
                     break
             
@@ -254,26 +281,21 @@ class SimulatorAdaptor(Node):
             
             logger.info(f"Forwarding command to simulator topic: {target_topic}")
             
-            # Create message instance
-            msg_type = self._topic_msg_types[target_topic]
-            ros_msg = msg_type()
-            
-            # Try to populate message fields from command data
-            # This is a simple example - in real use, you'd need more sophisticated mapping
-            if hasattr(ros_msg, 'data') and isinstance(ros_msg.data, str):
-                ros_msg.data = str(command_data)
-            elif hasattr(ros_msg, 'data') and isinstance(ros_msg.data, bytes):
-                # If binary data is base64 encoded in the message
-                if isinstance(command_data.get('command_data'), str):
-                    try:
-                        ros_msg.data = base64.b64decode(command_data.get('command_data', ''))
-                    except Exception:
-                        ros_msg.data = command_data.get('command_data', '').encode()
-                else:
-                    ros_msg.data = command_data.get('command_data', b'')
-            
-            # Publish message
-            self._topic_publishers[target_topic].publish(ros_msg)
+            # Use pickle to deserialize the message
+            if 'pickled_data_b64' in command_data:
+                try:
+                    import pickle
+                    pickled_data_b64 = command_data.get('pickled_data_b64', '')
+                    pickled_data = base64.b64decode(pickled_data_b64)
+                    ros_msg = pickle.loads(pickled_data)
+                    
+                    # Publish the unpickled message directly
+                    self._topic_publishers[target_topic].publish(ros_msg)
+                    logger.info(f"Published unpickled command to {target_topic}")
+                except Exception as e:
+                    logger.error(f"Failed to unpickle command data: {str(e)}")
+            else:
+                logger.error("No pickled data found in command")
             
         except Exception as e:
             logger.error(f"Error forwarding command to simulator: {str(e)}")
@@ -286,7 +308,7 @@ class SimulatorAdaptor(Node):
             # Find an appropriate publisher
             target_topic = None
             for topic in self._topic_publishers.keys():
-                if 'response' in topic.lower() or 'feedback' in topic.lower():
+                if 'response' in topic.lower() or 'feedback' in topic.lower() or 'action' in topic.lower():
                     target_topic = topic
                     break
             
@@ -300,40 +322,21 @@ class SimulatorAdaptor(Node):
             
             logger.info(f"Forwarding response to simulator topic: {target_topic}")
             
-            # Create message instance
-            msg_type = self._topic_msg_types[target_topic]
-            ros_msg = msg_type()
-            
-            # Try to populate message fields from response data
-            response_bytes = response_data.get('response_data', b'')
-            # Handle both string (base64) and bytes cases
-            if isinstance(response_bytes, str):
+            # Use pickle to deserialize the message
+            if 'pickled_data_b64' in response_data:
                 try:
-                    response_bytes = base64.b64decode(response_bytes)
-                except Exception:
-                    response_bytes = response_bytes.encode()
-            
-            if isinstance(response_bytes, bytes):
-                try:
-                    # Try to convert bytes to dict
-                    response_dict = json.loads(response_bytes.decode('utf-8'))
+                    import pickle
+                    pickled_data_b64 = response_data.get('pickled_data_b64', '')
+                    pickled_data = base64.b64decode(pickled_data_b64)
+                    ros_msg = pickle.loads(pickled_data)
                     
-                    # Try to set message fields from dict
-                    if hasattr(ros_msg, 'data'):
-                        if isinstance(ros_msg.data, str):
-                            ros_msg.data = json.dumps(response_dict)
-                        elif isinstance(ros_msg.data, bytes):
-                            ros_msg.data = response_bytes
+                    # Publish the unpickled message directly
+                    self._topic_publishers[target_topic].publish(ros_msg)
+                    logger.info(f"Published unpickled response to {target_topic}")
                 except Exception as e:
-                    logger.error(f"Failed to parse response data: {e}")
-                    if hasattr(ros_msg, 'data'):
-                        if isinstance(ros_msg.data, str):
-                            ros_msg.data = str(response_bytes)
-                        elif isinstance(ros_msg.data, bytes):
-                            ros_msg.data = response_bytes
-            
-            # Publish message
-            self._topic_publishers[target_topic].publish(ros_msg)
+                    logger.error(f"Failed to unpickle response data: {str(e)}")
+            else:
+                logger.error("No pickled data found in response")
             
         except Exception as e:
             logger.error(f"Error forwarding response to simulator: {str(e)}")
@@ -343,18 +346,9 @@ class SimulatorAdaptor(Node):
         try:
             logger.info(f"Received simulator message on topic: {topic_name}")
             
-            # Convert ROS message to dictionary
-            try:
-                msg_dict = message_to_ordereddict(msg)
-            except Exception:
-                # Fallback for simple messages
-                if hasattr(msg, 'data'):
-                    msg_dict = {'data': msg.data}
-                else:
-                    msg_dict = {'data': str(msg)}
-            
-            # Convert the message to JSON string
-            json_data = json.dumps(msg_dict)
+            # Pickle the ROS message directly
+            import pickle
+            pickled_data = pickle.dumps(msg)
             
             # Create simulator state message - use base64 encoding for binary data
             simulator_state = {
@@ -363,7 +357,8 @@ class SimulatorAdaptor(Node):
                     'nanoseconds': int(self.get_clock().now().seconds_nanoseconds()[1])
                 },
                 'frame_id': topic_name,
-                'state_data_b64': base64.b64encode(json_data.encode()).decode('ascii')
+                'pickled_data_b64': base64.b64encode(pickled_data).decode('ascii'),
+                'msg_type': msg.__class__.__module__ + '.' + msg.__class__.__name__
             }
             
             # Send state to meta simulator
@@ -373,10 +368,10 @@ class SimulatorAdaptor(Node):
             logger.error(f"Error handling simulator message: {str(e)}")
     
     def send_simulator_state(self, simulator_state):
-        # Send simulator state to meta simulator
+        # Send simulator state to meta simulator, using topic-based routing
         message = {
             'source_id': self.adaptor_id,
-            'destination_id': 'algorithm_adaptor',  # Replace with actual destination
+            'topic': simulator_state['frame_id'],  # Use the topic name for routing
             'timestamp': self.current_time,
             'simulator_state': simulator_state
         }
@@ -388,7 +383,7 @@ class SimulatorAdaptor(Node):
             )
             
             if response.status_code == 200 and response.json().get('success'):
-                logger.info(f"Sent simulator state to meta simulator")
+                logger.info(f"Sent simulator state to meta simulator for topic {simulator_state['frame_id']}")
             else:
                 logger.error(f"Failed to send simulator state: {response.text}")
         

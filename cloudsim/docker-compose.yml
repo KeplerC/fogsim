@@ -28,7 +28,11 @@ services:
       - ROS_DOMAIN_ID=1  # Simulator domain
       - META_SIMULATOR_URL=http://meta_simulator:5000
       - ADAPTOR_ID=simulator_adaptor_1
+      - ALGORITHM_ADAPTOR_ID=algorithm_adaptor_1  # Add algorithm adaptor ID
+      - USE_WILDCARD_DESTINATIONS=true  # Enable wildcards for more flexible message routing
       - PYTHONPATH=/app
+      - POLL_INTERVAL=0.5  # Polling rate in seconds
+      - TOPIC_DISCOVERY_INTERVAL=5.0  # Topic discovery interval in seconds
     volumes:
       - ./simulator_adaptor:/app/simulator_adaptor
       - ./protos:/app/protos
@@ -47,7 +51,11 @@ services:
       - ROS_DOMAIN_ID=2  # Algorithm domain
       - META_SIMULATOR_URL=http://meta_simulator:5000
       - ADAPTOR_ID=algorithm_adaptor_1
+      - SIMULATOR_ADAPTOR_ID=simulator_adaptor_1  # Add simulator adaptor ID
+      - USE_WILDCARD_DESTINATIONS=true  # Enable wildcards for more flexible message routing
       - PYTHONPATH=/app
+      - POLL_INTERVAL=0.5  # Polling rate in seconds
+      - TOPIC_DISCOVERY_INTERVAL=5.0  # Topic discovery interval in seconds
     volumes:
       - ./algorithm_adaptor:/app/algorithm_adaptor
       - ./protos:/app/protos
@@ -66,6 +74,7 @@ services:
       - ADAPTOR_ID=network_simulator_adaptor
       - NETWORK_SIMULATOR_TYPE=simple
       - PYTHONPATH=/app
+      - POLL_INTERVAL=0.5  # Polling rate in seconds
     volumes:
       - ./network_simulator_adaptor:/app/network_simulator_adaptor
       - ./protos:/app/protos

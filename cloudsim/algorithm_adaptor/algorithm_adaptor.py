@@ -18,6 +18,7 @@ from std_msgs.msg import String
 import subprocess
 from rosidl_runtime_py import message_to_ordereddict, get_message_interfaces
 from rosidl_runtime_py.utilities import get_message
+from rclpy.topic_endpoint_info import TopicEndpointTypeEnum
 
 # Add the parent directory to the path for importing protos
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -31,12 +32,14 @@ class AlgorithmAdaptor(Node):
     def __init__(self):
         super().__init__('algorithm_adaptor')
         
-        # Get configuration from parameters
-        self.declare_parameter('meta_simulator_url', 'http://meta_simulator:5000')
-        self.declare_parameter('adaptor_id', 'algorithm_adaptor_1')
-        self.declare_parameter('algorithm_topic_prefix', '/algorithm/')
-        self.declare_parameter('poll_interval', 0.1)  # seconds
-        self.declare_parameter('topic_discovery_interval', 5.0)  # seconds
+        # Get configuration from parameters or environment variables
+        self.declare_parameter('meta_simulator_url', os.environ.get('META_SIMULATOR_URL', 'http://meta_simulator:5000'))
+        self.declare_parameter('adaptor_id', os.environ.get('ADAPTOR_ID', 'algorithm_adaptor_1'))
+        self.declare_parameter('algorithm_topic_prefix', os.environ.get('ALGORITHM_TOPIC_PREFIX', ''))
+        self.declare_parameter('poll_interval', float(os.environ.get('POLL_INTERVAL', '0.5')))
+        self.declare_parameter('topic_discovery_interval', float(os.environ.get('TOPIC_DISCOVERY_INTERVAL', '5.0')))
+        self.declare_parameter('simulator_adaptor_id', os.environ.get('SIMULATOR_ADAPTOR_ID', 'simulator_adaptor_1'))
+        self.declare_parameter('use_wildcard_destinations', bool(os.environ.get('USE_WILDCARD_DESTINATIONS', 'False').lower() == 'true'))
         
         # Get parameters
         self.meta_simulator_url = self.get_parameter('meta_simulator_url').value
@@ -44,6 +47,16 @@ class AlgorithmAdaptor(Node):
         self.algorithm_topic_prefix = self.get_parameter('algorithm_topic_prefix').value
         self.poll_interval = self.get_parameter('poll_interval').value
         self.topic_discovery_interval = self.get_parameter('topic_discovery_interval').value
+        self.simulator_adaptor_id = self.get_parameter('simulator_adaptor_id').value
+        self.use_wildcard_destinations = self.get_parameter('use_wildcard_destinations').value
+        
+        logger.info(f"Algorithm adaptor configuration:")
+        logger.info(f"  meta_simulator_url: {self.meta_simulator_url}")
+        logger.info(f"  adaptor_id: {self.adaptor_id}")
+        logger.info(f"  simulator_adaptor_id: {self.simulator_adaptor_id}")
+        logger.info(f"  use_wildcard_destinations: {self.use_wildcard_destinations}")
+        logger.info(f"  poll_interval: {self.poll_interval}")
+        logger.info(f"  topic_discovery_interval: {self.topic_discovery_interval}")
         
         # Initialize state
         self.current_time = {'seconds': 0, 'nanoseconds': 0}
@@ -95,6 +108,18 @@ class AlgorithmAdaptor(Node):
             
             logger.info(f"Discovered algorithm topics: {algorithm_topics}")
             
+            # Count publishers and subscribers for each topic
+            pub_counts = {}
+            sub_counts = {}
+            
+            # Get publisher and subscriber counts for each topic individually
+            for topic_name, _ in algorithm_topics:
+                # Count publishers for this topic
+                pub_counts[topic_name] = self.count_publishers(topic_name)
+                
+                # Count subscribers for this topic
+                sub_counts[topic_name] = self.count_subscribers(topic_name)
+            
             # Process each algorithm topic
             for topic_name, topic_types in algorithm_topics:
                 if not topic_types:
@@ -103,14 +128,21 @@ class AlgorithmAdaptor(Node):
                 msg_type_str = topic_types[0]  # Use the first type
                 
                 if topic_name not in self._topic_subscriptions and topic_name not in self._topic_publishers:
-                    # Determine if this is an input or output topic
-                    if topic_name.endswith('/out') or topic_name.endswith('/response') or topic_name.endswith('/output'):
+                    # Determine if this is an input or output topic based on publisher/subscriber counts
+                    # If there are more publishers than subscribers, it's likely an output topic
+                    # If there are more subscribers than publishers, it's likely an input topic
+                    pub_count = pub_counts.get(topic_name, 0)
+                    sub_count = sub_counts.get(topic_name, 0)
+                    
+                    logger.info(f"Topic {topic_name}: {pub_count} publishers, {sub_count} subscribers")
+                    
+                    if pub_count > sub_count:
                         # This is likely an output topic, create a subscription
                         self.create_topic_subscription(topic_name, msg_type_str)
                     else:
                         # This is likely an input topic, create a publisher
                         self.create_topic_publisher(topic_name, msg_type_str)
-                    
+                
         except Exception as e:
             logger.error(f"Error discovering topics: {str(e)}")
     
@@ -190,13 +222,20 @@ class AlgorithmAdaptor(Node):
                 continue
             
             try:
+                # Get a list of topics we're interested in (topics we publish to)
+                topics_we_publish_to = list(self._topic_publishers.keys())
+                
+                # Add topic information to the poll request
                 response = requests.post(
                     f"{self.meta_simulator_url}/poll",
                     json={
-                        'adaptor_id': self.adaptor_id,
+                        'topics': topics_we_publish_to,
                         'last_update_time': self.current_time
                     }
                 )
+                
+                if topics_we_publish_to:
+                    logger.debug(f"Polling for topics: {topics_we_publish_to}")
                 
                 if response.status_code == 200:
                     data = response.json()
@@ -205,8 +244,14 @@ class AlgorithmAdaptor(Node):
                         self.current_time = data['state']['current_time']
                         
                         # Process messages if any
-                        for msg in data.get('messages', []):
-                            self.process_message(msg)
+                        messages = data.get('messages', [])
+                        if messages:
+                            logger.info(f"Received {len(messages)} messages to process")
+                            for msg in messages:
+                                self.process_message(msg)
+                        # Log if no messages were received but we're expecting some
+                        elif topics_we_publish_to:
+                            logger.debug(f"No messages received for topics: {topics_we_publish_to}")
                 else:
                     logger.error(f"Failed to poll: {response.text}")
             
@@ -233,109 +278,110 @@ class AlgorithmAdaptor(Node):
             message_id = message.get('message_id')
             simulator_state = message.get('simulator_state', {})
             
-            # Find an appropriate publisher
+            # Get the frame_id (topic) from the simulator state
+            frame_id = simulator_state.get('frame_id', '')
+            logger.info(f"Processing state message with frame_id (topic): {frame_id}")
+            
+            # Try to find a matching publisher based on the frame_id
             target_topic = None
-            for topic in self._topic_publishers.keys():
-                # Try to find a topic that might match the state
-                if 'state' in topic.lower() or 'input' in topic.lower():
-                    target_topic = topic
-                    break
+            
+            # First, try to find an exact match for the topic name
+            if frame_id and frame_id in self._topic_publishers:
+                target_topic = frame_id
+                logger.info(f"Found exact match for topic: {target_topic}")
+            else:
+                # If no exact match, try to find a topic with a similar name
+                for topic in self._topic_publishers.keys():
+                    # Extract the topic name without path
+                    topic_name = topic.split('/')[-1] if '/' in topic else topic
+                    frame_name = frame_id.split('/')[-1] if '/' in frame_id else frame_id
+                    
+                    if frame_name and frame_name in topic_name:
+                        target_topic = topic
+                        logger.info(f"Found related topic: {target_topic} for frame_id: {frame_id}")
+                        break
             
             if not target_topic:
-                # Just use the first available publisher if no match
-                if self._topic_publishers:
+                # If still no match, use a generic approach
+                for topic in self._topic_publishers.keys():
+                    if 'state' in topic.lower() or 'input' in topic.lower() or 'env' in topic.lower():
+                        target_topic = topic
+                        logger.info(f"Using generic topic: {target_topic}")
+                        break
+                
+                # Last resort - use the first available publisher
+                if not target_topic and self._topic_publishers:
                     target_topic = next(iter(self._topic_publishers.keys()))
-                else:
-                    logger.error("No publishers available to forward state")
-                    return
+                    logger.info(f"Using first available topic: {target_topic}")
+            
+            if not target_topic:
+                logger.error("No publishers available to forward state")
+                return
             
             logger.info(f"Forwarding state to algorithm topic: {target_topic}")
-            
-            # Create message instance
-            msg_type = self._topic_msg_types[target_topic]
-            ros_msg = msg_type()
             
             # Start timing for latency measurement
             start_time = time.time_ns()
             self.timing_data[message_id] = start_time
             
-            # Handle both the legacy and new base64 formats
-            if 'state_data_b64' in simulator_state:
-                # Base64-encoded data
+            # Use pickle to deserialize the message directly
+            if 'pickled_data_b64' in simulator_state:
                 try:
-                    state_data_b64 = simulator_state.get('state_data_b64', '')
-                    json_data = base64.b64decode(state_data_b64).decode('utf-8')
-                    state_dict = json.loads(json_data)
+                    import pickle
+                    pickled_data_b64 = simulator_state.get('pickled_data_b64', '')
+                    pickled_data = base64.b64decode(pickled_data_b64)
+                    ros_msg = pickle.loads(pickled_data)
                     
-                    # Try to set message fields from dict
-                    if hasattr(ros_msg, 'data'):
-                        if isinstance(ros_msg.data, str):
-                            ros_msg.data = json.dumps(state_dict)
-                        elif isinstance(ros_msg.data, bytes):
-                            ros_msg.data = json_data.encode()
-                    else:
-                        # For more complex messages, try to recursively set fields
-                        for key, value in state_dict.items():
-                            if hasattr(ros_msg, key):
-                                setattr(ros_msg, key, value)
+                    # Publish the unpickled message directly
+                    self._topic_publishers[target_topic].publish(ros_msg)
+                    logger.info(f"Published unpickled message to {target_topic}")
                 except Exception as e:
-                    logger.error(f"Failed to parse base64 state data: {e}")
-            elif 'state_data' in simulator_state:
-                # Legacy format (bytes or string)
-                state_data = simulator_state.get('state_data', b'')
-                if isinstance(state_data, bytes):
-                    try:
-                        # Try to convert bytes to dict
-                        state_dict = json.loads(state_data.decode('utf-8'))
-                        
-                        # Try to set message fields from dict
-                        if hasattr(ros_msg, 'data'):
-                            if isinstance(ros_msg.data, str):
-                                ros_msg.data = json.dumps(state_dict)
-                            elif isinstance(ros_msg.data, bytes):
-                                ros_msg.data = state_data
-                        else:
-                            # For more complex messages, try to recursively set fields
-                            for key, value in state_dict.items():
-                                if hasattr(ros_msg, key):
-                                    setattr(ros_msg, key, value)
-                    except Exception as e:
-                        logger.error(f"Failed to parse state data: {e}")
-                        # Fallback to setting data field if available
-                        if hasattr(ros_msg, 'data'):
-                            if isinstance(ros_msg.data, str):
-                                ros_msg.data = str(state_data)
-                            elif isinstance(ros_msg.data, bytes):
-                                ros_msg.data = state_data
-            
-            # Publish message to algorithm
-            self._topic_publishers[target_topic].publish(ros_msg)
+                    logger.error(f"Failed to unpickle message data: {str(e)}")
+            else:
+                logger.error("No pickled data found in message")
             
         except Exception as e:
             logger.error(f"Error forwarding state to algorithm: {str(e)}")
+    
+    def send_algorithm_response(self, algorithm_response, topic):
+        # Send algorithm response to meta simulator, using topic-based routing
+        message = {
+            'source_id': self.adaptor_id,
+            'topic': topic,  # Use the topic name for routing
+            'timestamp': self.current_time,
+            'algorithm_response': algorithm_response
+        }
+        
+        try:
+            response = requests.post(
+                f"{self.meta_simulator_url}/send",
+                json=message
+            )
+            
+            if response.status_code == 200 and response.json().get('success'):
+                logger.info(f"Sent algorithm response to meta simulator for topic {topic}")
+            else:
+                logger.error(f"Failed to send algorithm response: {response.text}")
+        
+        except Exception as e:
+            logger.error(f"Error sending algorithm response: {str(e)}")
     
     def handle_algorithm_output(self, msg, topic_name):
         """Handle output message from algorithm"""
         try:
             logger.info(f"Received algorithm output on topic: {topic_name}")
             
-            # Convert ROS message to dictionary
-            try:
-                msg_dict = message_to_ordereddict(msg)
-            except Exception:
-                # Fallback for simple messages
-                if hasattr(msg, 'data'):
-                    msg_dict = {'data': msg.data}
-                else:
-                    msg_dict = {'data': str(msg)}
+            # Pickle the ROS message directly
+            import pickle
+            pickled_data = pickle.dumps(msg)
             
-            # Convert to JSON and then base64 encode
-            json_data = json.dumps(msg_dict)
-            b64_data = base64.b64encode(json_data.encode()).decode('ascii')
+            # Encode as base64
+            b64_data = base64.b64encode(pickled_data).decode('ascii')
             
             # Create the algorithm response
             algorithm_response = {
-                'response_data_b64': b64_data,
+                'pickled_data_b64': b64_data,
+                'msg_type': msg.__class__.__module__ + '.' + msg.__class__.__name__,
                 'compute_time_ns': 0,  # Will be calculated
                 'status': 'success'
             }
@@ -354,33 +400,10 @@ class AlgorithmAdaptor(Node):
                 del self.timing_data[message_id]
             
             # Send algorithm response to meta simulator
-            self.send_algorithm_response(algorithm_response)
+            self.send_algorithm_response(algorithm_response, topic_name)
             
         except Exception as e:
             logger.error(f"Error handling algorithm output: {str(e)}")
-    
-    def send_algorithm_response(self, algorithm_response):
-        # Send algorithm response to meta simulator
-        message = {
-            'source_id': self.adaptor_id,
-            'destination_id': 'simulator_adaptor',  # Replace with actual destination
-            'timestamp': self.current_time,
-            'algorithm_response': algorithm_response
-        }
-        
-        try:
-            response = requests.post(
-                f"{self.meta_simulator_url}/send",
-                json=message
-            )
-            
-            if response.status_code == 200 and response.json().get('success'):
-                logger.info(f"Sent algorithm response to meta simulator")
-            else:
-                logger.error(f"Failed to send algorithm response: {response.text}")
-        
-        except Exception as e:
-            logger.error(f"Error sending algorithm response: {str(e)}")
     
     def destroy_node(self):
         self.running = False

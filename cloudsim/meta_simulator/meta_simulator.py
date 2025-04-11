@@ -92,7 +92,8 @@ class MetaSimulator:
             }
             return state
             
-    def get_pending_messages_for_adaptor(self, adaptor_id, last_update_time=None):
+    def get_pending_messages_for_topics(self, topics, last_update_time=None):
+        """Get messages for the given topics"""
         with self.lock:
             messages = []
             message_ids = self.get_messages_for_time(self.current_time)
@@ -100,8 +101,29 @@ class MetaSimulator:
             for msg_id in message_ids:
                 if msg_id in self.message_store:
                     message = self.message_store[msg_id]
-                    if message.get('destination_id') == adaptor_id:
+                    
+                    # Check if the message contains a simulator state with a matching topic
+                    if 'simulator_state' in message:
+                        simulator_state = message.get('simulator_state', {})
+                        topic = simulator_state.get('frame_id', '')  # The topic is stored in frame_id
+                        
+                        # If the topic matches any of the requested topics, include the message
+                        if topic in topics:
+                            messages.append(message)
+                            logger.info(f"Message {msg_id} matches requested topic: {topic}")
+                    
+                    # Check for algorithm responses for requested topics
+                    elif 'algorithm_response' in message and 'topic' in message:
+                        topic = message.get('topic', '')
+                        
+                        if topic in topics:
+                            messages.append(message)
+                            logger.info(f"Message {msg_id} matches requested topic (algorithm response): {topic}")
+                    
+                    # Also include messages with a wildcard topic - useful for broadcast messages
+                    elif 'topic' in message and message['topic'] == '*':
                         messages.append(message)
+                        logger.info(f"Message {msg_id} is a broadcast message")
                         
             return messages
 
@@ -122,10 +144,10 @@ def register():
 def send_message():
     message_data = request.json
     source_id = message_data.get('source_id')
-    destination_id = message_data.get('destination_id')
+    topic = message_data.get('topic')
     
-    if not source_id or not destination_id:
-        return jsonify({'error': 'Missing source_id or destination_id'}), 400
+    if not source_id or not topic:
+        return jsonify({'error': 'Missing source_id or topic'}), 400
     
     # If this is a message that needs network simulation
     if message_data.get('simulate_network', False):
@@ -139,14 +161,19 @@ def send_message():
 @app.route('/poll', methods=['POST'])
 def poll():
     data = request.json
-    adaptor_id = data.get('adaptor_id')
+    topics = data.get('topics', [])
     last_update_time = data.get('last_update_time', simulator.current_time)
     
-    if not adaptor_id:
-        return jsonify({'error': 'Missing adaptor_id'}), 400
-    
-    messages = simulator.get_pending_messages_for_adaptor(adaptor_id, last_update_time)
     state = simulator.get_state()
+    if not topics:
+        return jsonify({
+        'success': True,
+        'state': state,
+        'messages': []
+    })
+    
+    messages = simulator.get_pending_messages_for_topics(topics, last_update_time)
+    
     
     return jsonify({
         'success': True,
