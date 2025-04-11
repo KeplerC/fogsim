@@ -268,6 +268,9 @@ class SimulatorAdaptor(Node):
                 logger.error(f"Error deserializing message for {topic}: {e}")
                 return
             
+            # Advance time to the message timestamp
+            self.advance_time(message.timestamp)
+            
         except Exception as e:
             logger.error(f"Error forwarding response to simulator: {str(e)}")
     

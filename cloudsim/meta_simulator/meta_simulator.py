@@ -17,6 +17,79 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from protos import messages_pb2
 from protos import messages_pb2_grpc
 
+# Embedded network simulator adaptor code
+class SimpleNetworkSimulator:
+    def __init__(self):
+        self.base_latency_ns = 1000000  # 1ms base latency
+        self.bandwidth_bps = 1000000000  # 1Gbps
+    
+    def calculate_latency(self, source, destination, packet_size_bytes):
+        # Simple latency model: base_latency + (packet_size / bandwidth)
+        transmission_latency_ns = (packet_size_bytes * 8 * 1000000000) // self.bandwidth_bps
+        return self.base_latency_ns + transmission_latency_ns
+
+class NS3NetworkSimulator:
+    def __init__(self):
+        # This would initialize the NS3 simulator, potentially via a subprocess or API
+        logging.getLogger('meta_simulator').info("Initializing NS3 Network Simulator")
+        self.ns3_process = None
+    
+    def calculate_latency(self, source, destination, packet_size_bytes):
+        # This would call into the NS3 simulator to calculate latency
+        # Placeholder implementation
+        logging.getLogger('meta_simulator').info(f"NS3 calculating latency from {source} to {destination} for {packet_size_bytes} bytes")
+        # Call into NS3 API or use IPC to get the latency
+        return 5000000  # 5ms in nanoseconds
+
+class NetworkSimulatorAdaptor:
+    def __init__(self):
+        # Get configuration from environment variables
+        self.adaptor_id = os.environ.get('ADAPTOR_ID', 'network_simulator_adaptor')
+        self.network_simulator_type = os.environ.get('NETWORK_SIMULATOR_TYPE', 'simple')  # 'simple', 'ns3', etc.
+        
+        # Initialize network simulator based on type
+        self.init_network_simulator()
+        
+        logging.getLogger('meta_simulator').info(f"Network Simulator Adaptor {self.adaptor_id} initialized with {self.network_simulator_type} simulator")
+    
+    def init_network_simulator(self):
+        if self.network_simulator_type == 'simple':
+            # Simple constant latency simulator
+            self.network_simulator = SimpleNetworkSimulator()
+        elif self.network_simulator_type == 'ns3':
+            # NS3 simulator (placeholder)
+            self.network_simulator = NS3NetworkSimulator()
+        else:
+            logging.getLogger('meta_simulator').error(f"Unknown network simulator type: {self.network_simulator_type}")
+            raise ValueError(f"Unknown network simulator type: {self.network_simulator_type}")
+    
+    def calculate_delay(self, message):
+        """
+        Calculate network delay for a message in nanoseconds
+        
+        Args:
+            message (dict): The message to calculate delay for
+            
+        Returns:
+            int: Delay in nanoseconds
+        """
+        # Extract relevant information from message
+        source = message.get('source_id', '')
+        destination = message.get('destination_id', '')
+        
+        # Calculate message size
+        if 'binary_data' in message:
+            message_size = len(message['binary_data'])
+        else:
+            # Estimate size if binary data not available
+            message_size = 1024  # Default 1KB
+        
+        # Calculate latency using network simulator
+        latency_ns = self.network_simulator.calculate_latency(source, destination, message_size)
+        
+        logging.getLogger('meta_simulator').info(f"Calculated network delay: {latency_ns}ns from {source} to {destination}")
+        return latency_ns
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('meta_simulator')
 
@@ -28,7 +101,9 @@ class MetaSimulator(messages_pb2_grpc.MetaSimulatorServicer):
         self.adaptors = set()
         self.lock = threading.RLock()
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
-        logger.info("Meta Simulator initialized")
+        # Initialize network simulator adaptor
+        self.network_simulator = NetworkSimulatorAdaptor()
+        logger.info("Meta Simulator initialized with Network Simulator Adaptor")
     
     def Poll(self, request, context):
         """gRPC Poll implementation - returns messages for requested topics"""
@@ -112,7 +187,8 @@ class MetaSimulator(messages_pb2_grpc.MetaSimulatorServicer):
                     'source_id': request.source_id,
                     'topic': request.topic,
                     'message_type': request.message_type,
-                    'binary_data': request.data
+                    'binary_data': request.data,
+                    'destination_id': request.destination_id if hasattr(request, 'destination_id') else ''
                 }
                 
                 # Store the message
@@ -147,12 +223,22 @@ class MetaSimulator(messages_pb2_grpc.MetaSimulatorServicer):
         }
         
         with self.lock:
-            success = self.advance_time(new_time)
+            # Find the next message timestamp if any
+            next_message_time = self._get_next_message_time()
+            
+            # If there's a message scheduled before the requested time,
+            # advance only to that message's time
+            if next_message_time and self._compare_times(next_message_time, new_time) < 0:
+                success = self.advance_time(next_message_time)
+                message = f"Time advanced to next message time: {next_message_time['seconds']}.{next_message_time['nanoseconds']}"
+            else:
+                success = self.advance_time(new_time)
+                message = "Time advanced as requested"
             
             # Create response
             response = messages_pb2.StatusResponse(
                 success=success,
-                message="Time advanced" if success else "Failed to advance time",
+                message=message,
                 current_time=messages_pb2.TimeStamp(
                     seconds=self.current_time['seconds'],
                     nanoseconds=self.current_time['nanoseconds']
@@ -215,6 +301,32 @@ class MetaSimulator(messages_pb2_grpc.MetaSimulatorServicer):
             logger.error(f"Error converting message to proto: {e}")
             return None
     
+    def _compare_times(self, time1, time2):
+        """Compare two timestamps, return -1 if time1 < time2, 0 if equal, 1 if time1 > time2"""
+        if time1['seconds'] < time2['seconds']:
+            return -1
+        elif time1['seconds'] > time2['seconds']:
+            return 1
+        else:
+            if time1['nanoseconds'] < time2['nanoseconds']:
+                return -1
+            elif time1['nanoseconds'] > time2['nanoseconds']:
+                return 1
+            else:
+                return 0
+    
+    def _get_next_message_time(self):
+        """Get the timestamp of the next scheduled message"""
+        with self.lock:
+            if not self.message_queue:
+                return None
+                
+            # Find the earliest timestamp
+            earliest_ts = min(self.message_queue.keys())
+            ts_secs, ts_nsecs = map(int, earliest_ts.split('.'))
+            
+            return {'seconds': ts_secs, 'nanoseconds': ts_nsecs}
+    
     def advance_time(self, new_time):
         """Advance simulation time"""
         with self.lock:
@@ -238,9 +350,12 @@ class MetaSimulator(messages_pb2_grpc.MetaSimulatorServicer):
                     del self.message_queue[timestamp]
             return messages
     
-    def add_message(self, message, delay_ns=0):
-        """Add a message to the queue with optional delay"""
+    def add_message(self, message):
+        """Add a message to the queue with network delay"""
         with self.lock:
+            # Calculate network delay using the network simulator
+            delay_ns = self.network_simulator.calculate_delay(message)
+            
             # Calculate delivery time
             delivery_time_secs = self.current_time['seconds']
             delivery_time_nsecs = self.current_time['nanoseconds'] + delay_ns
@@ -261,7 +376,7 @@ class MetaSimulator(messages_pb2_grpc.MetaSimulatorServicer):
             self.message_store[message_id] = message
             self.message_queue[timestamp_key].append(message_id)
             
-            logger.info(f"Scheduled message {message_id} for delivery at {timestamp_key}")
+            logger.info(f"Scheduled message {message_id} for delivery at {timestamp_key} with delay {delay_ns}ns")
             return message_id
     
     def get_state(self):
