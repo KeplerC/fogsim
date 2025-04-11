@@ -1,1 +1,72 @@
- 
+syntax = "proto3";
+
+package cloudsim;
+
+service MetaSimulator {
+  // Polling for both Environment Adaptor and Algorithm Adaptor
+  rpc Poll(PollRequest) returns (PollResponse) {}
+  
+  // Advance simulation time
+  rpc AdvanceTime(TimeRequest) returns (StatusResponse) {}
+  
+  // Get simulator state
+  rpc GetState(EmptyRequest) returns (StateResponse) {}
+}
+
+// Common message structures
+message EmptyRequest {}
+
+message TimeStamp {
+  int64 seconds = 1;
+  int32 nanoseconds = 2;
+}
+
+message TimeRequest {
+  TimeStamp time = 1;
+}
+
+message StatusResponse {
+  bool success = 1;
+  string message = 2;
+  TimeStamp current_time = 3;
+}
+
+message SimulatorState {
+  TimeStamp current_time = 1;
+  int32 pending_messages = 2;
+  repeated string registered_adaptors = 3;
+}
+
+message StateResponse {
+  bool success = 1;
+  SimulatorState state = 2;
+}
+
+// Polling related messages
+message PollRequest {
+  string adaptor_id = 1;
+  repeated string topics = 2;
+  TimeStamp last_update_time = 3;
+}
+
+message PollResponse {
+  bool success = 1;
+  SimulatorState state = 2;
+  repeated Message messages = 3;
+}
+
+// Main message types
+message Message {
+  string message_id = 1;
+  string source_id = 2;
+  string topic = 3;
+  oneof content {
+    SimulatorState simulator_state = 4;
+    AlgorithmResponse algorithm_response = 5;
+  }
+}
+
+message AlgorithmResponse {
+  string data = 1;
+  string data_format = 2;  // e.g. 'json', 'binary', etc.
+} 

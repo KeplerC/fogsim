@@ -6,13 +6,15 @@ services:
       context: .
       dockerfile: meta_simulator/Dockerfile
     ports:
-      - "5000:5000"
+      - "50051:50051"  # gRPC port instead of HTTP port
     restart: unless-stopped
     networks:
       - cloudsim_network
     volumes:
       - ./meta_simulator:/app/meta_simulator
       - ./protos:/app/protos
+    environment:
+      - GRPC_PORT=50051
 
   simulator_adaptor:
     build:
@@ -26,10 +28,8 @@ services:
       - simulator_ros_network
     environment:
       - ROS_DOMAIN_ID=1  # Simulator domain
-      - META_SIMULATOR_URL=http://meta_simulator:5000
+      - META_SIMULATOR_URL=meta_simulator:50051  # gRPC address
       - ADAPTOR_ID=simulator_adaptor_1
-      - ALGORITHM_ADAPTOR_ID=algorithm_adaptor_1  # Add algorithm adaptor ID
-      - USE_WILDCARD_DESTINATIONS=true  # Enable wildcards for more flexible message routing
       - PYTHONPATH=/app
       - POLL_INTERVAL=0.5  # Polling rate in seconds
       - TOPIC_DISCOVERY_INTERVAL=5.0  # Topic discovery interval in seconds
@@ -49,36 +49,14 @@ services:
       - algorithm_ros_network
     environment:
       - ROS_DOMAIN_ID=2  # Algorithm domain
-      - META_SIMULATOR_URL=http://meta_simulator:5000
+      - META_SIMULATOR_URL=meta_simulator:50051  # gRPC address
       - ADAPTOR_ID=algorithm_adaptor_1
-      - SIMULATOR_ADAPTOR_ID=simulator_adaptor_1  # Add simulator adaptor ID
-      - USE_WILDCARD_DESTINATIONS=true  # Enable wildcards for more flexible message routing
       - PYTHONPATH=/app
       - POLL_INTERVAL=0.5  # Polling rate in seconds
       - TOPIC_DISCOVERY_INTERVAL=5.0  # Topic discovery interval in seconds
     volumes:
       - ./algorithm_adaptor:/app/algorithm_adaptor
       - ./protos:/app/protos
-
-  network_simulator_adaptor:
-    build:
-      context: .
-      dockerfile: network_simulator_adaptor/Dockerfile
-    depends_on:
-      - meta_simulator
-    restart: unless-stopped
-    networks:
-      - cloudsim_network
-    environment:
-      - META_SIMULATOR_URL=http://meta_simulator:5000
-      - ADAPTOR_ID=network_simulator_adaptor
-      - NETWORK_SIMULATOR_TYPE=simple
-      - PYTHONPATH=/app
-      - POLL_INTERVAL=0.5  # Polling rate in seconds
-    volumes:
-      - ./network_simulator_adaptor:/app/network_simulator_adaptor
-      - ./protos:/app/protos
-
   # Example simulator for testing
   example_simulator:
     build:
