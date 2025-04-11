@@ -67,11 +67,13 @@ class GymCoSimulator(BaseCoSimulator):
         """Render the current state of the simulation."""
         try:
             # New Gymnasium API (may not accept mode parameter)
-            self.robotics_simulator.render()
+            frame = self.robotics_simulator.render()
+            return frame
         except TypeError:
             try:
                 # Old Gym API (requires mode parameter)
-                self.robotics_simulator.render(mode=mode)
+                frame = self.robotics_simulator.render(mode=mode)
+                return frame
             except Exception as e:
                 print(f"Render failed: {e}")
     
