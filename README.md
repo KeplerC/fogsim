@@ -1,65 +1,104 @@
-# CloudSim with gRPC
+# Co-Simulator
 
-This project implements a cloud-based simulator architecture using gRPC for efficient communication between components.
+A Python package for co-simulation between robotics and network simulation environments.
 
-## Key Components
+## Features
 
-### Meta Simulator
-The central coordination system that maintains simulation time and message passing between adaptors.
+- Integration with popular robotics simulators (Gym, Carla)
+- Network simulation support via NS3
+- Message scheduling and latency simulation
+- Extensible architecture for adding new simulators
 
-### Environment Adaptor
-Connects to simulation environments and forwards their state to the Meta Simulator.
+## Installation
 
-### Algorithm Adaptor
-Connects to algorithm implementations and forwards their commands/responses to the Meta Simulator.
+```bash
+# Install the package
+pip install cosimulator
 
-## Communication Architecture
+# For development
+pip install -e ".[dev]"
+```
 
-The system uses gRPC for all component communication:
+## Usage
 
-1. **Streamlined Polling**: Both environment and algorithm adaptors poll the Meta Simulator for messages, which eliminates the need for separate register and send operations.
+### Gym Environment Example
 
-2. **Bidirectional Communication**: Messages flow naturally through the polling mechanism:
-   - Environment adaptor publishes environment states that are returned in algorithm adaptor's poll responses
-   - Algorithm adaptor publishes algorithm responses that are returned in environment adaptor's poll responses
+```python
+import gym
+from cosimulator import GymCoSimulator
+from cosimulator.network import NS3NetworkSimulator
 
-3. **Protocol Buffer Messages**: All messages are defined using Protocol Buffers in `messages.proto`.
+# Create network simulator
+network_sim = NS3NetworkSimulator()
 
-## Running the System
+# Create Gym environment
+env = gym.make('CartPole-v1')
 
-1. Start the Meta Simulator:
-   ```
-   cd cloudsim
-   python -m cloudsim.meta_simulator.meta_simulator
-   ```
+# Create co-simulator
+co_sim = GymCoSimulator(network_sim, env)
 
-2. Start the Environment Adaptor:
-   ```
-   cd cloudsim
-   python -m cloudsim.simulator_adaptor.simulator_adaptor
-   ```
+# Run simulation
+observation = co_sim.reset()
+done = False
 
-3. Start the Algorithm Adaptor:
-   ```
-   cd cloudsim
-   python -m cloudsim.algorithm_adaptor.algorithm_adaptor
-   ```
+while not done:
+    action = env.action_space.sample()
+    observation, reward, done, info = co_sim.step(action)
+    co_sim.render()
 
-## Configuration
+co_sim.close()
+```
 
-Each component can be configured using environment variables:
+### Carla Environment Example
 
-- `META_SIMULATOR_URL`: gRPC server address (default: `localhost:50051`)
-- `ADAPTOR_ID`: Unique ID for each adaptor
-- `SIMULATOR_TOPIC_PREFIX`/`ALGORITHM_TOPIC_PREFIX`: Prefix for topic discovery
-- `POLL_INTERVAL`: How often to poll for updates (in seconds)
-- `TOPIC_DISCOVERY_INTERVAL`: How often to discover new topics (in seconds)
-- `GRPC_PORT`: Port for the Meta Simulator gRPC server (default: `50051`)
+```python
+import carla
+from cosimulator import CarlaCoSimulator
+from cosimulator.network import NS3NetworkSimulator
 
-## Benefits of the New Architecture
+# Create network simulator
+network_sim = NS3NetworkSimulator()
 
-1. **Simplified Communication**: No need for separate register and send endpoints
-2. **Reduced Overhead**: gRPC is more efficient than HTTP+JSON for internal communication
-3. **Type Safety**: Protocol Buffers provide strong typing for all messages
-4. **Streamlined Code**: Cleaner implementation with fewer edge cases
-5. **Better Performance**: Lower latency and higher throughput 
+# Create Carla environment
+client = carla.Client('localhost', 2000)
+world = client.get_world()
+
+# Create co-simulator
+co_sim = CarlaCoSimulator(network_sim, world)
+
+# Run simulation
+observation = co_sim.reset()
+done = False
+
+while not done:
+    action = np.array([0.0, 0.5])  # Example action
+    observation, reward, done, info = co_sim.step(action)
+    co_sim.render()
+
+co_sim.close()
+```
+
+## Development
+
+### Running Tests
+
+```bash
+pytest tests/
+```
+
+### Code Style
+
+```bash
+# Format code
+black .
+
+# Check code style
+flake8
+
+# Type checking
+mypy .
+```
+
+## License
+
+MIT License 
