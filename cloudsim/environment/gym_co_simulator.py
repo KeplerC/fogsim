@@ -60,17 +60,19 @@ class GymCoSimulator(BaseCoSimulator):
         messages = self._process_network_messages()
         self.received_action_this_step = False
         
-        # Process all messages and track latencies
+        # Track round-trip latency when action arrives
+        round_trip_latency = None
+        
+        # Process all messages
         for message in messages:
             if isinstance(message, dict) and 'timestamp' in message:
                 # Calculate actual network latency
-                latency = self.get_current_time() - message['timestamp']
+                current_time = self.get_current_time()
+                latency = current_time - message['timestamp']
                 
-                # Track latency by message type
+                # Only track round-trip latency for actions
                 if 'action' in message:
-                    action_latencies.append(latency)
-                elif 'observation' in message:
-                    observation_latencies.append(latency)
+                    round_trip_latency = latency
                     
             self._handle_message(message)
             logger.info("Handled message: %s", str(message)[:100] + "..." if len(str(message)) > 100 else str(message))
@@ -130,14 +132,9 @@ class GymCoSimulator(BaseCoSimulator):
         if not isinstance(info, dict):
             info = {}
             
-        # Calculate average latencies from actual message deliveries
-        action_latency = sum(action_latencies) / len(action_latencies) if action_latencies else 0.0
-        observation_latency = sum(observation_latencies) / len(observation_latencies) if observation_latencies else 0.0
-        
-        info['action_latency'] = action_latency
-        info['observation_latency'] = observation_latency
-        info['total_latency'] = action_latency + observation_latency
-        info['action_from_previous_step'] = not self.received_action_this_step
+        # Only include round_trip_latency if an action arrived this step
+        if self.received_action_this_step and round_trip_latency is not None:
+            info['round_trip_latency'] = round_trip_latency
         
         # Advance simulation time
         self._advance_time()

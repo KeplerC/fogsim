@@ -26,7 +26,7 @@ def run_gym_example():
     
     # Create network simulator with virtual clock
     network_sim = NSPyNetworkSimulator(
-        source_rate=100000.0,  # 10 Kbps
+        source_rate=10000.0,  # 10 Kbps
         weights=[1, 2],       # Weight client->server flows lower than server->client
         debug=True
     )
@@ -39,9 +39,7 @@ def run_gym_example():
     
     # Set up video writer and latency data for plotting
     frames = []
-    action_latencies = []
-    observation_latencies = []
-    total_latencies = []
+    round_trip_latencies = []
     timesteps = []
     
     # Run simulation
@@ -76,10 +74,8 @@ def run_gym_example():
             done = terminated or truncated
         
         # Record latency information if available in info
-        if 'action_latency' in info and 'observation_latency' in info:
-            action_latencies.append(info['action_latency'])
-            observation_latencies.append(info['observation_latency'])
-            total_latencies.append(info['total_latency'])
+        if 'round_trip_latency' in info:
+            round_trip_latencies.append(info['round_trip_latency'])
             timesteps.append(start_time)
         
         # Get the rendered frame as RGB array
@@ -89,7 +85,7 @@ def run_gym_example():
             
         step_count += 1
     
-    print(f"Collected {len(frames)} frames and {len(total_latencies)} latency measurements")
+    print(f"Collected {len(frames)} frames and {len(round_trip_latencies)} latency measurements")
     print(f"CartPole survived for {step_count} steps")
 
     co_sim.close()
@@ -112,15 +108,13 @@ def run_gym_example():
     # Plot latency data if available
     if timesteps:
         plt.figure(figsize=(10, 6))
-        plt.plot(timesteps, action_latencies, 'r-', linewidth=2.0, label='Client → Server (Flow 0)')
-        plt.plot(timesteps, observation_latencies, 'b-', linewidth=2.0, label='Server → Client (Flow 1)')
-        plt.plot(timesteps, total_latencies, 'g--', linewidth=1.5, label='Total Latency')
-        plt.title("Network Latency over Time")
+        plt.plot(timesteps, round_trip_latencies, 'r-', linewidth=2.0, label='Round-trip Latency')
+        plt.title("Round-trip Environment-Action Latency")
         plt.xlabel("Simulation Time (s)")
         plt.ylabel("Latency (s)")
         plt.legend()
         plt.grid(True)
-        plt.savefig("network_latency.png")
+        plt.savefig("round_trip_latency.png")
         plt.show()
 
 if __name__ == "__main__":
