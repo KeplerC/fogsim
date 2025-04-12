@@ -24,6 +24,8 @@ classifiers = [
 
 dependencies = [
     "numpy>=1.21.0",
+    "matplotlib>=3.5.0",
+    "opencv-python>=4.5.0",
 ]
 
 [project.optional-dependencies]
@@ -33,9 +35,17 @@ gym = [
 carla = [
     "carla>=0.9.13",
 ]
+dashboard = [
+    "flask>=2.0.0",
+    "opencv-python>=4.5.0",
+    "matplotlib>=3.5.0",
+]
 all = [
     "gym>=0.21.0",
     "carla>=0.9.13",
+    "flask>=2.0.0",
+    "opencv-python>=4.5.0",
+    "matplotlib>=3.5.0",
 ]
 dev = [
     "pytest>=7.0.0",
