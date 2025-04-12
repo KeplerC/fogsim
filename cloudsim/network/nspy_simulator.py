@@ -2,10 +2,14 @@ import simpy
 import time
 from typing import Dict, Any, Optional, Callable, List, Tuple, Set
 import uuid
+import logging
 
 from ns.scheduler.virtual_clock import VirtualClockServer
 from ns.packet.sink import PacketSink
 from ns.packet.packet import Packet
+
+# Set up logging
+logger = logging.getLogger(__name__)
 
 class NSPyNetworkSimulator:
     """Network simulator implementation using ns.py with VirtualClock scheduler."""
@@ -32,6 +36,9 @@ class NSPyNetworkSimulator:
         self.ready_messages: Dict[str, Any] = {}  # msg_id -> message
         self.last_checked_arrivals: Dict[int, int] = {}  # flow_id -> last checked arrival index
         
+        logger.info("NSPyNetworkSimulator initialized with rate=%f, weights=%s, debug=%s", 
+                    source_rate, weights, debug)
+        
     def register_packet(self, message: Any, flow_id: int = 0, size: float = 1000.0) -> str:
         """
         Register a packet to be sent through the network.
@@ -49,6 +56,7 @@ class NSPyNetworkSimulator:
         # Initialize the flow's arrival tracking if not already done
         if flow_id not in self.last_checked_arrivals:
             self.last_checked_arrivals[flow_id] = 0
+            logger.info("Initialized arrival tracking for flow_id=%d", flow_id)
         
         # Create and send packet through virtual clock server
         packet = Packet(self.env.now, size, flow_id=flow_id, packet_id=msg_id)
@@ -58,6 +66,9 @@ class NSPyNetworkSimulator:
         
         # Send packet to server
         self.vc_server.put(packet)
+        
+        logger.info("Registered packet with ID=%s, flow_id=%d, size=%f, time=%f", 
+                    msg_id, flow_id, size, self.env.now)
         
         return msg_id
     
@@ -70,12 +81,17 @@ class NSPyNetworkSimulator:
         """
         # Skip running if time_point is not greater than current time
         if time_point <= self.env.now:
+            logger.info("Skipping run_until as time_point=%f <= current_time=%f", 
+                        time_point, self.env.now)
             return
+            
+        logger.info("Running simulation from %f to %f", self.env.now, time_point)
             
         # Run the simulation
         try:
             self.env.run(until=time_point)
         except simpy.core.EmptySchedule:
+            logger.info("No more events to process in simulation")
             pass  # No more events to process
             
         # Check for new packet arrivals by flow
@@ -90,11 +106,13 @@ class NSPyNetworkSimulator:
                 last_idx = self.last_checked_arrivals[flow_id]
                 
                 # Process any new arrivals since we last checked
+                new_arrivals = 0
                 for i in range(last_idx, len(arrivals)):
                     arrival_time = arrivals[i]
                     
                     # If this packet arrived by our time_point
                     if arrival_time <= time_point:
+                        new_arrivals += 1
                         # In a real implementation, we would need a way to map arrival positions to
                         # specific packet IDs. Since we don't have access to the actual packet objects,
                         # we'll use a simplified approach: mark the first pending packet for this flow
@@ -103,15 +121,22 @@ class NSPyNetworkSimulator:
                             if message_flow_id == flow_id and packet_id not in delivered_packet_ids:
                                 self.ready_messages[packet_id] = message
                                 delivered_packet_ids.add(packet_id)
+                                logger.info("Packet ID=%s delivered at time=%f, latency=%f", 
+                                            packet_id, arrival_time, arrival_time - sent_time)
                                 break
                 
                 # Update the last checked index for next time
                 self.last_checked_arrivals[flow_id] = len(arrivals)
+                logger.info("Flow %d: Processed %d new arrivals, total arrivals=%d", 
+                             flow_id, new_arrivals, len(arrivals))
         
         # Remove delivered packets from pending list
         for packet_id in delivered_packet_ids:
             if packet_id in self.pending_packets:
                 del self.pending_packets[packet_id]
+        
+        logger.info("Delivered %d packets, %d still pending", 
+                    len(delivered_packet_ids), len(self.pending_packets))
     
     def get_ready_messages(self) -> List[Any]:
         """
@@ -121,7 +146,9 @@ class NSPyNetworkSimulator:
             List of ready messages
         """
         messages = list(self.ready_messages.values())
+        message_count = len(messages)
         self.ready_messages.clear()
+        logger.info("Retrieved %d ready messages", message_count)
         return messages
     
     def estimate_latency(self, size: float = 1000.0, flow_id: int = 0) -> float:
@@ -138,11 +165,16 @@ class NSPyNetworkSimulator:
         """
         # Simple estimation based on rate and size
         if hasattr(self.vc_server, 'rate'):
-            return size / self.vc_server.rate
-        return 0.1  # Default latency if estimation not possible
+            latency = size / self.vc_server.rate
+            logger.info("Estimated latency for size=%f, flow_id=%d: %f", 
+                         size, flow_id, latency)
+            return latency
+        logger.info("Using default latency (100000.0) for size=%f, flow_id=%d", size, flow_id)
+        return 100000.0  # Default latency if estimation not possible
     
     def reset(self) -> None:
         """Reset the network simulator."""
+        logger.info("Resetting network simulator")
         self.env = simpy.Environment()
         self.vc_server = VirtualClockServer(
             self.env, 
@@ -158,4 +190,5 @@ class NSPyNetworkSimulator:
     
     def close(self) -> None:
         """Clean up resources."""
+        logger.info("Closing network simulator")
         pass 
