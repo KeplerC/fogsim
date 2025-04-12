@@ -26,6 +26,10 @@ class GymCoSimulator(BaseCoSimulator):
         self.current_observation = None
         self.last_action = None
         self.received_action_this_step = False
+        # Track observation IDs and action responses
+        self.pending_observations = {}  # Maps observation_id -> observation data
+        self.observation_counter = 0    # To generate unique observation IDs
+        self.last_received_observation_id = None  # Track which observation we're responding to
         logger.info("GymCoSimulator initialized with gym environment %s", type(gym_env).__name__)
         
     def step(self, action: Optional[np.ndarray] = None) -> Tuple[np.ndarray, float, bool, Dict]:
@@ -44,18 +48,7 @@ class GymCoSimulator(BaseCoSimulator):
         # Track latency information for info dict
         action_latencies = []
         observation_latencies = []
-                   
-        # If action is provided from the user/client, send it through the network
-        if action is not None:
-            # Simulate sending action from client to server
-            client_send_time = self.get_current_time()
-            action_size = self._estimate_message_size(action)
-            action_msg_id = self._send_message(
-                {'action': action, 'timestamp': client_send_time},
-                flow_id=self.CLIENT_TO_SERVER_FLOW,
-                size=action_size
-            )
-                   
+        
         # Process any network messages that should be visible now
         messages = self._process_network_messages()
         self.received_action_this_step = False
@@ -63,19 +56,62 @@ class GymCoSimulator(BaseCoSimulator):
         # Track round-trip latency when action arrives
         round_trip_latency = None
         
-        # Process all messages
+        # Process all messages to receive observations or actions
         for message in messages:
-            if isinstance(message, dict) and 'timestamp' in message:
-                # Calculate actual network latency
+            if isinstance(message, dict):
                 current_time = self.get_current_time()
-                latency = current_time - message['timestamp']
                 
-                # Only track round-trip latency for actions
-                if 'action' in message:
-                    round_trip_latency = latency
+                # Process observation message (client side received observation)
+                if 'observation' in message and 'observation_id' in message:
+                    observation_id = message['observation_id']
+                    self.last_received_observation_id = observation_id
                     
+                    # Calculate observation latency
+                    if 'timestamp' in message:
+                        latency = current_time - message['timestamp']
+                        observation_latencies.append(latency)
+                        logger.info(f"Received observation {observation_id} with latency {latency}")
+                
+                # Process action message (server side received action)
+                if 'action' in message and 'responding_to_observation' in message:
+                    response_to_observation = message['responding_to_observation']
+                    
+                    # Calculate action latency
+                    if 'timestamp' in message:
+                        latency = current_time - message['timestamp']
+                        action_latencies.append(latency)
+                        
+                        # Only count round-trip for actions matching the observation they respond to
+                        if response_to_observation in self.pending_observations:
+                            obs_timestamp = self.pending_observations[response_to_observation].get('timestamp')
+                            if obs_timestamp:
+                                round_trip_latency = current_time - obs_timestamp
+                                logger.info(f"Round-trip latency for observation {response_to_observation}: {round_trip_latency}")
+                    
+                    # Update the last_action based on the received message
+                    self.last_action = message['action']
+                    self.received_action_this_step = True
+                    logger.info(f"Received action for observation {response_to_observation}: {str(self.last_action)}")
+            
+            # Handle the message (legacy method)
             self._handle_message(message)
-            logger.info("Handled message: %s", str(message)[:100] + "..." if len(str(message)) > 100 else str(message))
+                   
+        # If client provided an action AND we have received an observation to respond to,
+        # send that action through the network with observation context
+        if action is not None and self.last_received_observation_id is not None:
+            # Simulate sending action from client to server
+            client_send_time = self.get_current_time()
+            action_size = self._estimate_message_size(action)
+            action_msg_id = self._send_message(
+                {
+                    'action': action, 
+                    'timestamp': client_send_time,
+                    'responding_to_observation': self.last_received_observation_id
+                },
+                flow_id=self.CLIENT_TO_SERVER_FLOW,
+                size=action_size
+            )
+            logger.info(f"Sent action in response to observation {self.last_received_observation_id}")
 
         # Use the last action received from the network, or keep using the previous one
         if not self.received_action_this_step and self.last_action is None:
@@ -117,22 +153,44 @@ class GymCoSimulator(BaseCoSimulator):
         
         # Send observation through network simulator (server to client)
         if observation is not None:
+            # Generate a unique observation ID
+            self.observation_counter += 1
+            observation_id = self.observation_counter
+            
             # Record send time
             server_send_time = self.get_current_time()
             
-            # Send observation through network
+            # Store this observation in our pending observations map
+            self.pending_observations[observation_id] = {
+                'observation': observation,
+                'timestamp': server_send_time,
+                'responded_to': False
+            }
+            
+            # Send observation through network with its ID
             observation_size = self._estimate_message_size(observation)
             obs_msg_id = self._send_message(
-                {'observation': observation, 'timestamp': server_send_time},
+                {
+                    'observation': observation, 
+                    'timestamp': server_send_time,
+                    'observation_id': observation_id
+                },
                 flow_id=self.SERVER_TO_CLIENT_FLOW,
                 size=observation_size
             )
+            logger.info(f"Sent observation with ID {observation_id}")
         
         # Add network info to the info dict
         if not isinstance(info, dict):
             info = {}
+        
+        # Include latency information in info dict
+        if action_latencies:
+            info['action_latencies'] = action_latencies
+        if observation_latencies:
+            info['observation_latencies'] = observation_latencies
             
-        # Only include round_trip_latency if an action arrived this step
+        # Include round-trip latency if an action arrived this step
         if self.received_action_this_step and round_trip_latency is not None:
             info['round_trip_latency'] = round_trip_latency
         
@@ -150,6 +208,10 @@ class GymCoSimulator(BaseCoSimulator):
         self.current_time = 0.0
         self.last_action = None
         self.received_action_this_step = False
+        # Reset observation tracking
+        self.pending_observations = {}
+        self.observation_counter = 0
+        self.last_received_observation_id = None
         return observation
     
     def render(self, mode: str = 'human') -> None:
