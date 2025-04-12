@@ -23,7 +23,7 @@ def run_dashboard_example(host='127.0.0.1', port=5000):
     try:
         # Create network simulator with virtual clock
         network_sim = NSPyNetworkSimulator(
-            source_rate=1000000.0,  # 10 Mbps
+            source_rate=100000.0,  # 10 Mbps
             weights=[1, 2],       # Weight client->server flows lower than server->client
             debug=True
         )

@@ -201,10 +201,10 @@ def run_simulation():
             
             step_count += 1
             
-            if done:
-                logger.info(f"Simulation completed after {step_count} steps")
-                running = False
-                break
+            # if done:
+            #     logger.info(f"Simulation completed after {step_count} steps")
+            #     running = False
+            #     break
                 
             # Add a small delay to prevent high CPU usage
             time.sleep(0.05)

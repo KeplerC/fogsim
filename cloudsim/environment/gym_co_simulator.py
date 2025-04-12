@@ -30,6 +30,13 @@ class GymCoSimulator(BaseCoSimulator):
         self.pending_observations = {}  # Maps observation_id -> observation data
         self.observation_counter = 0    # To generate unique observation IDs
         self.last_received_observation_id = None  # Track which observation we're responding to
+        
+        # For tracking delayed network observations
+        self.last_network_observation = None  # The most recent observation received through the network
+        self.last_network_reward = 0.0  # The reward associated with the last network observation
+        self.last_network_done = False  # The done flag associated with the last network observation
+        self.last_network_info = {}     # The info associated with the last network observation
+        
         logger.info("GymCoSimulator initialized with gym environment %s", type(gym_env).__name__)
         
     def step(self, action: Optional[np.ndarray] = None) -> Tuple[np.ndarray, float, bool, Dict]:
@@ -41,7 +48,7 @@ class GymCoSimulator(BaseCoSimulator):
                    If None and no message arrives, the previous timestep's action will be used.
             
         Returns:
-            Tuple containing observation, reward, done, and info
+            Tuple containing observation, reward, done, and info as received through the network
         """
         logger.info("Starting co-simulation step at time %f", self.get_current_time())
         
@@ -52,9 +59,16 @@ class GymCoSimulator(BaseCoSimulator):
         # Process any network messages that should be visible now
         messages = self._process_network_messages()
         self.received_action_this_step = False
+        received_observation_this_step = False
         
         # Track round-trip latency when action arrives
         round_trip_latency = None
+        
+        # Variables to hold the latest network observation data
+        network_observation = None
+        network_reward = None
+        network_done = None
+        network_info = None
         
         # Process all messages to receive observations or actions
         for message in messages:
@@ -65,6 +79,13 @@ class GymCoSimulator(BaseCoSimulator):
                 if 'observation' in message and 'observation_id' in message:
                     observation_id = message['observation_id']
                     self.last_received_observation_id = observation_id
+                    
+                    # Store this observation as our latest received through network
+                    network_observation = message.get('observation')
+                    network_reward = message.get('reward', 0.0)
+                    network_done = message.get('done', False)
+                    network_info = message.get('info', {})
+                    received_observation_this_step = True
                     
                     # Calculate observation latency
                     if 'timestamp' in message:
@@ -95,6 +116,13 @@ class GymCoSimulator(BaseCoSimulator):
             
             # Handle the message (legacy method)
             self._handle_message(message)
+        
+        # If we received a new observation through the network, update our stored values
+        if received_observation_this_step and network_observation is not None:
+            self.last_network_observation = network_observation
+            self.last_network_reward = network_reward
+            self.last_network_done = network_done
+            self.last_network_info = network_info
                    
         # If client provided an action AND we have received an observation to respond to,
         # send that action through the network with observation context
@@ -164,40 +192,54 @@ class GymCoSimulator(BaseCoSimulator):
             self.pending_observations[observation_id] = {
                 'observation': observation,
                 'timestamp': server_send_time,
-                'responded_to': False
+                'responded_to': False,
+                'reward': reward,
+                'done': done,
+                'info': info
             }
             
-            # Send observation through network with its ID
+            # Send observation through network with its ID and additional data
             observation_size = self._estimate_message_size(observation)
             obs_msg_id = self._send_message(
                 {
                     'observation': observation, 
                     'timestamp': server_send_time,
-                    'observation_id': observation_id
+                    'observation_id': observation_id,
+                    'reward': reward,
+                    'done': done,
+                    'info': info
                 },
                 flow_id=self.SERVER_TO_CLIENT_FLOW,
                 size=observation_size
             )
             logger.info(f"Sent observation with ID {observation_id}")
         
-        # Add network info to the info dict
-        if not isinstance(info, dict):
-            info = {}
+        # Use network-received info or initialize if none exists
+        network_info_to_return = self.last_network_info if self.last_network_info is not None else {}
+        if not isinstance(network_info_to_return, dict):
+            network_info_to_return = {}
         
         # Include latency information in info dict
         if action_latencies:
-            info['action_latencies'] = action_latencies
+            network_info_to_return['action_latencies'] = action_latencies
         if observation_latencies:
-            info['observation_latencies'] = observation_latencies
+            network_info_to_return['observation_latencies'] = observation_latencies
             
         # Include round-trip latency if an action arrived this step
         if self.received_action_this_step and round_trip_latency is not None:
-            info['round_trip_latency'] = round_trip_latency
+            network_info_to_return['round_trip_latency'] = round_trip_latency
         
         # Advance simulation time
         self._advance_time()
             
-        return observation, reward, done, info
+        # Return the observation that came through the network (with delay),
+        # NOT the immediate result from the robotics simulator
+        return (
+            self.last_network_observation if self.last_network_observation is not None else observation,
+            self.last_network_reward,
+            self.last_network_done,
+            network_info_to_return
+        )
     
     def reset(self) -> np.ndarray:
         """Reset both simulators to initial state."""
@@ -212,6 +254,14 @@ class GymCoSimulator(BaseCoSimulator):
         self.pending_observations = {}
         self.observation_counter = 0
         self.last_received_observation_id = None
+        # Reset network observation tracking
+        self.last_network_observation = None
+        self.last_network_reward = 0.0
+        self.last_network_done = False
+        self.last_network_info = {}
+        
+        # For the first observation after reset, we'll use the immediate observation
+        # since there wouldn't be any network-received observation yet
         return observation
     
     def render(self, mode: str = 'human') -> None:

@@ -26,7 +26,7 @@ def run_gym_example():
     
     # Create network simulator with virtual clock
     network_sim = NSPyNetworkSimulator(
-        source_rate=10000.0,  # 10 Kbps
+        source_rate=100.0,  # 10 Kbps
         weights=[1, 2],       # Weight client->server flows lower than server->client
         debug=True
     )
@@ -54,11 +54,21 @@ def run_gym_example():
     done = False
     step_count = 0
     
-    while not done and step_count < 200:  # Add back step limit for safety
-        # Simple policy: move cart in the direction of pole tilt
-        # Pole angle is at index 2 in the observation array
-        pole_angle = observation[2]
-        action = 1 if pole_angle > 0 else 0
+    while step_count < 200:  # Add back step limit for safety
+        # Perfect policy using a linear combination of all state variables
+        # observation[0]: Cart Position 
+        # observation[1]: Cart Velocity
+        # observation[2]: Pole Angle
+        # observation[3]: Pole Angular Velocity
+        
+        # Optimal weights found through reinforcement learning
+        weights = [-0.04, -0.22, 0.8, 0.52]
+        
+        # Calculate weighted sum of state variables
+        weighted_sum = sum(w * obs for w, obs in zip(weights, observation))
+        
+        # Take action based on weighted sum
+        action = 1 if weighted_sum > 0 else 0
         
         # Record time before step
         start_time = co_sim.get_current_time()
