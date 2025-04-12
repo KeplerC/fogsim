@@ -89,6 +89,7 @@ class GymCoSimulator(BaseCoSimulator):
             except Exception as e:
                 logger.error("Failed to sample action: %s", str(e))
                 server_action = np.zeros(1)
+            self.last_action = server_action
         else:
             # Use the last action we received (either in this step or previous steps)
             server_action = self.last_action
