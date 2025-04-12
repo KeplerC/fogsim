@@ -10,38 +10,29 @@ logger = logging.getLogger(__name__)
 class BaseCoSimulator(ABC):
     """Base class for co-simulation between robotics and network simulation."""
     
-    def __init__(self, network_simulator: Any, robotics_simulator: Any, cosim_timestep: float = 0.1, 
-                 network_timestep: Optional[float] = None, robotics_timestep: Optional[float] = None):
+    def __init__(self, network_simulator: Any, robotics_simulator: Any, timestep: float = 0.1):
         """
         Initialize the co-simulator.
         
         Args:
             network_simulator: Instance of network simulator (e.g., NSPyNetworkSimulator)
             robotics_simulator: Instance of robotics simulator (e.g., gym, carla)
-            cosim_timestep: Co-simulation timestep in seconds (default: 0.1)
-            network_timestep: Network simulator timestep in seconds (default: same as cosim_timestep)
-            robotics_timestep: Robotics simulator timestep in seconds (default: same as cosim_timestep)
+            timestep: Unified simulation timestep in seconds (default: 0.1)
         """
         self.network_simulator = network_simulator
         self.robotics_simulator = robotics_simulator
         
-        # Set default timesteps if not provided
-        self.cosim_timestep = cosim_timestep
-        self.network_timestep = network_timestep if network_timestep is not None else cosim_timestep
-        self.robotics_timestep = robotics_timestep if robotics_timestep is not None else cosim_timestep
+        # Set a single unified timestep for all simulation components
+        self.timestep = timestep
         
-        # For backward compatibility
-        self.timestep = self.cosim_timestep
-        
-        self.current_time = self.cosim_timestep
+        self.current_time = self.timestep
         self._last_step_time: Optional[float] = None
         
         # Define flow IDs for different message types
         self.CLIENT_TO_SERVER_FLOW = 0
         self.SERVER_TO_CLIENT_FLOW = 1
         
-        logger.info("BaseCoSimulator initialized with timesteps - cosim: %f, network: %f, robotics: %f", 
-                   self.cosim_timestep, self.network_timestep, self.robotics_timestep)
+        logger.info("BaseCoSimulator initialized with unified timestep: %f", self.timestep)
         
     @abstractmethod
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict]:
@@ -125,7 +116,7 @@ class BaseCoSimulator(ABC):
     
     def _advance_time(self) -> None:
         """Advance the simulation time by one timestep."""
-        self.current_time += self.cosim_timestep
+        self.current_time += self.timestep
         logger.info("Advanced simulation time to %f", self.current_time)
         
     def get_current_time(self) -> float:
@@ -142,27 +133,9 @@ class BaseCoSimulator(ABC):
         Get the simulation timestep.
         
         Returns:
-            float: Co-simulation timestep in seconds
+            float: Unified simulation timestep in seconds
         """
-        return self.cosim_timestep
-    
-    def get_network_timestep(self) -> float:
-        """
-        Get the network simulation timestep.
-        
-        Returns:
-            float: Network simulation timestep in seconds
-        """
-        return self.network_timestep
-    
-    def get_robotics_timestep(self) -> float:
-        """
-        Get the robotics simulation timestep.
-        
-        Returns:
-            float: Robotics simulation timestep in seconds
-        """
-        return self.robotics_timestep
+        return self.timestep
     
     def close(self) -> None:
         """Clean up resources."""

@@ -2,53 +2,80 @@ import numpy as np
 import logging
 from typing import Dict, Tuple, Any, List, Optional
 from ..base import BaseCoSimulator
-
+import pickle
 # Set up logging
 logger = logging.getLogger(__name__)
 
 class GymCoSimulator(BaseCoSimulator):
     """Co-simulator implementation for Gym environments."""
     
-    def __init__(self, network_simulator: Any, gym_env: Any, cosim_timestep: float,
-                 network_timestep: Optional[float] = None, robotics_timestep: Optional[float] = None):
+    def __init__(self, network_simulator: Any, gym_env: Any, timestep: float):
         """
         Initialize the Gym co-simulator.
         
         Args:
             network_simulator: Instance of network simulator (e.g., NSPyNetworkSimulator)
             gym_env: Gym environment instance
-            cosim_timestep: Co-simulation timestep in seconds
-            network_timestep: Network simulator timestep in seconds (default: same as cosim_timestep)
-            robotics_timestep: Robotics simulator timestep in seconds (default: same as cosim_timestep)
+            timestep: Unified simulation timestep in seconds
         """
         super().__init__(
             network_simulator=network_simulator, 
             robotics_simulator=gym_env, 
-            cosim_timestep=cosim_timestep,
-            network_timestep=network_timestep,
-            robotics_timestep=robotics_timestep
+            timestep=timestep
         )
         self.current_observation = None
+        self.last_action = None
+        self.received_action_this_step = False
         logger.info("GymCoSimulator initialized with gym environment %s", type(gym_env).__name__)
         
-    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict]:
+    def step(self, action: Optional[np.ndarray] = None) -> Tuple[np.ndarray, float, bool, Dict]:
         """
         Perform one step of co-simulation.
         
         Args:
-            action: Action to be taken in the robotics simulator
+            action: Action to be taken in the robotics simulator.
+                   If None and no message arrives, the previous timestep's action will be used.
             
         Returns:
             Tuple containing observation, reward, done, and info
         """
-        logger.info("Starting co-simulation step at time %f with action %s", 
-                    self.get_current_time(), str(action))
-                    
+        logger.info("Starting co-simulation step at time %f", self.get_current_time())
+                   
         # Process any network messages that should be visible now
         messages = self._process_network_messages()
+        self.received_action_this_step = False
+        
+        # Process all messages
         for message in messages:
             self._handle_message(message)
             logger.info("Handled message: %s", str(message)[:100] + "..." if len(str(message)) > 100 else str(message))
+
+        # If no action was provided by the user or received from the network
+        if action is None and not self.received_action_this_step:
+            # Use the previous timestep's action if available
+            if self.last_action is not None:
+                action = self.last_action
+                logger.info("No new action - persisting previous action: %s", str(action))
+            else:
+                # If no prior action exists, sample a random one
+                try:
+                    if hasattr(self.robotics_simulator, 'action_space'):
+                        action = self.robotics_simulator.action_space.sample()
+                        logger.info("No prior action - sampling random action: %s", str(action))
+                    else:
+                        # Fallback to zeros if we can't sample
+                        action = np.zeros(1)
+                        logger.info("No action space found - using zero action: %s", str(action))
+                except Exception as e:
+                    logger.error("Failed to sample action: %s", str(e))
+                    action = np.zeros(1)
+        elif action is None and self.received_action_this_step:
+            # We received an action from the network during this step
+            action = self.last_action
+            logger.info("Using action received from network: %s", str(action))
+        
+        # Store this action as the last action for the next step
+        self.last_action = action
 
         # Calculate network latency for this step
         action_latency = 0.0
@@ -58,11 +85,9 @@ class GymCoSimulator(BaseCoSimulator):
         client_send_time = self.get_current_time()
         action_msg_id = self._send_message(
             {'action': action, 'timestamp': client_send_time},
-            flow_id=self.CLIENT_TO_SERVER_FLOW,  # This is 0
+            flow_id=self.CLIENT_TO_SERVER_FLOW,
             size=self._estimate_message_size(action)
         )
-        logger.info("Sent action from client to server with msg_id=%s at time=%f", 
-                    action_msg_id, client_send_time)
         
         # Estimate latency for action packet
         action_size = self._estimate_message_size(action)
@@ -70,7 +95,6 @@ class GymCoSimulator(BaseCoSimulator):
             size=action_size,
             flow_id=self.CLIENT_TO_SERVER_FLOW
         )
-        logger.info("Estimated action latency: %f seconds", action_latency)
         
         # Step the robotics simulator (server side)
         logger.info("Stepping robotics simulator with action %s", str(action))
@@ -81,7 +105,7 @@ class GymCoSimulator(BaseCoSimulator):
             observation, reward, terminated, truncated, info = result
             done = terminated or truncated
             logger.info("Gym step result (new API): reward=%f, terminated=%s, truncated=%s", 
-                        reward, terminated, truncated)
+                       reward, terminated, truncated)
         else:  # Old Gym API: obs, reward, done, info
             observation, reward, done, info = result
             logger.info("Gym step result (old API): reward=%f, done=%s", reward, done)
@@ -97,20 +121,15 @@ class GymCoSimulator(BaseCoSimulator):
             observation_size = self._estimate_message_size(observation)
             obs_msg_id = self._send_message(
                 {'observation': observation, 'timestamp': server_send_time},
-                flow_id=self.SERVER_TO_CLIENT_FLOW,  # This is 1
+                flow_id=self.SERVER_TO_CLIENT_FLOW,
                 size=observation_size
             )
-            logger.info("Sent observation from server to client with msg_id=%s at time=%f, size=%f", 
-                        obs_msg_id, server_send_time, observation_size)
             
             # Estimate latency for observation packet
             observation_latency = self.network_simulator.estimate_latency(
                 size=observation_size, 
                 flow_id=self.SERVER_TO_CLIENT_FLOW
             )
-            logger.info("Estimated observation latency: %f seconds", observation_latency)
-        else:
-            logger.warning("Received None observation from robotics simulator")
         
         # Add network info to the info dict
         if not isinstance(info, dict):
@@ -118,9 +137,7 @@ class GymCoSimulator(BaseCoSimulator):
         info['action_latency'] = action_latency
         info['observation_latency'] = observation_latency
         info['total_latency'] = action_latency + observation_latency
-        
-        logger.info("Network latencies - action: %f, observation: %f, total: %f", 
-                    action_latency, observation_latency, action_latency + observation_latency)
+        info['action_from_previous_step'] = not self.received_action_this_step
         
         # Advance simulation time
         self._advance_time()
@@ -134,8 +151,8 @@ class GymCoSimulator(BaseCoSimulator):
         self.current_observation = observation
         self.network_simulator.reset()
         self.current_time = 0.0
-        logger.info("Reset complete, initial observation shape: %s", 
-                    str(observation.shape) if hasattr(observation, 'shape') else str(type(observation)))
+        self.last_action = None
+        self.received_action_this_step = False
         return observation
     
     def render(self, mode: str = 'human') -> None:
@@ -161,12 +178,17 @@ class GymCoSimulator(BaseCoSimulator):
         Args:
             message: The received message
         """
-        logger.info("Handling message: %s", str(message)[:50] + "..." if isinstance(message, dict) and len(str(message)) > 50 else str(message))
         # Update the current observation with the received message
-        if isinstance(message, dict) and 'observation' in message:
-            self.current_observation = message['observation']
-            logger.info("Updated current observation from network message")
-    
+        if isinstance(message, dict):
+            if 'observation' in message:
+                self.current_observation = message['observation']
+            
+            # If the message contains an action, update our last_action
+            if 'action' in message:
+                self.last_action = message['action']
+                self.received_action_this_step = True
+                logger.info("Received action from network: %s", str(self.last_action))
+
     def _estimate_message_size(self, observation: np.ndarray) -> float:
         """
         Estimate the size of a message in bytes.
@@ -191,10 +213,14 @@ class GymCoSimulator(BaseCoSimulator):
                     # Rough estimate for other types
                     total_size += 100.0
             size = total_size
+        elif isinstance(observation, list):
+            # For lists, estimate based on number of elements
+            size = float(len(observation))
         else:
             # Default size if we can't estimate
-            size = 1000.0
-            
+            # pickle it     
+            size = float(len(pickle.dumps(observation)))
+
         logger.info("Estimated message size: %f bytes", size)
         return size
     

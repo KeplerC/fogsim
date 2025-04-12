@@ -26,7 +26,7 @@ def run_gym_example():
     
     # Create network simulator with virtual clock
     network_sim = NSPyNetworkSimulator(
-        source_rate=10000.0,  # 10 Kbps
+        source_rate=100000.0,  # 10 Kbps
         weights=[1, 2],       # Weight client->server flows lower than server->client
         debug=True
     )
@@ -35,7 +35,7 @@ def run_gym_example():
     env = gym.make('CartPole-v1', render_mode="rgb_array")
     
     # Create co-simulator
-    co_sim = GymCoSimulator(network_sim, env, cosim_timestep=0.01)
+    co_sim = GymCoSimulator(network_sim, env, timestep=0.01)
     
     # Set up video writer and latency data for plotting
     frames = []

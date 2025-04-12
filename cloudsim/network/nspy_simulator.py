@@ -169,8 +169,8 @@ class NSPyNetworkSimulator:
             logger.info("Estimated latency for size=%f, flow_id=%d: %f", 
                          size, flow_id, latency)
             return latency
-        logger.info("Using default latency (100000.0) for size=%f, flow_id=%d", size, flow_id)
-        return 100000.0  # Default latency if estimation not possible
+        logger.info("Using default latency (0.1) for size=%f, flow_id=%d", size, flow_id)
+        return 0.1  # Default latency if estimation not possible
     
     def reset(self) -> None:
         """Reset the network simulator."""
