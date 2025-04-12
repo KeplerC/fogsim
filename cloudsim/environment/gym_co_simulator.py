@@ -40,65 +40,65 @@ class GymCoSimulator(BaseCoSimulator):
             Tuple containing observation, reward, done, and info
         """
         logger.info("Starting co-simulation step at time %f", self.get_current_time())
+        
+        # Track latency information for info dict
+        action_latencies = []
+        observation_latencies = []
+                   
+        # If action is provided from the user/client, send it through the network
+        if action is not None:
+            # Simulate sending action from client to server
+            client_send_time = self.get_current_time()
+            action_size = self._estimate_message_size(action)
+            action_msg_id = self._send_message(
+                {'action': action, 'timestamp': client_send_time},
+                flow_id=self.CLIENT_TO_SERVER_FLOW,
+                size=action_size
+            )
                    
         # Process any network messages that should be visible now
         messages = self._process_network_messages()
         self.received_action_this_step = False
         
-        # Process all messages
+        # Process all messages and track latencies
         for message in messages:
+            if isinstance(message, dict) and 'timestamp' in message:
+                # Calculate actual network latency
+                latency = self.get_current_time() - message['timestamp']
+                
+                # Track latency by message type
+                if 'action' in message:
+                    action_latencies.append(latency)
+                elif 'observation' in message:
+                    observation_latencies.append(latency)
+                    
             self._handle_message(message)
             logger.info("Handled message: %s", str(message)[:100] + "..." if len(str(message)) > 100 else str(message))
 
-        # If no action was provided by the user or received from the network
-        if action is None and not self.received_action_this_step:
-            # Use the previous timestep's action if available
-            if self.last_action is not None:
-                action = self.last_action
-                logger.info("No new action - persisting previous action: %s", str(action))
-            else:
-                # If no prior action exists, sample a random one
-                try:
-                    if hasattr(self.robotics_simulator, 'action_space'):
-                        action = self.robotics_simulator.action_space.sample()
-                        logger.info("No prior action - sampling random action: %s", str(action))
-                    else:
-                        # Fallback to zeros if we can't sample
-                        action = np.zeros(1)
-                        logger.info("No action space found - using zero action: %s", str(action))
-                except Exception as e:
-                    logger.error("Failed to sample action: %s", str(e))
-                    action = np.zeros(1)
-        elif action is None and self.received_action_this_step:
-            # We received an action from the network during this step
-            action = self.last_action
-            logger.info("Using action received from network: %s", str(action))
+        # Use the last action received from the network, or keep using the previous one
+        if not self.received_action_this_step and self.last_action is None:
+            # If no prior action exists, sample a random one
+            try:
+                if hasattr(self.robotics_simulator, 'action_space'):
+                    server_action = self.robotics_simulator.action_space.sample()
+                    logger.info("No prior action - sampling random action: %s", str(server_action))
+                else:
+                    # Fallback to zeros if we can't sample
+                    server_action = np.zeros(1)
+                    logger.info("No action space found - using zero action: %s", str(server_action))
+            except Exception as e:
+                logger.error("Failed to sample action: %s", str(e))
+                server_action = np.zeros(1)
+        else:
+            # Use the last action we received (either in this step or previous steps)
+            server_action = self.last_action
+            logger.info("Using %s action: %s", 
+                       "newly received" if self.received_action_this_step else "previous", 
+                       str(server_action))
         
-        # Store this action as the last action for the next step
-        self.last_action = action
-
-        # Calculate network latency for this step
-        action_latency = 0.0
-        observation_latency = 0.0
-        
-        # Simulate sending action from client to server
-        client_send_time = self.get_current_time()
-        action_msg_id = self._send_message(
-            {'action': action, 'timestamp': client_send_time},
-            flow_id=self.CLIENT_TO_SERVER_FLOW,
-            size=self._estimate_message_size(action)
-        )
-        
-        # Estimate latency for action packet
-        action_size = self._estimate_message_size(action)
-        action_latency = self.network_simulator.estimate_latency(
-            size=action_size,
-            flow_id=self.CLIENT_TO_SERVER_FLOW
-        )
-        
-        # Step the robotics simulator (server side)
-        logger.info("Stepping robotics simulator with action %s", str(action))
-        result = self.robotics_simulator.step(action)
+        # Step the robotics simulator (server side) with the action that has gone through the network
+        logger.info("Stepping robotics simulator with action %s", str(server_action))
+        result = self.robotics_simulator.step(server_action)
         
         # Handle both old and new Gym API formats
         if len(result) == 5:  # New Gymnasium API: obs, reward, terminated, truncated, info
@@ -124,16 +124,15 @@ class GymCoSimulator(BaseCoSimulator):
                 flow_id=self.SERVER_TO_CLIENT_FLOW,
                 size=observation_size
             )
-            
-            # Estimate latency for observation packet
-            observation_latency = self.network_simulator.estimate_latency(
-                size=observation_size, 
-                flow_id=self.SERVER_TO_CLIENT_FLOW
-            )
         
         # Add network info to the info dict
         if not isinstance(info, dict):
             info = {}
+            
+        # Calculate average latencies from actual message deliveries
+        action_latency = sum(action_latencies) / len(action_latencies) if action_latencies else 0.0
+        observation_latency = sum(observation_latencies) / len(observation_latencies) if observation_latencies else 0.0
+        
         info['action_latency'] = action_latency
         info['observation_latency'] = observation_latency
         info['total_latency'] = action_latency + observation_latency

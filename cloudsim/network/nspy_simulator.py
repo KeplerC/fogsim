@@ -151,27 +151,6 @@ class NSPyNetworkSimulator:
         logger.info("Retrieved %d ready messages", message_count)
         return messages
     
-    def estimate_latency(self, size: float = 1000.0, flow_id: int = 0) -> float:
-        """
-        Estimate latency for a packet of given size and flow_id.
-        This is mostly for backward compatibility.
-        
-        Args:
-            size: Size of packet in bytes
-            flow_id: Flow ID
-            
-        Returns:
-            float: Estimated latency in seconds
-        """
-        # Simple estimation based on rate and size
-        if hasattr(self.vc_server, 'rate'):
-            latency = size / self.vc_server.rate
-            logger.info("Estimated latency for size=%f, flow_id=%d: %f", 
-                         size, flow_id, latency)
-            return latency
-        logger.info("Using default latency (0.1) for size=%f, flow_id=%d", size, flow_id)
-        return 0.1  # Default latency if estimation not possible
-    
     def reset(self) -> None:
         """Reset the network simulator."""
         logger.info("Resetting network simulator")
