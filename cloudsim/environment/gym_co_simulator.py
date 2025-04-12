@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Dict, Tuple, Any
+from typing import Dict, Tuple, Any, List
 from ..base import BaseCoSimulator
 
 class GymCoSimulator(BaseCoSimulator):
@@ -10,7 +10,7 @@ class GymCoSimulator(BaseCoSimulator):
         Initialize the Gym co-simulator.
         
         Args:
-            network_simulator: Instance of network simulator (e.g., ns3)
+            network_simulator: Instance of network simulator (e.g., NSPyNetworkSimulator)
             gym_env: Gym environment instance
             timestep: Simulation timestep in seconds (default: 0.1)
         """
@@ -28,12 +28,30 @@ class GymCoSimulator(BaseCoSimulator):
             Tuple containing observation, reward, done, and info
         """
         # Process any network messages that should be visible now
-        self._process_network_messages()
+        messages = self._process_network_messages()
+        for message in messages:
+            self._handle_message(message)
 
-        print(f"Current time: {self.get_current_time()}")
-        print("action: ", action)
+        # Calculate network latency for this step
+        action_latency = 0.0
+        observation_latency = 0.0
         
-        # Step the robotics simulator
+        # Simulate sending action from client to server
+        client_send_time = self.get_current_time()
+        action_msg_id = self._send_message(
+            {'action': action, 'timestamp': client_send_time},
+            flow_id=self.CLIENT_TO_SERVER_FLOW,  # This is 0
+            size=self._estimate_message_size(action)
+        )
+        
+        # Estimate latency for action packet
+        action_size = self._estimate_message_size(action)
+        action_latency = self.network_simulator.estimate_latency(
+            size=action_size,
+            flow_id=self.CLIENT_TO_SERVER_FLOW
+        )
+        
+        # Step the robotics simulator (server side)
         result = self.robotics_simulator.step(action)
         
         # Handle both old and new Gym API formats
@@ -45,9 +63,31 @@ class GymCoSimulator(BaseCoSimulator):
             
         self.current_observation = observation
         
-        # Send observation through network simulator
+        # Send observation through network simulator (server to client)
         if observation is not None:
-            self._send_observation(observation)
+            # Record send time
+            server_send_time = self.get_current_time()
+            
+            # Send observation through network
+            obs_msg_id = self._send_message(
+                {'observation': observation, 'timestamp': server_send_time},
+                flow_id=self.SERVER_TO_CLIENT_FLOW,  # This is 1
+                size=self._estimate_message_size(observation)
+            )
+            
+            # Estimate latency for observation packet
+            observation_size = self._estimate_message_size(observation)
+            observation_latency = self.network_simulator.estimate_latency(
+                size=observation_size, 
+                flow_id=self.SERVER_TO_CLIENT_FLOW
+            )
+        
+        # Add network info to the info dict
+        if not isinstance(info, dict):
+            info = {}
+        info['action_latency'] = action_latency
+        info['observation_latency'] = observation_latency
+        info['total_latency'] = action_latency + observation_latency
         
         # Advance simulation time
         self._advance_time()
@@ -59,7 +99,6 @@ class GymCoSimulator(BaseCoSimulator):
         observation = self.robotics_simulator.reset()
         self.current_observation = observation
         self.network_simulator.reset()
-        self.scheduled_messages.clear()
         self.current_time = 0.0
         return observation
     
@@ -88,23 +127,33 @@ class GymCoSimulator(BaseCoSimulator):
         if isinstance(message, dict) and 'observation' in message:
             self.current_observation = message['observation']
     
-    def _send_observation(self, observation: np.ndarray) -> None:
+    def _estimate_message_size(self, observation: np.ndarray) -> float:
         """
-        Send observation through the network simulator.
+        Estimate the size of a message in bytes.
         
         Args:
-            observation: Current observation to send
+            observation: Observation array
+            
+        Returns:
+            float: Estimated size in bytes
         """
-        # Get network latency from ns3
-        latency = self.network_simulator.get_latency()
-        
-        # Schedule the message to be processed after the latency
-        message = {
-            'observation': observation,
-            'timestamp': self.get_current_time()
-        }
-        self._schedule_message(message, latency)
+        if isinstance(observation, np.ndarray):
+            # Numpy arrays have known memory usage
+            return observation.nbytes
+        elif isinstance(observation, dict):
+            # For dictionaries, estimate based on keys
+            total_size = 100  # Base size
+            for key, value in observation.items():
+                if isinstance(value, np.ndarray):
+                    total_size += value.nbytes
+                else:
+                    # Rough estimate for other types
+                    total_size += 100
+            return float(total_size)
+        else:
+            # Default size if we can't estimate
+            return 1000.0
     
     def get_time(self) -> float:
         """Get current simulation time."""
-        return self.robotics_simulator.get_time() 
+        return self.get_current_time() 

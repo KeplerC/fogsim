@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Tuple, Optional
+from typing import Any, Dict, Tuple, Optional, List
 import numpy as np
 import time
 
@@ -11,16 +11,19 @@ class BaseCoSimulator(ABC):
         Initialize the co-simulator.
         
         Args:
-            network_simulator: Instance of network simulator (e.g., ns3)
+            network_simulator: Instance of network simulator (e.g., NSPyNetworkSimulator)
             robotics_simulator: Instance of robotics simulator (e.g., gym, carla)
             timestep: Simulation timestep in seconds (default: 0.1)
         """
         self.network_simulator = network_simulator
         self.robotics_simulator = robotics_simulator
-        self.scheduled_messages = {}  # Dictionary to store scheduled messages
         self.timestep = timestep
-        self.current_time = 0.0
+        self.current_time = timestep
         self._last_step_time: Optional[float] = None
+        
+        # Define flow IDs for different message types
+        self.CLIENT_TO_SERVER_FLOW = 0
+        self.SERVER_TO_CLIENT_FLOW = 1
         
     @abstractmethod
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict]:
@@ -59,19 +62,18 @@ class BaseCoSimulator(ABC):
         """
         pass
     
-    def _process_network_messages(self) -> None:
-        """Process any messages that should be visible at the current timestep."""
-        messages_to_process = []
+    def _process_network_messages(self) -> List[Any]:
+        """
+        Process any messages that should be visible at the current timestep.
         
-        # Find messages that should be processed at current time
-        for msg_id, (msg, scheduled_time) in self.scheduled_messages.items():
-            if scheduled_time <= self.current_time:
-                messages_to_process.append((msg_id, msg))
+        Returns:
+            List of messages ready for processing
+        """
+        # Run the network simulator until current time
+        self.network_simulator.run_until(self.current_time)
         
-        # Process messages and remove them from schedule
-        for msg_id, msg in messages_to_process:
-            self._handle_message(msg)
-            del self.scheduled_messages[msg_id]
+        # Get ready messages
+        return self.network_simulator.get_ready_messages()
     
     @abstractmethod
     def _handle_message(self, message: Any) -> None:
@@ -83,17 +85,19 @@ class BaseCoSimulator(ABC):
         """
         pass
     
-    def _schedule_message(self, message: Any, delay: float) -> None:
+    def _send_message(self, message: Any, flow_id: int = 0, size: float = 1000.0) -> str:
         """
-        Schedule a message to be processed after a delay.
+        Send a message through the network simulator.
         
         Args:
-            message: Message to schedule
-            delay: Delay in seconds
+            message: Message to send
+            flow_id: Flow ID (default: 0, client to server)
+            size: Size of message in bytes (default: 1000.0)
+            
+        Returns:
+            str: Message ID
         """
-        scheduled_time = self.current_time + delay
-        msg_id = id(message)  # Use message ID as key
-        self.scheduled_messages[msg_id] = (message, scheduled_time)
+        return self.network_simulator.register_packet(message, flow_id, size)
     
     def _advance_time(self) -> None:
         """Advance the simulation time by one timestep."""
