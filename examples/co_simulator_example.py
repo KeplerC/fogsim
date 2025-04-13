@@ -26,7 +26,7 @@ def run_gym_example():
     
     # Create network simulator with virtual clock
     network_sim = NSPyNetworkSimulator(
-        source_rate=100.0,  # 10 Kbps
+        source_rate=100000.0,  # 10 Mbps
         weights=[1, 2],       # Weight client->server flows lower than server->client
         debug=True
     )
