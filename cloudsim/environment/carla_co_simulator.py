@@ -87,7 +87,7 @@ class CarlaCoSimulator(BaseCoSimulator):
                     'timestamp': client_send_time,
                     'responding_to_observation': self.last_received_observation_id
                 },
-                flow_id=self.CLIENT_TO_SERVER_FLOW,
+                flow_id=self.SERVER_TO_CLIENT_FLOW,
                 size=action_size
             )
             logger.info(f"Sent action in response to observation {self.last_received_observation_id}")
@@ -228,8 +228,8 @@ class CarlaCoSimulator(BaseCoSimulator):
                 # Use pickle to estimate the size
                 size = float(len(pickle.dumps(data)))
             except Exception as e:
-                logger.debug("Failed to pickle data: %s", str(e))
-                size = 1000.0
+                logger.info("Failed to pickle data: %s", str(e))
+                size = 2.0 # control message is two bytes 
 
         logger.info("Estimated message size: %f bytes", size)
         return size

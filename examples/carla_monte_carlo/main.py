@@ -606,7 +606,7 @@ def main():
     args = parser.parse_args()
 
     network_sim = NSPyNetworkSimulator(
-        source_rate=1.0,  # 10 Mbps
+        source_rate=10000.0,  # 10 Mbps
         weights=[1, 2],       # Weight client->server flows lower than server->client
     )
     # Select configuration based on argument
