@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CloudSim Visualization</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {
+            padding-top: 20px;
+            background-color: #f8f9fa;
+        }
+        .frame-container {
+            background-color: #000;
+            border-radius: 8px;
+            overflow: hidden;
+            margin-bottom: 20px;
+            position: relative;
+            min-height: 300px;
+        }
+        .frame-container img {
+            max-width: 100%;
+            height: auto;
+            display: block;
+            margin: 0 auto;
+        }
+        .metrics-card {
+            height: 100%;
+            overflow-y: auto;
+        }
+        .metrics-table {
+            font-size: 0.9rem;
+        }
+        .control-card {
+            margin-bottom: 20px;
+        }
+        .simulation-selector {
+            margin-bottom: 20px;
+        }
+        .no-frame-message {
+            color: #ffffff;
+            text-align: center;
+            padding: 100px 0;
+        }
+        .loading-spinner {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #ffffff;
+        }
+        .simulation-badge {
+            font-size: 0.8rem;
+            margin-left: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1 class="mb-4">CloudSim Visualization</h1>
+        
+        <div class="simulation-selector mb-4">
+            <div class="card">
+                <div class="card-header">
+                    <h5 class="card-title mb-0">Active Simulations</h5>
+                </div>
+                <div class="card-body">
+                    <div id="simulations-list" class="list-group">
+                        <div class="text-center" id="no-simulations">
+                            <p>No active simulations. Waiting for connections...</p>
+                            <div class="spinner-border text-primary" role="status">
+                                <span class="visually-hidden">Loading...</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="row">
+            <!-- Frame display -->
+            <div class="col-md-8">
+                <div class="frame-container">
+                    <div id="no-frame-message" class="no-frame-message">
+                        <h3>No frame available</h3>
+                        <p>Select a simulation or wait for frames to be sent</p>
+                    </div>
+                    <img id="frame-display" style="display: none;">
+                    <div id="loading-spinner" class="loading-spinner" style="display: none;">
+                        <div class="spinner-border text-light" role="status">
+                            <span class="visually-hidden">Loading...</span>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Control panel -->
+                <div class="control-card card">
+                    <div class="card-header">
+                        <h5 class="card-title mb-0">Controls</h5>
+                    </div>
+                    <div class="card-body">
+                        <form id="network-params-form">
+                            <h6>Network Parameters</h6>
+                            <div class="row g-3 mb-3">
+                                <div class="col-md-4">
+                                    <label for="latency" class="form-label">Latency (ms)</label>
+                                    <input type="number" class="form-control" id="latency" min="0" step="1" placeholder="e.g., 100">
+                                </div>
+                                <div class="col-md-4">
+                                    <label for="packet-loss" class="form-label">Packet Loss (%)</label>
+                                    <input type="number" class="form-control" id="packet-loss" min="0" max="100" step="0.1" placeholder="e.g., 2.5">
+                                </div>
+                                <div class="col-md-4">
+                                    <label for="bandwidth" class="form-label">Bandwidth (Mbps)</label>
+                                    <input type="number" class="form-control" id="bandwidth" min="0" step="0.1" placeholder="e.g., 10">
+                                </div>
+                            </div>
+                            <button type="submit" class="btn btn-primary" id="network-params-submit" disabled>Update Network Parameters</button>
+                        </form>
+                        
+                        <hr>
+                        
+                        <div class="row">
+                            <div class="col-md-6">
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" id="render-toggle" checked disabled>
+                                    <label class="form-check-label" for="render-toggle">Enable Rendering</label>
+                                </div>
+                            </div>
+                            <div class="col-md-6 text-end">
+                                <button class="btn btn-warning" id="reset-button" disabled>Reset Simulation</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Metrics display -->
+            <div class="col-md-4">
+                <div class="metrics-card card">
+                    <div class="card-header">
+                        <h5 class="card-title mb-0">Metrics</h5>
+                    </div>
+                    <div class="card-body">
+                        <div id="no-metrics-message">
+                            <p class="text-center">No metrics available</p>
+                        </div>
+                        <table class="metrics-table table table-striped table-sm" id="metrics-table" style="display: none;">
+                            <thead>
+                                <tr>
+                                    <th>Metric</th>
+                                    <th>Value</th>
+                                </tr>
+                            </thead>
+                            <tbody id="metrics-body">
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Socket.IO and Scripts -->
+    <script src="https://cdn.socket.io/4.6.0/socket.io.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        // Globals
+        let socket;
+        let selectedSimulation = null;
+        let simulationList = {};
+        const viewerId = 'viewer_' + Math.random().toString(36).substr(2, 9);
+        
+        // DOM elements
+        const frameDisplay = document.getElementById('frame-display');
+        const noFrameMessage = document.getElementById('no-frame-message');
+        const loadingSpinner = document.getElementById('loading-spinner');
+        const simulationsList = document.getElementById('simulations-list');
+        const noSimulationsMessage = document.getElementById('no-simulations');
+        const metricsTable = document.getElementById('metrics-table');
+        const metricsBody = document.getElementById('metrics-body');
+        const noMetricsMessage = document.getElementById('no-metrics-message');
+        const networkParamsForm = document.getElementById('network-params-form');
+        const networkParamsSubmit = document.getElementById('network-params-submit');
+        const renderToggle = document.getElementById('render-toggle');
+        const resetButton = document.getElementById('reset-button');
+        
+        // Connect to the Socket.IO server
+        function connectToServer() {
+            // Connect to the server
+            socket = io();
+            
+            // Socket events
+            socket.on('connect', () => {
+                console.log('Connected to server');
+                
+                // Register as a viewer
+                socket.emit('register_viewer', { viewer_id: viewerId });
+            });
+            
+            socket.on('disconnect', () => {
+                console.log('Disconnected from server');
+                // Disable controls
+                disableControls();
+                // Clear simulations list
+                simulationList = {};
+                updateSimulationsList();
+            });
+            
+            socket.on('error', (data) => {
+                console.error('Socket error:', data.message);
+                alert('Error: ' + data.message);
+            });
+            
+            socket.on('active_simulations', (data) => {
+                console.log('Active simulations:', data.simulations);
+                
+                // Update the simulations list
+                data.simulations.forEach(sim => {
+                    simulationList[sim.simulation_id] = sim;
+                });
+                
+                updateSimulationsList();
+            });
+            
+            socket.on('simulation_connected', (data) => {
+                console.log('Simulation connected:', data);
+                
+                // Add to the simulations list
+                simulationList[data.simulation_id] = data;
+                
+                updateSimulationsList();
+            });
+            
+            socket.on('simulation_disconnected', (data) => {
+                console.log('Simulation disconnected:', data);
+                
+                // Remove from the simulations list
+                delete simulationList[data.simulation_id];
+                
+                // If this was the selected simulation, clear the selection
+                if (selectedSimulation === data.simulation_id) {
+                    selectedSimulation = null;
+                    noFrameMessage.style.display = 'block';
+                    frameDisplay.style.display = 'none';
+                    noMetricsMessage.style.display = 'block';
+                    metricsTable.style.display = 'none';
+                    disableControls();
+                }
+                
+                updateSimulationsList();
+            });
+            
+            socket.on('frame_update', (data) => {
+                // Only process if this is for the selected simulation
+                if (selectedSimulation && data.simulation_id === selectedSimulation) {
+                    // Update the frame display
+                    noFrameMessage.style.display = 'none';
+                    frameDisplay.style.display = 'block';
+                    frameDisplay.src = data.frame;
+                }
+            });
+            
+            socket.on('metrics_update', (data) => {
+                // Only process if this is for the selected simulation
+                if (selectedSimulation && data.simulation_id === selectedSimulation) {
+                    // Update the metrics display
+                    updateMetricsTable(data.metrics);
+                }
+            });
+            
+            socket.on('command_sent', (data) => {
+                console.log('Command sent:', data);
+            });
+        }
+        
+        // Update the simulations list in the UI
+        function updateSimulationsList() {
+            // Clear the current list
+            simulationsList.innerHTML = '';
+            
+            // Show/hide no simulations message
+            if (Object.keys(simulationList).length === 0) {
+                noSimulationsMessage.style.display = 'block';
+            } else {
+                noSimulationsMessage.style.display = 'none';
+                
+                // Add each simulation to the list
+                for (const [id, sim] of Object.entries(simulationList)) {
+                    const item = document.createElement('button');
+                    item.className = 'list-group-item list-group-item-action d-flex justify-content-between align-items-center';
+                    if (selectedSimulation === id) {
+                        item.classList.add('active');
+                    }
+                    
+                    item.innerHTML = `
+                        <div>
+                            ${id}
+                            <span class="badge bg-primary simulation-badge">${sim.simulator_type}</span>
+                        </div>
+                    `;
+                    
+                    item.addEventListener('click', () => {
+                        selectSimulation(id);
+                    });
+                    
+                    simulationsList.appendChild(item);
+                }
+            }
+        }
+        
+        // Select a simulation
+        function selectSimulation(simulationId) {
+            // Update the selected simulation
+            selectedSimulation = simulationId;
+            
+            // Update the UI
+            updateSimulationsList();
+            
+            // Show loading spinner
+            loadingSpinner.style.display = 'block';
+            noFrameMessage.style.display = 'none';
+            frameDisplay.style.display = 'none';
+            
+            // Enable controls
+            enableControls();
+            
+            // Clear metrics
+            noMetricsMessage.style.display = 'block';
+            metricsTable.style.display = 'none';
+            metricsBody.innerHTML = '';
+            
+            console.log('Selected simulation:', simulationId);
+        }
+        
+        // Update the metrics table
+        function updateMetricsTable(metrics) {
+            // Show the table and hide the no metrics message
+            noMetricsMessage.style.display = 'none';
+            metricsTable.style.display = 'table';
+            
+            // Clear the table
+            metricsBody.innerHTML = '';
+            
+            // Add each metric to the table
+            if (metrics && metrics.data) {
+                for (const [key, value] of Object.entries(metrics.data)) {
+                    const row = document.createElement('tr');
+                    
+                    const keyCell = document.createElement('td');
+                    keyCell.textContent = key;
+                    
+                    const valueCell = document.createElement('td');
+                    // Format the value based on type
+                    if (typeof value === 'number') {
+                        valueCell.textContent = value.toFixed(4);
+                    } else {
+                        valueCell.textContent = value;
+                    }
+                    
+                    row.appendChild(keyCell);
+                    row.appendChild(valueCell);
+                    
+                    metricsBody.appendChild(row);
+                }
+            }
+        }
+        
+        // Enable controls
+        function enableControls() {
+            networkParamsSubmit.disabled = false;
+            renderToggle.disabled = false;
+            resetButton.disabled = false;
+        }
+        
+        // Disable controls
+        function disableControls() {
+            networkParamsSubmit.disabled = true;
+            renderToggle.disabled = true;
+            resetButton.disabled = true;
+        }
+        
+        // Event listeners
+        networkParamsForm.addEventListener('submit', (e) => {
+            e.preventDefault();
+            
+            if (!selectedSimulation) return;
+            
+            // Get the values
+            const latency = document.getElementById('latency').value;
+            const packetLoss = document.getElementById('packet-loss').value;
+            const bandwidth = document.getElementById('bandwidth').value;
+            
+            // Create the params object
+            const params = {};
+            if (latency) params.latency = parseFloat(latency);
+            if (packetLoss) params.packet_loss = parseFloat(packetLoss);
+            if (bandwidth) params.bandwidth = parseFloat(bandwidth);
+            
+            // Send the command
+            socket.emit('command', {
+                simulation_id: selectedSimulation,
+                command: 'set_network_params',
+                params: params
+            });
+        });
+        
+        renderToggle.addEventListener('change', () => {
+            if (!selectedSimulation) return;
+            
+            // Send the command
+            socket.emit('command', {
+                simulation_id: selectedSimulation,
+                command: 'set_render_enabled',
+                params: {
+                    enabled: renderToggle.checked
+                }
+            });
+        });
+        
+        resetButton.addEventListener('click', () => {
+            if (!selectedSimulation) return;
+            
+            // Confirm reset
+            if (confirm('Are you sure you want to reset the simulation?')) {
+                // Send the command
+                socket.emit('command', {
+                    simulation_id: selectedSimulation,
+                    command: 'reset',
+                    params: {}
+                });
+            }
+        });
+        
+        // Initialize the app
+        connectToServer();
+    </script>
+</body>
+</html> 
