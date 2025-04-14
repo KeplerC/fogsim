@@ -98,24 +98,10 @@ class CarlaCoSimulator(BaseCoSimulator):
         if not self.received_action_this_step and self.last_action is None:
             # For Carla, we might need a default action if none exists
             # This will depend on the Carla environment's action space
-            try:
-                # Try to create a neutral action (no throttle, no steering)
-                server_action = np.zeros(2)  # [throttle, steering]
-                logger.info("No prior action - using neutral action: %s", str(server_action))
-            except Exception as e:
-                logger.error("Failed to create default action: %s", str(e))
-                server_action = np.zeros(1)
-            self.last_action = server_action
-        else:
-            # Use the last action we received
-            server_action = self.last_action
-            logger.info("Using %s action: %s", 
-                       "newly received" if self.received_action_this_step else "previous", 
-                       str(server_action))
+            action = None
         
         # Step the Carla simulator with the action
-        logger.info("Stepping Carla simulator with action %s", str(server_action))
-        observation = self.robotics_simulator.step(server_action)
+        observation = self.robotics_simulator.step(action)
         self.current_observation = observation
         
         # Send observation through network simulator (server to client)

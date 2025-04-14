@@ -110,27 +110,36 @@ class CarlaLatencySimulator:
         Take a step in the simulation.
         
         Args:
-            action: Control input for the ego vehicle. Can be:
-                   - None: Will not apply any control
-                   - carla.VehicleControl: Direct control to apply
-                   - list/tuple: [throttle, steer, brake(optional)] values
+            action: Boolean indicating whether to apply emergency brake
         
         Returns:
             observation: Current observation
         """
-        # Apply ego vehicle control if provided
-        if action is not None:
-            if isinstance(action, carla.VehicleControl):
-                # Apply directly if it's already a VehicleControl object
-                self.ego_vehicle.apply_control(action)
-            elif isinstance(action, (list, tuple)) and len(action) >= 2:
-                # Convert list/tuple to VehicleControl
-                ego_control = carla.VehicleControl(
-                    throttle=float(action[0]), 
-                    steer=float(action[1]),
-                    brake=float(action[2]) if len(action) > 2 else 0.0
-                )
-                self.ego_vehicle.apply_control(ego_control)
+        if action is None:
+            brake = False
+        else:
+            brake = action
+            
+        # Generate and apply ego vehicle control based on current tick and brake flag
+        if brake:
+            # Emergency brake
+            ego_control = carla.VehicleControl(throttle=0.0, brake=1.0)
+        else:
+            # Normal driving based on config
+            ego_control = carla.VehicleControl()
+            
+            if self.tick < self.config['ego_vehicle']['go_straight_ticks']:
+                ego_control.throttle = self.config['ego_vehicle']['throttle']['straight']
+                ego_control.steer = self.config['ego_vehicle']['steer']['straight'] if 'straight' in self.config['ego_vehicle']['steer'] else 0.0
+            elif self.tick < self.config['ego_vehicle']['go_straight_ticks'] + self.config['ego_vehicle']['turn_ticks']:
+                ego_control.throttle = self.config['ego_vehicle']['throttle']['turn']
+                ego_control.steer = self.config['ego_vehicle']['steer']['turn']
+            else:
+                ego_control.throttle = self.config['ego_vehicle']['throttle']['after_turn']
+                ego_control.steer = self.config['ego_vehicle']['steer']['after_turn'] if 'after_turn' in self.config['ego_vehicle']['steer'] else 0.0
+        
+        # Apply the calculated control
+        self.ego_vehicle.apply_control(ego_control)
         
         # Tick the world
         self.world.tick()
@@ -336,7 +345,7 @@ def main():
     args = parser.parse_args()
 
     network_sim = NSPyNetworkSimulator(
-        source_rate=10000.0,  # 10 Mbps
+        source_rate=100000000.0,  # 10 Mbps
         weights=[1, 2],       # Weight client->server flows lower than server->client
     )
     # Select configuration based on argument
@@ -379,30 +388,8 @@ def main():
     # Run for specified number of steps
     for cur_step in range(base_config['ego_vehicle']['go_straight_ticks'] + base_config['ego_vehicle']['turn_ticks'] + base_config['ego_vehicle']['after_turn_ticks']):
         
-        # Generate the appropriate control for the ego vehicle
-        ego_control = None
-        
-        if brake:
-            # Emergency brake
-            ego_control = carla.VehicleControl(throttle=0.0, brake=1.0)
-        else:
-            # Normal driving based on config
-            control = carla.VehicleControl()
-            
-            if cur_step < base_config['ego_vehicle']['go_straight_ticks']:
-                control.throttle = base_config['ego_vehicle']['throttle']['straight']
-                control.steer = base_config['ego_vehicle']['steer']['straight'] if 'straight' in base_config['ego_vehicle']['steer'] else 0.0
-            elif cur_step < base_config['ego_vehicle']['go_straight_ticks'] + base_config['ego_vehicle']['turn_ticks']:
-                control.throttle = base_config['ego_vehicle']['throttle']['turn']
-                control.steer = base_config['ego_vehicle']['steer']['turn']
-            else:
-                control.throttle = base_config['ego_vehicle']['throttle']['after_turn']
-                control.steer = base_config['ego_vehicle']['steer']['after_turn'] if 'after_turn' in base_config['ego_vehicle']['steer'] else 0.0
-            
-            ego_control = control
-        
-        # Step the simulation with calculated ego control
-        observation = co_sim.step(ego_control)
+        # Step the simulation with brake flag
+        observation = co_sim.step(brake)
         
         # Reset brake flag
         brake = False
