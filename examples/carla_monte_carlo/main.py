@@ -103,13 +103,9 @@ class CarlaLatencySimulator:
         # Return the initial observation
         return self._get_observation()
     
-    def step(self, action=None):
+    def step(self):
         """
         Take a step in the simulation.
-        
-        Args:
-            action: Optional action to override default behavior
-                   If None, will use the configured driving behavior
         
         Returns:
             tuple: (observation, reward, done, info)
@@ -155,7 +151,7 @@ class CarlaLatencySimulator:
                         self.obstacle_buffer.pop(0)
     
         # Apply vehicle controls based on action or default behavior
-        self._apply_vehicle_controls(brake, action)
+        self._apply_vehicle_controls(brake, action=None)
         
         # Tick the world
         self.world.tick()
@@ -434,7 +430,7 @@ def main():
         for step in range(base_config['ego_vehicle']['go_straight_ticks'] + base_config['ego_vehicle']['turn_ticks'] + base_config['ego_vehicle']['after_turn_ticks']):
             
             # Step the simulation
-            observation, reward, done, info = simulator.step(None)
+            observation, reward, done, info = simulator.step()
             
             print(f"Step {step}: reward={reward}, done={done}")
             print(f"  - Collision probability: {info.get('collision_probability', 0):.4f}")
