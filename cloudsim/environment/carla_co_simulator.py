@@ -222,8 +222,12 @@ class CarlaCoSimulator(BaseCoSimulator):
         elif isinstance(data, list):
             size = float(len(data))
         else:
-            # Use pickle to estimate the size
-            size = float(len(pickle.dumps(data)))
+            try:
+                # Use pickle to estimate the size
+                size = float(len(pickle.dumps(data)))
+            except Exception as e:
+                logger.debug("Failed to pickle data: %s", str(e))
+                size = 1000.0
 
         logger.info("Estimated message size: %f bytes", size)
         return size

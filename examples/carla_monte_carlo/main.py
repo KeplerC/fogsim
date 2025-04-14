@@ -51,7 +51,6 @@ class CarlaLatencySimulator:
         self.tick = 0
         
         # Tracking
-        self.rel_tracker = None
         self.obstacle_buffer = []
         
         # Connect to CARLA and initialize
@@ -85,18 +84,11 @@ class CarlaLatencySimulator:
         # Reset simulation state
         self.has_collided = False
         self.frame_queue = []
-        self.tick = 0
         self.obstacle_buffer = []
         
         # Spawn the vehicles and sensors
         self._spawn_actors()
         
-        # Initialize tracker
-        self.rel_tracker = RelativePositionTracker(
-            self.ego_vehicle,
-            self.obstacle_vehicle,
-            dt=self.config['simulation']['delta_seconds'])
-            
         # Tick the world to get initial observation
         self.world.tick()
         
@@ -107,72 +99,60 @@ class CarlaLatencySimulator:
         """
         Take a step in the simulation.
         
+        Args:
+            action: Control input for the ego vehicle. Can be:
+                   - None: Will not apply any control
+                   - carla.VehicleControl: Direct control to apply
+                   - list/tuple: [throttle, steer, brake(optional)] values
+        
         Returns:
-            tuple: (observation, reward, done, info)
+            observation: Current observation
         """
-        if self.has_collided:
-            return self._get_observation(), -1000, True, {"collision": True}
-            
-        # Increment tick counter
-        self.tick += 1
-        
-        # Store current observation to buffer
-        current_observation = (self.ego_vehicle.get_transform(), 
-                              self.obstacle_vehicle.get_transform(), 
-                              self.tick)
-        self.obstacle_buffer.append(current_observation)
-        
-        # Update tracker with real-time data
-        self.rel_tracker.update(self.tick)
-        
-        brake = False
-        max_collision_prob = 0.0
-    
-        # Predict future positions using EKF
-        predicted_positions = self.rel_tracker.predict_future_position(
-            int(self.config['simulation']['prediction_steps']))
-
-        # Calculate collision probabilities with new relative position approach
-        max_collision_prob, collision_time, collision_probabilities = calculate_collision_probability_relative(
-            self.rel_tracker, predicted_positions)
-        
-        # Apply emergency brake if collision probability exceeds threshold
-        if max_collision_prob > self.config['simulation']['emergency_brake_threshold']:
-            # Emergency brake
-            brake = True
-    
-        # Apply vehicle controls based on action or default behavior
-        self._apply_vehicle_controls(brake, action=action)
+        # Apply ego vehicle control if provided
+        if action is not None:
+            if isinstance(action, carla.VehicleControl):
+                # Apply directly if it's already a VehicleControl object
+                self.ego_vehicle.apply_control(action)
+            elif isinstance(action, (list, tuple)) and len(action) >= 2:
+                # Convert list/tuple to VehicleControl
+                ego_control = carla.VehicleControl(
+                    throttle=float(action[0]), 
+                    steer=float(action[1]),
+                    brake=float(action[2]) if len(action) > 2 else 0.0
+                )
+                self.ego_vehicle.apply_control(ego_control)
         
         # Tick the world
         self.world.tick()
+        self.tick += 1
+        
+        # Apply obstacle controls
+        self._apply_obstacle_controls()
         
         # Get observation
         observation = self._get_observation()
-        
-        # Calculate reward (negative for collisions, slight penalty for braking, positive for moving)
-        reward = 0
-        if self.has_collided:
-            reward = -1000  # Large negative reward for collision
-        elif brake:
-            reward = -10    # Slight penalty for emergency braking
-        else:
-            reward = 1      # Small positive reward for moving
-            
-        # Check if done
-        done = self.has_collided or self.tick >= (self.config['ego_vehicle']['go_straight_ticks'] + 
-                                                 self.config['ego_vehicle']['turn_ticks'] + 
-                                                 self.config['ego_vehicle']['after_turn_ticks'])
-                                                 
-        # Create info dict
-        info = {
-            "collision": self.has_collided,
-            "collision_probability": max_collision_prob,
-            "tick": self.tick
-        }
-        
-        return observation, reward, done, info
+
+        return observation
     
+    def _apply_obstacle_controls(self):
+        obstacle_control = carla.VehicleControl()
+
+        if self.tick < self.config['obstacle_vehicle']['go_straight_ticks']:
+            # Initial straight phase
+            obstacle_control.throttle = self.config['obstacle_vehicle']['throttle']['straight']
+            obstacle_control.steer = self.config['obstacle_vehicle']['steer']['straight']
+        elif self.tick < self.config['obstacle_vehicle']['go_straight_ticks'] + self.config[
+                'obstacle_vehicle']['turn_ticks']:
+            # Turning phase
+            obstacle_control.throttle = self.config['obstacle_vehicle']['throttle']['turn']
+            obstacle_control.steer = self.config['obstacle_vehicle']['steer']['turn']
+        else:
+            # After turn straight phase
+            obstacle_control.throttle = self.config['obstacle_vehicle']['throttle']['after_turn']
+            obstacle_control.steer = self.config['obstacle_vehicle']['steer']['after_turn']
+
+        self.obstacle_vehicle.apply_control(obstacle_control)
+            
     def render(self, mode='rgb_array'):
         """
         Render the current simulation state.
@@ -280,89 +260,18 @@ class CarlaLatencySimulator:
     
     def _get_observation(self):
         """Get the current observation from the simulation."""
-        # For this implementation, we use camera frames as observations
-        if self.frame_queue:
-            return self.frame_queue[-1]
-        return None
-    
-    def _apply_vehicle_controls(self, brake, action=None):
-        """
-        Apply controls to vehicles based on brake flag or custom action.
+        # Make sure vehicles are initialized
+        if self.ego_vehicle is None or self.obstacle_vehicle is None:
+            return None
         
-        Args:
-            brake (bool): Whether to apply emergency brake
-            action (ndarray, optional): Custom action to apply instead of default behavior
-        """
-        # For ego vehicle
-        if brake:
-            # Emergency brake
-            self.ego_vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0))
-        elif action is not None:
-            # Apply custom action if provided
-            # Assuming action format is [throttle, steer]
-            if len(action) >= 2:
-                ego_control = carla.VehicleControl(
-                    throttle=float(action[0]), 
-                    steer=float(action[1]),
-                    brake=float(action[2]) if len(action) > 2 else 0.0
-                )
-                self.ego_vehicle.apply_control(ego_control)
-        else:
-            # Normal driving based on config
-            ego_control = carla.VehicleControl()
-            if self.tick < self.config['ego_vehicle']['go_straight_ticks']:
-                ego_control.throttle = self.config['ego_vehicle']['throttle']['straight']
-            elif self.tick < self.config['ego_vehicle']['go_straight_ticks'] + self.config[
-                    'ego_vehicle']['turn_ticks']:
-                ego_control.throttle = self.config['ego_vehicle']['throttle']['turn']
-                ego_control.steer = self.config['ego_vehicle']['steer']['turn']
-            else:
-                ego_control.throttle = self.config['ego_vehicle']['throttle']['after_turn']
-                
-            self.ego_vehicle.apply_control(ego_control)
-
-        # For obstacle vehicle (follows predetermined path)
-        obstacle_control = carla.VehicleControl()
-
-        if self.tick < self.config['obstacle_vehicle']['go_straight_ticks']:
-            # Initial straight phase
-            obstacle_control.throttle = self.config['obstacle_vehicle']['throttle']['straight']
-            obstacle_control.steer = self.config['obstacle_vehicle']['steer']['straight']
-        elif self.tick < self.config['obstacle_vehicle']['go_straight_ticks'] + self.config[
-                'obstacle_vehicle']['turn_ticks']:
-            # Turning phase
-            obstacle_control.throttle = self.config['obstacle_vehicle']['throttle']['turn']
-            obstacle_control.steer = self.config['obstacle_vehicle']['steer']['turn']
-        else:
-            # After turn straight phase
-            obstacle_control.throttle = self.config['obstacle_vehicle']['throttle']['after_turn']
-            obstacle_control.steer = self.config['obstacle_vehicle']['steer']['after_turn']
-
-        self.obstacle_vehicle.apply_control(obstacle_control)
-
-
-def run_adaptive_simulation(config, output_dir):
-    """Run a simulation with braking based on collision probability using the new interface"""
-    simulator = CarlaLatencySimulator(config, output_dir)
-    has_collided = False
+        # convert transform to numpy array
+        ego_transform = np.array(self.ego_vehicle.get_transform().location)
+        obstacle_transform = np.array(self.obstacle_vehicle.get_transform().location)
+        current_observation = (ego_transform, 
+                              obstacle_transform, 
+                              self.tick)
+        return current_observation
     
-    try:
-        # Reset to initialize the simulation
-        simulator.reset()
-        
-        # Run simulation loop
-        done = False
-        while not done:
-            # Step simulation with default behavior
-            _, _, done, info = simulator.step()
-            has_collided = info.get("collision", False)
-            
-    except Exception as e:
-        print(f"Error in simulation: {e}")
-    finally:
-        # Clean up
-        simulator.close()
-        return has_collided
 
 def main():
     parser = argparse.ArgumentParser(
@@ -406,32 +315,71 @@ def main():
 
     # Run in gym-like mode for interactive use or testing
     simulator = CarlaLatencySimulator(base_config, args.output_dir)
-    simulator.reset()
+    observation = simulator.reset()
+    
+    # Create the relative position tracker outside the simulator
+    rel_tracker = RelativePositionTracker(
+        simulator.ego_vehicle,
+        simulator.obstacle_vehicle,
+        dt=base_config['simulation']['delta_seconds'])
 
     co_sim = CarlaCoSimulator(network_sim, simulator, timestep=0.01)
 
-    try:
-        # Run for specified number of steps
-        for step in range(base_config['ego_vehicle']['go_straight_ticks'] + base_config['ego_vehicle']['turn_ticks'] + base_config['ego_vehicle']['after_turn_ticks']):
-            
-            # Step the simulation
-            observation, reward, done, info = co_sim.step(None)
-            
-            print(f"Step {step}: reward={reward}, done={done}")
-            print(f"  - Collision probability: {info.get('collision_probability', 0):.4f}")
-            
-            if done:
-                print(f"Simulation ended after {step} steps")
-                break
-                
-        print("Simulation completed")
+    brake = False
+    observation = None
+
+    # Run for specified number of steps
+    for step in range(base_config['ego_vehicle']['go_straight_ticks'] + base_config['ego_vehicle']['turn_ticks'] + base_config['ego_vehicle']['after_turn_ticks']):
         
-    except KeyboardInterrupt:
-        print("Simulation interrupted by user")
-    except Exception as e:
-        print(f"Error in simulation: {e}")
-    finally:
-        simulator.close()
+        # Generate the appropriate control for the ego vehicle
+        ego_control = None
+        
+        if brake:
+            # Emergency brake
+            ego_control = carla.VehicleControl(throttle=0.0, brake=1.0)
+        else:
+            # Normal driving based on config
+            control = carla.VehicleControl()
+            
+            if step < base_config['ego_vehicle']['go_straight_ticks']:
+                control.throttle = base_config['ego_vehicle']['throttle']['straight']
+                control.steer = base_config['ego_vehicle']['steer']['straight'] if 'straight' in base_config['ego_vehicle']['steer'] else 0.0
+            elif step < base_config['ego_vehicle']['go_straight_ticks'] + base_config['ego_vehicle']['turn_ticks']:
+                control.throttle = base_config['ego_vehicle']['throttle']['turn']
+                control.steer = base_config['ego_vehicle']['steer']['turn']
+            else:
+                control.throttle = base_config['ego_vehicle']['throttle']['after_turn']
+                control.steer = base_config['ego_vehicle']['steer']['after_turn'] if 'after_turn' in base_config['ego_vehicle']['steer'] else 0.0
+            
+            ego_control = control
+        
+        # Step the simulation with calculated ego control
+        observation = co_sim.step(ego_control)
+        
+        # Reset brake flag
+        brake = False
+        
+        # Predict future positions and calculate collision probability
+        if rel_tracker is not None:
+            # Update the tracker
+            rel_tracker.update(step)
+            
+            # Predict future positions
+            predicted_positions = rel_tracker.predict_future_position(
+                int(base_config['simulation']['prediction_steps']))
+            
+            # Calculate collision probabilities
+            max_collision_prob, collision_time, collision_probabilities = calculate_collision_probability_relative(
+                rel_tracker, predicted_positions)
+            print(f"Collision probability: {max_collision_prob}")
+            
+            # Apply emergency brake if collision probability exceeds threshold
+            if max_collision_prob > base_config['simulation']['emergency_brake_threshold']:
+                brake = True
+
+    print("Simulation completed")
+    
+
 
 if __name__ == '__main__':
     main()
