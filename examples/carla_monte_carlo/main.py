@@ -385,8 +385,9 @@ def main():
     logger.info(f"Starting simulation with {base_config['simulation']['prediction_steps']} prediction steps")
     logger.info(f"Emergency brake threshold: {base_config['simulation']['emergency_brake_threshold']}")
 
+    total_steps = base_config['ego_vehicle']['go_straight_ticks'] + base_config['ego_vehicle']['turn_ticks'] + base_config['ego_vehicle']['after_turn_ticks']
     # Run for specified number of steps
-    for cur_step in range(base_config['ego_vehicle']['go_straight_ticks'] + base_config['ego_vehicle']['turn_ticks'] + base_config['ego_vehicle']['after_turn_ticks']):
+    for cur_step in range(total_steps):
         
         # Step the simulation with brake flag
         observation = co_sim.step(brake)
@@ -407,17 +408,19 @@ def main():
             # relative x, y, yaw
             rel_x = obstacle_pos[0] - ego_pos[0]
             rel_y = obstacle_pos[1] - ego_pos[1]
-            rel_yaw = obstacle_rot[0] - ego_rot[0]
-            
+            rel_yaw_deg = obstacle_rot[0] - ego_rot[0] 
+            rel_yaw_rad = rel_yaw_deg * np.pi / 180.0
+                        
             # Update the tracker with the observation data
-            rel_tracker.update((rel_x, rel_y, rel_yaw), tick)
+            rel_tracker.update((rel_x, rel_y, rel_yaw_rad), tick)
             
             # Predict future positions
-            predicted_positions = rel_tracker.predict_future_position(50)
+            predicted_positions = rel_tracker.predict_future_position(1000)
+            
             
             # Calculate collision probabilities
-            ego_trajectory = np.array([ego_pos] * base_config['simulation']['prediction_steps'])
-            
+            ego_trajectory = np.zeros((total_steps, 3))
+
             max_collision_prob, collision_time, collision_probabilities = calculate_collision_probabilities(
                 rel_tracker, predicted_positions, ego_trajectory, tick)
             logger.info(f"Step {cur_step}: Collision probability: {max_collision_prob:.4f}")

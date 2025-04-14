@@ -97,11 +97,16 @@ class CarlaCoSimulator(BaseCoSimulator):
         # Use the last action received from the network, or keep using the previous one
         if not self.received_action_this_step and self.last_action is None:
             # For Carla, we might need a default action if none exists
-            # This will depend on the Carla environment's action space
-            action = None
+            # Try to create a neutral action (no throttle, no steering)
+            server_action = None
+            self.last_action = server_action
+        else:
+            # Use the last action we received
+            server_action = self.last_action
         
         # Step the Carla simulator with the action
-        observation = self.robotics_simulator.step(action)
+        logger.info(f"Stepping Carla simulator with action {server_action}")
+        observation = self.robotics_simulator.step(server_action)
         self.current_observation = observation
         
         # Send observation through network simulator (server to client)
@@ -186,7 +191,7 @@ class CarlaCoSimulator(BaseCoSimulator):
             if 'action' in message:
                 self.last_action = message['action']
                 self.received_action_this_step = True
-                logger.info("Received action from network: %s", str(self.last_action))
+                logger.info(f"Received action from network: {self.last_action}")
 
     def _estimate_message_size(self, data: Any) -> float:
         """
