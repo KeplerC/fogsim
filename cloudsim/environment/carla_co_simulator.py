@@ -91,6 +91,8 @@ class CarlaCoSimulator(BaseCoSimulator):
                 size=action_size
             )
             logger.info(f"Sent action in response to observation {self.last_received_observation_id}")
+            self.last_action = action
+            
 
         # Use the last action received from the network, or keep using the previous one
         if not self.received_action_this_step and self.last_action is None:
