@@ -13,6 +13,8 @@ from scipy.stats import norm
 
 from configs import *
 from utils import *
+from cloudsim import GymCoSimulator, CarlaCoSimulator
+from cloudsim.network.nspy_simulator import NSPyNetworkSimulator
 
 
 class CarlaLatencySimulator:
@@ -50,7 +52,6 @@ class CarlaLatencySimulator:
         
         # Tracking
         self.rel_tracker = None
-        self.current_delta_k = self.config['simulation']['delta_k']
         self.obstacle_buffer = []
         
         # Connect to CARLA and initialize
@@ -85,7 +86,6 @@ class CarlaLatencySimulator:
         self.has_collided = False
         self.frame_queue = []
         self.tick = 0
-        self.current_delta_k = self.config['simulation']['delta_k']
         self.obstacle_buffer = []
         
         # Spawn the vehicles and sensors
@@ -103,7 +103,7 @@ class CarlaLatencySimulator:
         # Return the initial observation
         return self._get_observation()
     
-    def step(self):
+    def step(self, action=None):
         """
         Take a step in the simulation.
         
@@ -130,28 +130,19 @@ class CarlaLatencySimulator:
     
         # Predict future positions using EKF
         predicted_positions = self.rel_tracker.predict_future_position(
-            int(self.config['simulation']['prediction_steps'] / self.current_delta_k))
+            int(self.config['simulation']['prediction_steps']))
 
         # Calculate collision probabilities with new relative position approach
         max_collision_prob, collision_time, collision_probabilities = calculate_collision_probability_relative(
             self.rel_tracker, predicted_positions)
         
-        # Adaptive behavior based on collision probability
+        # Apply emergency brake if collision probability exceeds threshold
         if max_collision_prob > self.config['simulation']['emergency_brake_threshold']:
             # Emergency brake
             brake = True
-        elif max_collision_prob > self.config['simulation']['cautious_threshold']:
-            # Increase tracking frequency (decrease delta_k)
-            new_delta_k = self.config['simulation']['cautious_delta_k']
-            if new_delta_k != self.current_delta_k:
-                self.current_delta_k = new_delta_k
-                # Drop observations from buffer to match new delta_k
-                for i in range(self.config['simulation']['l_max'] - new_delta_k):
-                    if self.obstacle_buffer:
-                        self.obstacle_buffer.pop(0)
     
         # Apply vehicle controls based on action or default behavior
-        self._apply_vehicle_controls(brake, action=None)
+        self._apply_vehicle_controls(brake, action=action)
         
         # Tick the world
         self.world.tick()
@@ -177,8 +168,7 @@ class CarlaLatencySimulator:
         info = {
             "collision": self.has_collided,
             "collision_probability": max_collision_prob,
-            "tick": self.tick,
-            "delta_k": self.current_delta_k
+            "tick": self.tick
         }
         
         return observation, reward, done, info
@@ -352,10 +342,9 @@ class CarlaLatencySimulator:
 
 
 def run_adaptive_simulation(config, output_dir):
-    """Run a simulation with adaptive delta_k and braking based on collision probability using the new interface"""
+    """Run a simulation with braking based on collision probability using the new interface"""
     simulator = CarlaLatencySimulator(config, output_dir)
     has_collided = False
-    current_delta_k = config['simulation']['delta_k']
     
     try:
         # Reset to initialize the simulation
@@ -367,22 +356,17 @@ def run_adaptive_simulation(config, output_dir):
             # Step simulation with default behavior
             _, _, done, info = simulator.step()
             has_collided = info.get("collision", False)
-            current_delta_k = info.get("delta_k", current_delta_k)
             
     except Exception as e:
         print(f"Error in simulation: {e}")
     finally:
         # Clean up
         simulator.close()
-        return has_collided, current_delta_k
+        return has_collided
 
 def main():
     parser = argparse.ArgumentParser(
         description='Run CARLA simulation with configurable parameters')
-    parser.add_argument('--cautious_delta_k',
-                        type=int,
-                        default=-1,
-                        help='Value for cautious_delta_k parameter')
     parser.add_argument('--config_type',
                         type=str,
                         choices=['right_turn', 'left_turn', 'merge'],
@@ -399,6 +383,11 @@ def main():
 
     args = parser.parse_args()
 
+    network_sim = NSPyNetworkSimulator(
+        source_rate=1.0,  # 10 Mbps
+        weights=[1, 2],       # Weight client->server flows lower than server->client
+        debug=True
+    )
     # Select configuration based on argument
     config_map = {
         'right_turn': unprotected_right_turn_config,
@@ -407,12 +396,6 @@ def main():
     }
 
     base_config = config_map[args.config_type]
-
-    # Update configuration with command line parameters
-    if args.cautious_delta_k != -1:
-        base_config['simulation']['cautious_delta_k'] = args.cautious_delta_k
-        base_config['simulation']['l_max'] = args.cautious_delta_k
-        base_config['simulation']['delta_k'] = args.cautious_delta_k
 
     # Update emergency brake threshold
     base_config['simulation'][
@@ -425,16 +408,17 @@ def main():
     simulator = CarlaLatencySimulator(base_config, args.output_dir)
     simulator.reset()
 
+    co_sim = CarlaCoSimulator(network_sim, simulator, timestep=0.01)
+
     try:
         # Run for specified number of steps
         for step in range(base_config['ego_vehicle']['go_straight_ticks'] + base_config['ego_vehicle']['turn_ticks'] + base_config['ego_vehicle']['after_turn_ticks']):
             
             # Step the simulation
-            observation, reward, done, info = simulator.step()
+            observation, reward, done, info = co_sim.step(None)
             
             print(f"Step {step}: reward={reward}, done={done}")
             print(f"  - Collision probability: {info.get('collision_probability', 0):.4f}")
-            print(f"  - Current delta_k: {info.get('delta_k', 0)}")
             
             if done:
                 print(f"Simulation ended after {step} steps")
