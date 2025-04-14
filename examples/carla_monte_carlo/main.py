@@ -415,7 +415,7 @@ def main():
             rel_tracker.update((rel_x, rel_y, rel_yaw_rad), tick)
             
             # Predict future positions
-            predicted_positions = rel_tracker.predict_future_position(1000)
+            predicted_positions = rel_tracker.predict_future_position(100)
             
             
             # Calculate collision probabilities
@@ -426,7 +426,8 @@ def main():
             logger.info(f"Step {cur_step}: Collision probability: {max_collision_prob:.4f}")
             
             # Apply emergency brake if collision probability exceeds threshold
-            if max_collision_prob > base_config['simulation']['emergency_brake_threshold']:
+            # if max_collision_prob > base_config['simulation']['emergency_brake_threshold']:
+            if max_collision_prob > 0:
                 logger.info(f"Step {cur_step}: EMERGENCY BRAKE ACTIVATED")
                 brake = True
                 
