@@ -592,7 +592,7 @@ def main():
     parser.add_argument('--config_type',
                         type=str,
                         choices=['right_turn', 'left_turn', 'merge'],
-                        default='merge',
+                        default='right_turn',
                         help='Type of configuration to use')
     parser.add_argument('--emergency_brake_threshold',
                         type=float,
@@ -606,7 +606,7 @@ def main():
     args = parser.parse_args()
 
     network_sim = NSPyNetworkSimulator(
-        source_rate=1000000000000.0,  # 10 Mbps
+        source_rate=1.0,  # 10 Mbps
         weights=[1, 2],       # Weight client->server flows lower than server->client
     )
     # Select configuration based on argument
@@ -683,6 +683,7 @@ def main():
             # Predict future positions
             predicted_positions = rel_tracker.predict_future_position(
                 int(base_config['simulation']['prediction_steps']))
+            logger.info(f"Step {cur_step}: Predicted positions: {np.unique(predicted_positions)}")
             
             # Calculate collision probabilities
             max_collision_prob, collision_time, collision_probabilities = calculate_collision_probability_relative(

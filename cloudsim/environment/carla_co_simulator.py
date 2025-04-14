@@ -148,9 +148,11 @@ class CarlaCoSimulator(BaseCoSimulator):
         # Advance simulation time
         self._advance_time()
         
-        # Return the observation that came through the network (with delay),
-        # or the direct observation if nothing has come through the network yet
-        return self.last_network_observation if self.last_network_observation is not None else observation
+        if self.last_network_observation is not None:
+            return self.last_network_observation
+        else:
+            self.last_network_observation = observation
+            return observation
     
     def reset(self) -> np.ndarray:
         """Reset both simulators to initial state."""
