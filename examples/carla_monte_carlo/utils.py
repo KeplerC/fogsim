@@ -525,3 +525,160 @@ def calculate_collision_probabilities(obstacle_tracker, predicted_positions,
     )
 
     return max_collision_prob, collision_time, collision_probabilities
+
+
+
+class RelativePositionTracker:
+    """Tracker for predicting relative positions between ego and obstacle vehicles using EKF"""
+    def __init__(self, ego_vehicle, obstacle_vehicle, dt=0.1):
+        self.ego_vehicle = ego_vehicle
+        self.obstacle_vehicle = obstacle_vehicle
+        self.dt = dt
+        
+        # Initialize EKF
+        self.ekf = KalmanFilter(dim_x=6, dim_z=3)
+        
+        # State vector [x, y, yaw, vx, vy, yaw_rate]
+        self.ekf.x = np.zeros(6)
+        
+        # State transition matrix
+        self.ekf.F = np.array([
+            [1, 0, 0, self.dt, 0, 0],
+            [0, 1, 0, 0, self.dt, 0],
+            [0, 0, 1, 0, 0, self.dt],
+            [0, 0, 0, 1, 0, 0],
+            [0, 0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 0, 1]
+        ])
+        
+        # Measurement matrix
+        self.ekf.H = np.array([
+            [1, 0, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0, 0],
+            [0, 0, 1, 0, 0, 0]
+        ])
+        
+        # Measurement noise
+        self.ekf.R = np.eye(3) * 0.1
+        
+        # Process noise
+        self.ekf.Q = np.eye(6) * 0.01
+        self.ekf.Q[3:, 3:] *= 10  # Higher process noise for velocity components
+        
+        # Initial covariance
+        self.ekf.P = np.eye(6) * 1.0
+        
+        # Last update time
+        self.last_update_time = 0
+        
+    def update(self, tick):
+        """Update the tracker with current vehicle positions"""
+        ego_transform = self.ego_vehicle.get_transform()
+        obstacle_transform = self.obstacle_vehicle.get_transform()
+        
+        # Calculate relative position
+        rel_x = obstacle_transform.location.x - ego_transform.location.x
+        rel_y = obstacle_transform.location.y - ego_transform.location.y
+        rel_yaw = math.radians(obstacle_transform.rotation.yaw - ego_transform.rotation.yaw)
+        
+        # Get velocities
+        ego_vel = self.ego_vehicle.get_velocity()
+        obstacle_vel = self.obstacle_vehicle.get_velocity()
+        
+        # Calculate relative velocity
+        rel_vx = obstacle_vel.x - ego_vel.x
+        rel_vy = obstacle_vel.y - ego_vel.y
+        
+        # Calculate yaw rate
+        ego_angular_vel = self.ego_vehicle.get_angular_velocity()
+        obstacle_angular_vel = self.obstacle_vehicle.get_angular_velocity()
+        rel_yaw_rate = obstacle_angular_vel.z - ego_angular_vel.z
+        
+        # Set initial state if first update
+        if tick == self.last_update_time + 1:
+            # Predict
+            self.ekf.predict()
+            
+            # Update
+            z = np.array([rel_x, rel_y, rel_yaw])
+            self.ekf.update(z)
+        else:
+            # Initialize state
+            self.ekf.x = np.array([rel_x, rel_y, rel_yaw, rel_vx, rel_vy, rel_yaw_rate])
+        
+        self.last_update_time = tick
+        
+    def predict_future_position(self, steps):
+        """Predict future relative positions"""
+        # Current state
+        state = self.ekf.x.copy()
+        
+        # Transition matrix for simulation
+        F = np.array([
+            [1, 0, 0, self.dt, 0, 0],
+            [0, 1, 0, 0, self.dt, 0],
+            [0, 0, 1, 0, 0, self.dt],
+            [0, 0, 0, 1, 0, 0],
+            [0, 0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 0, 1]
+        ])
+        
+        predictions = []
+        for i in range(steps):
+            # Apply transition
+            state = F @ state
+            
+            # Extract position
+            predictions.append((state[0], state[1], state[2]))
+            
+        return predictions
+        
+    def get_position_uncertainty(self):
+        """Get position uncertainty from covariance matrix"""
+        # Extract position covariance
+        pos_cov = self.ekf.P[:2, :2]
+        return pos_cov
+
+
+def calculate_collision_probability_relative(rel_tracker, predicted_positions, ego_radius=2.0, obstacle_radius=2.0):
+    """Calculate collision probability based on relative positions and uncertainties"""
+    collision_probabilities = []
+    collision_times = []
+    
+    # Combined radius for collision detection
+    combined_radius = ego_radius + obstacle_radius
+    
+    for i, pos in enumerate(predicted_positions):
+        rel_x, rel_y, _ = pos
+        
+        # Distance between vehicles
+        distance = math.sqrt(rel_x**2 + rel_y**2)
+        
+        # Get uncertainty
+        pos_cov = rel_tracker.get_position_uncertainty()
+        
+        # Simplified collision probability calculation
+        # Assuming normal distribution
+        if distance < combined_radius:
+            # Already colliding
+            prob = 1.0
+        else:
+            # Calculate probability using Mahalanobis distance
+            d_squared = np.array([rel_x, rel_y]) @ np.linalg.inv(pos_cov) @ np.array([rel_x, rel_y])
+            prob = 1 - math.exp(-0.5 * d_squared) 
+            
+            # Scale based on distance to collision boundary
+            scale_factor = combined_radius / max(distance, combined_radius)
+            prob *= scale_factor
+        
+        collision_probabilities.append(prob)
+        
+        if prob > 0.5:  # Arbitrary threshold for reporting collision time
+            collision_times.append(i)
+    
+    # Return max probability and earliest collision time
+    max_prob = max(collision_probabilities) if collision_probabilities else 0.0
+    collision_time = min(collision_times) if collision_times else -1
+    
+    return max_prob, collision_time, collision_probabilities
+

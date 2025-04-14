@@ -15,94 +15,6 @@ from configs import *
 from utils import *
 
 
-def save_trajectory(vehicle, filename):
-    """Save vehicle transform to file"""
-    with open(filename, 'a') as f:
-        transform = vehicle.get_transform()
-        f.write(
-            f"{transform.location.x},{transform.location.y},{transform.rotation.yaw}\n"
-        )
-
-
-def load_trajectory(filename):
-    """Load trajectory from file"""
-    trajectory = []
-    with open(filename, 'r') as f:
-        for line in f:
-            x, y, yaw = map(float, line.strip().split(','))
-            trajectory.append([x, y, math.radians(yaw)])
-    return trajectory
-
-
-def run_first_simulation(config, trajectory_file=None):
-    """Run the first simulation to generate the ego vehicle trajectory"""
-    # Use trajectory file from config if none provided
-    if trajectory_file is None:
-        trajectory_file = config['trajectories']['ego']
-
-    client = carla.Client(config['simulation']['host'],
-                          config['simulation']['port'])
-    client.set_timeout(10.0)
-    world = client.load_world("Town03")
-
-    # Set synchronous mode
-    original_settings = world.get_settings()
-    settings = world.get_settings()
-    settings.fixed_delta_seconds = config['simulation']['delta_seconds']
-    settings.synchronous_mode = True
-    settings.no_rendering_mode = False
-    world.apply_settings(settings)
-
-    blueprint_library = world.get_blueprint_library()
-
-    # Get spawn points
-    spawn_points = world.get_map().get_spawn_points()
-
-    # Setup ego vehicle spawn point
-    ego_spawn_point = spawn_points[0]
-    ego_spawn_point.location.x += config['ego_vehicle']['spawn_offset']['x']
-    ego_spawn_point.location.y += config['ego_vehicle']['spawn_offset']['y']
-    ego_spawn_point.rotation.yaw += config['ego_vehicle']['spawn_offset']['yaw']
-
-    # Spawn only the ego vehicle
-    ego_bp = blueprint_library.find(config['ego_vehicle']['model'])
-    ego_bp.set_attribute('role_name', 'ego')
-    ego_vehicle = world.try_spawn_actor(ego_bp, ego_spawn_point)
-    ego_vehicle.set_autopilot(False)
-
-    try:
-        for tick in range(config['ego_vehicle']['go_straight_ticks'] +
-                          config['ego_vehicle']['turn_ticks'] +
-                          config['ego_vehicle']['after_turn_ticks']):
-            world.tick()
-
-            # Apply controls
-            ego_control = carla.VehicleControl()
-            if tick < config['ego_vehicle']['go_straight_ticks']:
-                # Initial straight phase
-                ego_control.throttle = config['ego_vehicle']['throttle'][
-                    'straight']
-                ego_control.steer = 0.0
-            elif tick < config['ego_vehicle']['go_straight_ticks'] + config[
-                    'ego_vehicle']['turn_ticks']:
-                # Turning phase
-                ego_control.throttle = config['ego_vehicle']['throttle']['turn']
-                ego_control.steer = config['ego_vehicle']['steer']['turn']
-            else:
-                # After turn straight phase
-                ego_control.throttle = config['ego_vehicle']['throttle'][
-                    'after_turn']
-                ego_control.steer = 0.0
-
-            ego_vehicle.apply_control(ego_control)
-            save_trajectory(ego_vehicle, trajectory_file)
-
-    finally:
-        if ego_vehicle is not None:
-            ego_vehicle.destroy()
-        client.reload_world()
-        world.apply_settings(original_settings)
-
 def run_adaptive_simulation(config, output_dir):
     """Run a simulation with adaptive delta_k and braking based on collision probability"""
     # Connect to CARLA
@@ -171,37 +83,17 @@ def run_adaptive_simulation(config, output_dir):
 
     camera.listen(camera_callback)
 
-    # Load trajectory and setup tracker
-    ego_trajectory = load_trajectory(config['trajectories']['ego'])
+    # Initialize our new relative position tracker
+    rel_tracker = RelativePositionTracker(
+        ego_vehicle,
+        obstacle_vehicle,
+        dt=config['simulation']['delta_seconds'])
 
     # Initialize tracker with initial delta_k
     initial_delta_k = config['simulation']['delta_k']
     current_delta_k = initial_delta_k
 
-    if config['simulation']['tracker_type'] == 'ekf':
-        obstacle_tracker = EKFObstacleTracker(
-            ego_vehicle,
-            obstacle_vehicle,
-            dt=config['simulation']['delta_seconds'])
-    else:
-        obstacle_tracker = KFObstacleTracker(
-            ego_vehicle,
-            obstacle_vehicle,
-            dt=config['simulation']['delta_seconds'])
-
-    # Add ground truth tracker (using same type as regular tracker)
-    if config['simulation']['tracker_type'] == 'ekf':
-        ground_truth_tracker = EKFObstacleTracker(
-            ego_vehicle,
-            obstacle_vehicle,
-            dt=config['simulation']['delta_seconds'])
-    else:
-        ground_truth_tracker = KFObstacleTracker(
-            ego_vehicle,
-            obstacle_vehicle,
-            dt=config['simulation']['delta_seconds'])
-
-    # Initialize obstacle buffer
+    # Initialize obstacle buffer for delayed observations
     obstacle_buffer = []
 
     # Add collision sensor
@@ -232,51 +124,29 @@ def run_adaptive_simulation(config, output_dir):
                     carla.VehicleControl(throttle=0.0, brake=1.0))
                 break
 
-            current_transform = obstacle_vehicle.get_transform()
-            ground_truth_tracker.update(
-                (current_transform.location.x, current_transform.location.y,
-                 current_transform.rotation.yaw), tick)
-
-            obstacle_buffer.append(current_transform)
+            # Store current observation
+            current_observation = (ego_vehicle.get_transform(), obstacle_vehicle.get_transform(), tick)
+            obstacle_buffer.append(current_observation)
+            
+            # Update tracker with real-time data initially
+            rel_tracker.update(tick)
+            
             brake = False
             max_collision_prob = 0.0
-            ground_truth_collision_prob = 0.0
 
             if tick >= config['simulation']['l_max']:
+                # Use delayed observation based on delta_k
                 obstacle_buffer.pop(0)
+                historical_observation = obstacle_buffer[0]
+                
+                # Predict future positions using EKF
+                predicted_positions = rel_tracker.predict_future_position(
+                    int(config['simulation']['prediction_steps'] / current_delta_k))
 
-                historical_transform = obstacle_buffer[0]
-
-                obstacle_tracker.update((historical_transform.location.x,
-                                         historical_transform.location.y,
-                                         historical_transform.rotation.yaw),
-                                        tick)
-
-                # Predict future positions and calculate collision probabilities
-                predicted_positions = obstacle_tracker.predict_future_position(
-                    int(config['simulation']['prediction_steps'] /
-                        current_delta_k))
-
-                max_collision_prob, collision_time, collision_probabilities = calculate_collision_probabilities(
-                    obstacle_tracker, predicted_positions, ego_trajectory, tick)
-                ground_truth_predictions = ground_truth_tracker.predict_future_position(
-                    int(config['simulation']['prediction_steps'] /
-                        current_delta_k))
-
-                ground_truth_max_prob, ground_truth_collision_time, ground_truth_probabilities = calculate_collision_probabilities(
-                    ground_truth_tracker, ground_truth_predictions,
-                    ego_trajectory, tick)
-                # Get current ego vehicle position
-                ego_transform = ego_vehicle.get_transform()
-                ego_pos = (ego_transform.location.x, ego_transform.location.y,
-                           math.radians(ego_transform.rotation.yaw))
-                obstacle_pos = (current_transform.location.x,
-                                current_transform.location.y,
-                                math.radians(current_transform.rotation.yaw))
-                max_prob_idx = collision_probabilities.index(max_collision_prob)
-                predicted_pos = predicted_positions[max_prob_idx]
-                ego_predicted_pos = ego_trajectory[tick + max_prob_idx]
-                ground_truth_collision_prob = ground_truth_max_prob
+                # Calculate collision probabilities with new relative position approach
+                max_collision_prob, collision_time, collision_probabilities = calculate_collision_probability_relative(
+                    rel_tracker, predicted_positions)
+                print(f"Collision probability: {max_collision_prob:.4f}")
 
                 # Adaptive behavior based on collision probability
                 if max_collision_prob > config['simulation'][
@@ -296,15 +166,10 @@ def run_adaptive_simulation(config, output_dir):
                             f"Adjusting delta_k from {current_delta_k} to {new_delta_k}"
                         )
                         current_delta_k = new_delta_k
-                        # drop the obstacle buffer to new delta_k
-                        for i in range(config['simulation']['l_max'] -
-                                       new_delta_k):
-                            obstacle_pos = obstacle_buffer.pop(0)
-                            # update obstacle tracker with the new position
-                            obstacle_tracker.update((obstacle_pos.location.x,
-                                                     obstacle_pos.location.y,
-                                                     obstacle_pos.rotation.yaw),
-                                                    tick)
+                        # Drop observations from buffer to match new delta_k
+                        for i in range(config['simulation']['l_max'] - new_delta_k):
+                            if obstacle_buffer:
+                                obstacle_buffer.pop(0)
 
             if brake:
                 ego_control = carla.VehicleControl(throttle=0.0, brake=1.0)
@@ -454,16 +319,7 @@ def run_monte_carlo_simulation(config, num_samples=10, output_dir='./results'):
                    ego_spawn_point.rotation.yaw
         }
 
-        # Update trajectory files for this sample
-        sample_config['trajectories'] = {
-            'ego': f'./ego_trajectory_sample_{sample}.csv',
-            'obstacle': f'./obstacle_trajectory_sample_{sample}.csv'
-        }
-
         try:
-            # Generate trajectories
-            run_first_simulation(sample_config)
-
             # Run simulation and check for collision
             has_collided, current_delta_k = run_adaptive_simulation(
                 sample_config, output_dir)
