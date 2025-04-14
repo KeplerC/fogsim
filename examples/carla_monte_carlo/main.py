@@ -131,36 +131,29 @@ class CarlaLatencySimulator:
         
         brake = False
         max_collision_prob = 0.0
-        
-        # Simulate latency by using delayed observations after sufficient buffer built
-        if self.tick >= self.config['simulation']['l_max']:
-            # Use delayed observation based on delta_k
-            if len(self.obstacle_buffer) > 1:
-                self.obstacle_buffer.pop(0)
-            historical_observation = self.obstacle_buffer[0]
-            
-            # Predict future positions using EKF
-            predicted_positions = self.rel_tracker.predict_future_position(
-                int(self.config['simulation']['prediction_steps'] / self.current_delta_k))
+    
+        # Predict future positions using EKF
+        predicted_positions = self.rel_tracker.predict_future_position(
+            int(self.config['simulation']['prediction_steps'] / self.current_delta_k))
 
-            # Calculate collision probabilities with new relative position approach
-            max_collision_prob, collision_time, collision_probabilities = calculate_collision_probability_relative(
-                self.rel_tracker, predicted_positions)
-            
-            # Adaptive behavior based on collision probability
-            if max_collision_prob > self.config['simulation']['emergency_brake_threshold']:
-                # Emergency brake
-                brake = True
-            elif max_collision_prob > self.config['simulation']['cautious_threshold']:
-                # Increase tracking frequency (decrease delta_k)
-                new_delta_k = self.config['simulation']['cautious_delta_k']
-                if new_delta_k != self.current_delta_k:
-                    self.current_delta_k = new_delta_k
-                    # Drop observations from buffer to match new delta_k
-                    for i in range(self.config['simulation']['l_max'] - new_delta_k):
-                        if self.obstacle_buffer:
-                            self.obstacle_buffer.pop(0)
+        # Calculate collision probabilities with new relative position approach
+        max_collision_prob, collision_time, collision_probabilities = calculate_collision_probability_relative(
+            self.rel_tracker, predicted_positions)
         
+        # Adaptive behavior based on collision probability
+        if max_collision_prob > self.config['simulation']['emergency_brake_threshold']:
+            # Emergency brake
+            brake = True
+        elif max_collision_prob > self.config['simulation']['cautious_threshold']:
+            # Increase tracking frequency (decrease delta_k)
+            new_delta_k = self.config['simulation']['cautious_delta_k']
+            if new_delta_k != self.current_delta_k:
+                self.current_delta_k = new_delta_k
+                # Drop observations from buffer to match new delta_k
+                for i in range(self.config['simulation']['l_max'] - new_delta_k):
+                    if self.obstacle_buffer:
+                        self.obstacle_buffer.pop(0)
+    
         # Apply vehicle controls based on action or default behavior
         self._apply_vehicle_controls(brake, action)
         
@@ -439,11 +432,9 @@ def main():
     try:
         # Run for specified number of steps
         for step in range(base_config['ego_vehicle']['go_straight_ticks'] + base_config['ego_vehicle']['turn_ticks'] + base_config['ego_vehicle']['after_turn_ticks']):
-            # Simple action: go straight with slight variation
-            action = np.array([0.5, 0.1 * np.sin(step / 10)])
             
             # Step the simulation
-            observation, reward, done, info = simulator.step(action)
+            observation, reward, done, info = simulator.step(None)
             
             print(f"Step {step}: reward={reward}, done={done}")
             print(f"  - Collision probability: {info.get('collision_probability', 0):.4f}")
