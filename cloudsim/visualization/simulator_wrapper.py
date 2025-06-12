@@ -170,6 +170,7 @@ class VisualizationCoSimulator:
         self.step_count += 1
         fps = 1.0 / step_duration if step_duration > 0 else 0
         
+        # Only update internal metrics, don't send them
         self.latest_metrics = {
             'step_count': self.step_count,
             'step_duration': step_duration,
@@ -184,8 +185,8 @@ class VisualizationCoSimulator:
                 if 'latency' in key:
                     self.latest_metrics[key] = value
         
-        # Send metrics to visualization server
-        self.viz_client.send_metrics(self.latest_metrics)
+        # Don't send metrics here - they will be sent by the simulation code
+        # self.viz_client.send_metrics(self.latest_metrics)
         
         # If rendering is enabled, render and send the frame
         if self.render_enabled:

@@ -78,6 +78,57 @@ while not done:
 co_sim.close()
 ```
 
+## Visualization Features
+
+The visualization system provides real-time monitoring of the simulation through a web interface. Key features include:
+
+### Real-time Metrics Display
+- Collision probability monitoring
+- Current simulation step
+- Vehicle positions (ego and obstacle)
+- Metrics update in real-time as the simulation runs
+
+### Frame Visualization
+- Real-time display of simulation frames
+- Support for multiple simultaneous simulations
+- Frame rate monitoring
+- Automatic frame format conversion and optimization
+
+### Control Panel
+- Network parameter adjustment
+  - Latency control
+  - Packet loss simulation
+  - Bandwidth limitation
+- Simulation controls
+  - Enable/disable rendering
+  - Reset simulation
+  - Emergency braking based on collision probability
+
+### Multi-simulation Support
+- View multiple simulations simultaneously
+- Switch between different simulations
+- Independent metrics tracking for each simulation
+
+### Emergency Braking System
+- Real-time collision probability calculation
+- Automatic emergency braking when collision probability exceeds threshold (1.1)
+- Visual feedback of collision risk in metrics display
+
+### Usage
+1. Start the visualization server:
+```bash
+python -m cloudsim.visualization.visualization_server
+```
+
+2. Run a simulation with visualization:
+```bash
+python examples/carla_visualization_example.py
+```
+
+3. Access the visualization interface at `http://localhost:5000`
+
+The visualization interface will automatically connect to running simulations and display their metrics and frames in real-time.
+
 ## Development
 
 ### Running Tests

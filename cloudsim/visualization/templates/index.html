@@ -42,13 +42,6 @@
             text-align: center;
             padding: 100px 0;
         }
-        .loading-spinner {
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            color: #ffffff;
-        }
         .simulation-badge {
             font-size: 0.8rem;
             margin-left: 10px;
@@ -86,11 +79,6 @@
                         <p>Select a simulation or wait for frames to be sent</p>
                     </div>
                     <img id="frame-display" style="display: none;">
-                    <div id="loading-spinner" class="loading-spinner" style="display: none;">
-                        <div class="spinner-border text-light" role="status">
-                            <span class="visually-hidden">Loading...</span>
-                        </div>
-                    </div>
                 </div>
                 
                 <!-- Control panel -->
@@ -174,7 +162,6 @@
         // DOM elements
         const frameDisplay = document.getElementById('frame-display');
         const noFrameMessage = document.getElementById('no-frame-message');
-        const loadingSpinner = document.getElementById('loading-spinner');
         const simulationsList = document.getElementById('simulations-list');
         const noSimulationsMessage = document.getElementById('no-simulations');
         const metricsTable = document.getElementById('metrics-table');
@@ -265,7 +252,21 @@
                 // Only process if this is for the selected simulation
                 if (selectedSimulation && data.simulation_id === selectedSimulation) {
                     // Update the metrics display
-                    updateMetricsTable(data.metrics);
+                    noMetricsMessage.style.display = 'none';
+                    metricsTable.style.display = 'table';
+                    
+                    // Clear existing metrics
+                    metricsBody.innerHTML = '';
+                    
+                    // Add new metrics
+                    for (const [key, value] of Object.entries(data.metrics)) {
+                        const row = document.createElement('tr');
+                        row.innerHTML = `
+                            <td>${key}</td>
+                            <td>${value}</td>
+                        `;
+                        metricsBody.appendChild(row);
+                    }
                 }
             });
             
@@ -318,7 +319,6 @@
             updateSimulationsList();
             
             // Show loading spinner
-            loadingSpinner.style.display = 'block';
             noFrameMessage.style.display = 'none';
             frameDisplay.style.display = 'none';
             
