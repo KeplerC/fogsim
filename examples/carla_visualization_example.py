@@ -24,6 +24,11 @@ import numpy as np
 import threading
 import argparse
 
+# Set up logging
+logging.basicConfig(level=logging.INFO, 
+                   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -35,10 +40,13 @@ from cloudsim.environment.carla_co_simulator import CarlaCoSimulator
 # Import a simple network simulator for demonstration
 from simple_network_simulator import SimpleNetworkSimulator
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, 
-                   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# Import carla
+try:
+    import carla
+    logger.info("Carla module imported successfully")
+except ImportError:
+    logger.error("Failed to import Carla. Is it installed? Exiting.")
+    sys.exit(1)
 
 def run_example(args):
     """Run the visualization example with Carla."""
@@ -49,14 +57,6 @@ def run_example(args):
     
     # Wait for server to start
     time.sleep(1)
-    
-    try:
-        # Conditional import for Carla to handle environments without it installed
-        import carla
-        logger.info("Carla module imported successfully")
-    except ImportError:
-        logger.error("Failed to import Carla. Is it installed? Exiting.")
-        return
     
     # Connect to the Carla server
     logger.info(f"Connecting to Carla server at {args.carla_host}:{args.carla_port}")
@@ -108,10 +108,17 @@ def run_example(args):
             # Step the environment
             observation = viz_sim.step(action)
             
-            logger.info(f"Step {step}/{args.steps}")
+            # Log progress every 10 steps
+            if step % 10 == 0:
+                logger.info(f"Step {step}/{args.steps}")
             
             # Slow down the simulation for better visualization
             time.sleep(args.delay)
+            
+            # Check if we should stop
+            if observation is None:
+                logger.warning("Received None observation, stopping simulation")
+                break
     
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt detected, stopping simulation")
@@ -182,7 +189,18 @@ class SimpleCarlaEnv:
         # Spawn a vehicle
         vehicle_bp = self.world.get_blueprint_library().filter('vehicle.tesla.model3')[0]
         spawn_points = self.world.get_map().get_spawn_points()
-        self.vehicle = self.world.spawn_actor(vehicle_bp, spawn_points[0])
+        
+        # Try multiple spawn points until successful
+        for spawn_point in spawn_points:
+            try:
+                self.vehicle = self.world.spawn_actor(vehicle_bp, spawn_point)
+                if self.vehicle is not None:
+                    break
+            except RuntimeError:
+                continue
+        
+        if self.vehicle is None:
+            raise RuntimeError("Failed to spawn vehicle at any spawn point")
         
         # Spawn the camera
         camera_transform = carla.Transform(carla.Location(x=1.5, z=2.4))
@@ -213,8 +231,12 @@ class SimpleCarlaEnv:
         Returns:
             observation: Current observation
         """
-        # Unpack the action
-        throttle, steer, brake = action
+        # Handle None action by using default values
+        if action is None:
+            throttle, steer, brake = 0.0, 0.0, 0.0
+        else:
+            # Unpack the action
+            throttle, steer, brake = action
         
         # Apply the control
         control = carla.VehicleControl(
@@ -250,7 +272,23 @@ class SimpleCarlaEnv:
     
     def render(self, mode='rgb_array'):
         """Render the current observation."""
-        return self._get_observation()
+        # Get the current camera image
+        frame = self._get_observation()
+        
+        # Ensure the frame is in the correct format (uint8 RGB)
+        if frame is not None:
+            # Make sure the frame is uint8
+            if frame.dtype != np.uint8:
+                frame = (frame * 255).astype(np.uint8)
+            
+            # Ensure the frame is RGB (3 channels)
+            if len(frame.shape) == 2:  # If grayscale
+                frame = np.stack([frame] * 3, axis=-1)
+            elif frame.shape[2] == 4:  # If RGBA
+                frame = frame[:, :, :3]  # Drop alpha channel
+            
+            return frame
+        return None
     
     def close(self):
         """Clean up resources."""
