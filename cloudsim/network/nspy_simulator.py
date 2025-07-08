@@ -11,10 +11,45 @@ from ns.packet.packet import Packet
 # Set up logging
 logger = logging.getLogger(__name__)
 
+class PacketTracker:
+    """Manages packet tracking and message delivery."""
+    
+    def __init__(self):
+        self.pending_packets: Dict[str, Tuple[Any, float, int]] = {}  # msg_id -> (message, sent_time, flow_id)
+        self.ready_messages: Dict[str, Any] = {}  # msg_id -> message
+        self.last_checked_arrivals: Dict[int, int] = {}  # flow_id -> last checked arrival index
+    
+    def add_pending_packet(self, msg_id: str, message: Any, sent_time: float, flow_id: int) -> None:
+        """Add a packet to pending tracking."""
+        self.pending_packets[msg_id] = (message, sent_time, flow_id)
+        if flow_id not in self.last_checked_arrivals:
+            self.last_checked_arrivals[flow_id] = 0
+    
+    def mark_packet_delivered(self, msg_id: str) -> None:
+        """Mark a packet as delivered and ready."""
+        if msg_id in self.pending_packets:
+            message, _, _ = self.pending_packets[msg_id]
+            self.ready_messages[msg_id] = message
+            del self.pending_packets[msg_id]
+    
+    def get_ready_messages(self) -> List[Any]:
+        """Get and clear ready messages."""
+        messages = list(self.ready_messages.values())
+        self.ready_messages.clear()
+        return messages
+    
+    def reset(self) -> None:
+        """Reset all tracking."""
+        self.pending_packets.clear()
+        self.ready_messages.clear()
+        self.last_checked_arrivals.clear()
+
+
 class NSPyNetworkSimulator:
     """Network simulator implementation using ns.py with VirtualClock scheduler."""
     
-    def __init__(self, source_rate: float = 4600.0, weights: List[int] = [1, 1], debug: bool = False):
+    def __init__(self, source_rate: float = 4600.0, weights: List[int] = [1, 1], debug: bool = False,
+                 env: Optional[simpy.Environment] = None, packet_tracker: Optional[PacketTracker] = None):
         """
         Initialize the network simulator with ns.py.
         
@@ -22,8 +57,10 @@ class NSPyNetworkSimulator:
             source_rate: Rate in bytes per second (default: 4600.0)
             weights: Weights for different flows (default: [1, 1])
             debug: Enable debug output (default: False)
+            env: Optional SimPy environment for dependency injection
+            packet_tracker: Optional packet tracker for dependency injection
         """
-        self.env = simpy.Environment()
+        self.env = env or simpy.Environment()
         self.source_rate = source_rate
         self.flow_weights = weights
         self.debug = debug
@@ -32,9 +69,7 @@ class NSPyNetworkSimulator:
         self.vc_server.out = self.sink
         
         # Message tracking
-        self.pending_packets: Dict[str, Tuple[Any, float, int]] = {}  # msg_id -> (message, sent_time, flow_id)
-        self.ready_messages: Dict[str, Any] = {}  # msg_id -> message
-        self.last_checked_arrivals: Dict[int, int] = {}  # flow_id -> last checked arrival index
+        self.packet_tracker = packet_tracker or PacketTracker()
         
         logger.info("NSPyNetworkSimulator initialized with rate=%f, weights=%s, debug=%s", 
                     source_rate, weights, debug)
@@ -53,16 +88,11 @@ class NSPyNetworkSimulator:
         """
         msg_id = str(uuid.uuid4())
         
-        # Initialize the flow's arrival tracking if not already done
-        if flow_id not in self.last_checked_arrivals:
-            self.last_checked_arrivals[flow_id] = 0
-            logger.info("Initialized arrival tracking for flow_id=%d", flow_id)
-        
         # Create and send packet through virtual clock server
         packet = Packet(self.env.now, size, flow_id=flow_id, packet_id=msg_id)
         
         # Store original message with the packet ID, sent time, and flow_id
-        self.pending_packets[msg_id] = (message, self.env.now, flow_id)
+        self.packet_tracker.add_pending_packet(msg_id, message, self.env.now, flow_id)
         
         # Send packet to server
         self.vc_server.put(packet)
@@ -94,16 +124,20 @@ class NSPyNetworkSimulator:
             logger.info("No more events to process in simulation")
             pass  # No more events to process
             
-        # Check for new packet arrivals by flow
+        # Check for new packet arrivals
+        self._process_arrivals(time_point)
+    
+    def _process_arrivals(self, time_point: float) -> None:
+        """Process packet arrivals up to the specified time point."""
         delivered_packet_ids = set()
         
-        for flow_id in list(self.last_checked_arrivals.keys()):
+        for flow_id in list(self.packet_tracker.last_checked_arrivals.keys()):
             # Check if this flow has any arrivals to process
             if flow_id in self.sink.arrivals:
                 arrivals = self.sink.arrivals[flow_id]
                 
                 # Get last checked index for this flow
-                last_idx = self.last_checked_arrivals[flow_id]
+                last_idx = self.packet_tracker.last_checked_arrivals[flow_id]
                 
                 # Process any new arrivals since we last checked
                 new_arrivals = 0
@@ -117,26 +151,21 @@ class NSPyNetworkSimulator:
                         # specific packet IDs. Since we don't have access to the actual packet objects,
                         # we'll use a simplified approach: mark the first pending packet for this flow
                         # as delivered.
-                        for packet_id, (message, sent_time, message_flow_id) in self.pending_packets.items():
+                        for packet_id, (message, sent_time, message_flow_id) in self.packet_tracker.pending_packets.items():
                             if message_flow_id == flow_id and packet_id not in delivered_packet_ids:
-                                self.ready_messages[packet_id] = message
+                                self.packet_tracker.mark_packet_delivered(packet_id)
                                 delivered_packet_ids.add(packet_id)
                                 logger.info("Packet ID=%s delivered at time=%f, latency=%f", 
                                             packet_id, arrival_time, arrival_time - sent_time)
                                 break
                 
                 # Update the last checked index for next time
-                self.last_checked_arrivals[flow_id] = len(arrivals)
+                self.packet_tracker.last_checked_arrivals[flow_id] = len(arrivals)
                 logger.info("Flow %d: Processed %d new arrivals, total arrivals=%d", 
                              flow_id, new_arrivals, len(arrivals))
         
-        # Remove delivered packets from pending list
-        for packet_id in delivered_packet_ids:
-            if packet_id in self.pending_packets:
-                del self.pending_packets[packet_id]
-        
         logger.info("Delivered %d packets, %d still pending", 
-                    len(delivered_packet_ids), len(self.pending_packets))
+                    len(delivered_packet_ids), len(self.packet_tracker.pending_packets))
     
     def get_ready_messages(self) -> List[Any]:
         """
@@ -145,10 +174,8 @@ class NSPyNetworkSimulator:
         Returns:
             List of ready messages
         """
-        messages = list(self.ready_messages.values())
-        message_count = len(messages)
-        self.ready_messages.clear()
-        logger.info("Retrieved %d ready messages", message_count)
+        messages = self.packet_tracker.get_ready_messages()
+        logger.info("Retrieved %d ready messages", len(messages))
         return messages
     
     def reset(self) -> None:
@@ -163,9 +190,7 @@ class NSPyNetworkSimulator:
         )
         self.sink = PacketSink(self.env)
         self.vc_server.out = self.sink
-        self.pending_packets.clear()
-        self.ready_messages.clear()
-        self.last_checked_arrivals.clear()
+        self.packet_tracker.reset()
     
     def close(self) -> None:
         """Clean up resources."""

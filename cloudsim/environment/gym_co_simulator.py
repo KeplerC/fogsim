@@ -6,10 +6,88 @@ import pickle
 # Set up logging
 logger = logging.getLogger(__name__)
 
+
+class ObservationTracker:
+    """Manages observation tracking and ID generation."""
+    
+    def __init__(self):
+        self.pending_observations = {}  # Maps observation_id -> observation data
+        self.observation_counter = 0    # To generate unique observation IDs
+        self.last_received_observation_id = None  # Track which observation we're responding to
+    
+    def create_observation_id(self) -> int:
+        """Generate a new unique observation ID."""
+        self.observation_counter += 1
+        return self.observation_counter
+    
+    def add_pending_observation(self, observation_id: int, observation_data: Dict[str, Any]) -> None:
+        """Add a pending observation."""
+        self.pending_observations[observation_id] = observation_data
+    
+    def update_last_received(self, observation_id: int) -> None:
+        """Update the last received observation ID."""
+        self.last_received_observation_id = observation_id
+    
+    def reset(self) -> None:
+        """Reset tracking state."""
+        self.pending_observations.clear()
+        self.observation_counter = 0
+        self.last_received_observation_id = None
+
+
+class NetworkObservationState:
+    """Manages network observation state."""
+    
+    def __init__(self):
+        self.last_network_observation = None  # The most recent observation received through the network
+        self.last_network_reward = 0.0  # The reward associated with the last network observation
+        self.last_network_done = False  # The done flag associated with the last network observation
+        self.last_network_info = {}     # The info associated with the last network observation
+    
+    def update(self, observation: Any, reward: float, done: bool, info: Dict) -> None:
+        """Update the network observation state."""
+        self.last_network_observation = observation
+        self.last_network_reward = reward
+        self.last_network_done = done
+        self.last_network_info = info
+    
+    def reset(self) -> None:
+        """Reset to initial state."""
+        self.last_network_observation = None
+        self.last_network_reward = 0.0
+        self.last_network_done = False
+        self.last_network_info = {}
+
+
+class MessageSizeEstimator:
+    """Estimates message sizes for network transmission."""
+    
+    @staticmethod
+    def estimate(data: Any) -> float:
+        """Estimate the size of data in bytes."""
+        if isinstance(data, np.ndarray):
+            return float(data.nbytes)
+        elif isinstance(data, dict):
+            total_size = 100.0  # Base size
+            for key, value in data.items():
+                if isinstance(value, np.ndarray):
+                    total_size += value.nbytes
+                else:
+                    total_size += 100.0
+            return total_size
+        elif isinstance(data, list):
+            return float(len(data) * 100)  # Rough estimate
+        else:
+            # Default: pickle and measure
+            return float(len(pickle.dumps(data)))
+
 class GymCoSimulator(BaseCoSimulator):
     """Co-simulator implementation for Gym environments."""
     
-    def __init__(self, network_simulator: Any, gym_env: Any, timestep: float):
+    def __init__(self, network_simulator: Any, gym_env: Any, timestep: float,
+                 observation_tracker: Optional[ObservationTracker] = None,
+                 network_state: Optional[NetworkObservationState] = None,
+                 size_estimator: Optional[MessageSizeEstimator] = None):
         """
         Initialize the Gym co-simulator.
         
@@ -17,6 +95,9 @@ class GymCoSimulator(BaseCoSimulator):
             network_simulator: Instance of network simulator (e.g., NSPyNetworkSimulator)
             gym_env: Gym environment instance
             timestep: Unified simulation timestep in seconds
+            observation_tracker: Optional observation tracker for dependency injection
+            network_state: Optional network state manager for dependency injection
+            size_estimator: Optional message size estimator for dependency injection
         """
         super().__init__(
             network_simulator=network_simulator, 
@@ -26,16 +107,11 @@ class GymCoSimulator(BaseCoSimulator):
         self.current_observation = None
         self.last_action = None
         self.received_action_this_step = False
-        # Track observation IDs and action responses
-        self.pending_observations = {}  # Maps observation_id -> observation data
-        self.observation_counter = 0    # To generate unique observation IDs
-        self.last_received_observation_id = None  # Track which observation we're responding to
         
-        # For tracking delayed network observations
-        self.last_network_observation = None  # The most recent observation received through the network
-        self.last_network_reward = 0.0  # The reward associated with the last network observation
-        self.last_network_done = False  # The done flag associated with the last network observation
-        self.last_network_info = {}     # The info associated with the last network observation
+        # Use injected dependencies or create defaults
+        self.observation_tracker = observation_tracker or ObservationTracker()
+        self.network_state = network_state or NetworkObservationState()
+        self.size_estimator = size_estimator or MessageSizeEstimator()
         
         logger.info("GymCoSimulator initialized with gym environment %s", type(gym_env).__name__)
         
@@ -78,7 +154,7 @@ class GymCoSimulator(BaseCoSimulator):
                 # Process observation message (client side received observation)
                 if 'observation' in message and 'observation_id' in message:
                     observation_id = message['observation_id']
-                    self.last_received_observation_id = observation_id
+                    self.observation_tracker.update_last_received(observation_id)
                     
                     # Store this observation as our latest received through network
                     network_observation = message.get('observation')
@@ -103,8 +179,8 @@ class GymCoSimulator(BaseCoSimulator):
                         action_latencies.append(latency)
                         
                         # Only count round-trip for actions matching the observation they respond to
-                        if response_to_observation in self.pending_observations:
-                            obs_timestamp = self.pending_observations[response_to_observation].get('timestamp')
+                        if response_to_observation in self.observation_tracker.pending_observations:
+                            obs_timestamp = self.observation_tracker.pending_observations[response_to_observation].get('timestamp')
                             if obs_timestamp:
                                 round_trip_latency = current_time - obs_timestamp
                                 logger.info(f"Round-trip latency for observation {response_to_observation}: {round_trip_latency}")
@@ -119,27 +195,24 @@ class GymCoSimulator(BaseCoSimulator):
         
         # If we received a new observation through the network, update our stored values
         if received_observation_this_step and network_observation is not None:
-            self.last_network_observation = network_observation
-            self.last_network_reward = network_reward
-            self.last_network_done = network_done
-            self.last_network_info = network_info
+            self.network_state.update(network_observation, network_reward, network_done, network_info)
                    
         # If client provided an action AND we have received an observation to respond to,
         # send that action through the network with observation context
-        if action is not None and self.last_received_observation_id is not None:
+        if action is not None and self.observation_tracker.last_received_observation_id is not None:
             # Simulate sending action from client to server
             client_send_time = self.get_current_time()
-            action_size = self._estimate_message_size(action)
+            action_size = self.size_estimator.estimate(action)
             action_msg_id = self._send_message(
                 {
                     'action': action, 
                     'timestamp': client_send_time,
-                    'responding_to_observation': self.last_received_observation_id
+                    'responding_to_observation': self.observation_tracker.last_received_observation_id
                 },
                 flow_id=self.CLIENT_TO_SERVER_FLOW,
                 size=action_size
             )
-            logger.info(f"Sent action in response to observation {self.last_received_observation_id}")
+            logger.info(f"Sent action in response to observation {self.observation_tracker.last_received_observation_id}")
 
         # Use the last action received from the network, or keep using the previous one
         if not self.received_action_this_step and self.last_action is None:
@@ -182,24 +255,23 @@ class GymCoSimulator(BaseCoSimulator):
         # Send observation through network simulator (server to client)
         if observation is not None:
             # Generate a unique observation ID
-            self.observation_counter += 1
-            observation_id = self.observation_counter
+            observation_id = self.observation_tracker.create_observation_id()
             
             # Record send time
             server_send_time = self.get_current_time()
             
             # Store this observation in our pending observations map
-            self.pending_observations[observation_id] = {
+            self.observation_tracker.add_pending_observation(observation_id, {
                 'observation': observation,
                 'timestamp': server_send_time,
                 'responded_to': False,
                 'reward': reward,
                 'done': done,
                 'info': info
-            }
+            })
             
             # Send observation through network with its ID and additional data
-            observation_size = self._estimate_message_size(observation)
+            observation_size = self.size_estimator.estimate(observation)
             obs_msg_id = self._send_message(
                 {
                     'observation': observation, 
@@ -215,7 +287,7 @@ class GymCoSimulator(BaseCoSimulator):
             logger.info(f"Sent observation with ID {observation_id}")
         
         # Use network-received info or initialize if none exists
-        network_info_to_return = self.last_network_info if self.last_network_info is not None else {}
+        network_info_to_return = self.network_state.last_network_info.copy() if self.network_state.last_network_info else {}
         if not isinstance(network_info_to_return, dict):
             network_info_to_return = {}
         
@@ -235,9 +307,9 @@ class GymCoSimulator(BaseCoSimulator):
         # Return the observation that came through the network (with delay),
         # NOT the immediate result from the robotics simulator
         return (
-            self.last_network_observation if self.last_network_observation is not None else observation,
-            self.last_network_reward,
-            self.last_network_done,
+            self.network_state.last_network_observation if self.network_state.last_network_observation is not None else observation,
+            self.network_state.last_network_reward,
+            self.network_state.last_network_done,
             network_info_to_return
         )
     
@@ -247,18 +319,13 @@ class GymCoSimulator(BaseCoSimulator):
         observation = self.robotics_simulator.reset()
         self.current_observation = observation
         self.network_simulator.reset()
-        self.current_time = 0.0
+        self._time_manager.reset_time()
         self.last_action = None
         self.received_action_this_step = False
-        # Reset observation tracking
-        self.pending_observations = {}
-        self.observation_counter = 0
-        self.last_received_observation_id = None
-        # Reset network observation tracking
-        self.last_network_observation = None
-        self.last_network_reward = 0.0
-        self.last_network_done = False
-        self.last_network_info = {}
+        
+        # Reset tracking components
+        self.observation_tracker.reset()
+        self.network_state.reset()
         
         # For the first observation after reset, we'll use the immediate observation
         # since there wouldn't be any network-received observation yet
@@ -298,38 +365,17 @@ class GymCoSimulator(BaseCoSimulator):
                 self.received_action_this_step = True
                 logger.info("Received action from network: %s", str(self.last_action))
 
-    def _estimate_message_size(self, observation: np.ndarray) -> float:
+    def _estimate_message_size(self, data: Any) -> float:
         """
         Estimate the size of a message in bytes.
         
         Args:
-            observation: Observation array
+            data: Data to estimate size for
             
         Returns:
             float: Estimated size in bytes
         """
-        size = 0.0
-        if isinstance(observation, np.ndarray):
-            # Numpy arrays have known memory usage
-            size = float(observation.nbytes)
-        elif isinstance(observation, dict):
-            # For dictionaries, estimate based on keys
-            total_size = 100.0  # Base size
-            for key, value in observation.items():
-                if isinstance(value, np.ndarray):
-                    total_size += value.nbytes
-                else:
-                    # Rough estimate for other types
-                    total_size += 100.0
-            size = total_size
-        elif isinstance(observation, list):
-            # For lists, estimate based on number of elements
-            size = float(len(observation))
-        else:
-            # Default size if we can't estimate
-            # pickle it     
-            size = float(len(pickle.dumps(observation)))
-
+        size = self.size_estimator.estimate(data)
         logger.info("Estimated message size: %f bytes", size)
         return size
     
