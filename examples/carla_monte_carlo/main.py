@@ -77,7 +77,7 @@ class CarlaLatencySimulator:
         self.original_settings = self.world.get_settings()
         settings = self.world.get_settings()
         settings.fixed_delta_seconds = self.config['simulation']['delta_seconds']
-        settings.synchronous_mode = True
+        settings.synchronous_mode = False
         settings.no_rendering_mode = False
         self.world.apply_settings(settings)
         
@@ -345,7 +345,7 @@ def main():
     args = parser.parse_args()
 
     network_sim = NSPyNetworkSimulator(
-        source_rate=100000000.0,  # 10 Mbps
+        source_rate=10000000.0,  # 10 Mbps
         weights=[1, 2],       # Weight client->server flows lower than server->client
     )
     # Select configuration based on argument
