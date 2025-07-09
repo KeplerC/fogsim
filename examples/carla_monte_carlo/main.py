@@ -13,8 +13,8 @@ from scipy.stats import norm
 
 from configs import *
 from utils import *
-from cloudsim import GymCoSimulator, CarlaCoSimulator
-from cloudsim.network.nspy_simulator import NSPyNetworkSimulator
+from fogsim import GymCoSimulator, CarlaCoSimulator
+from fogsim.network.nspy_simulator import NSPyNetworkSimulator
 import logging
 logging.basicConfig(
     level=logging.INFO,

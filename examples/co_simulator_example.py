@@ -13,119 +13,117 @@ logging.basicConfig(
     ]
 )
 
-from cloudsim import GymCoSimulator, CarlaCoSimulator
-from cloudsim.network.nspy_simulator import NSPyNetworkSimulator
+from fogsim import Env, GymHandler, NetworkConfig
 
 def run_gym_example():
-    """Example of using the Gym co-simulator with NS.py network simulator."""
+    """Example of using the new FogSim interface with Gym and network simulation."""
     try:
-        import gym
-    except ImportError:
-        print("Gym not installed. Please install with: pip install 'cloudsim[gym]'")
-        return
-    
-    # Create network simulator with virtual clock
-    network_sim = NSPyNetworkSimulator(
-        source_rate=100000.0,  # 10 Mbps
-        weights=[1, 2],       # Weight client->server flows lower than server->client
-        debug=True
-    )
-    
-    # Create Gym environment with rgb_array render mode
-    env = gym.make('CartPole-v1', render_mode="rgb_array")
-    
-    # Create co-simulator
-    co_sim = GymCoSimulator(network_sim, env, timestep=0.01)
-    
-    # Set up video writer and latency data for plotting
-    frames = []
-    round_trip_latencies = []
-    timesteps = []
-    
-    # Run simulation
-    observation = co_sim.reset()
-    print("Initial observation type:", type(observation))
-    print("Initial observation:", observation)
-    
-    # Handle different return types from reset() - could be observation or (observation, info)
-    if isinstance(observation, tuple):
-        observation = observation[0]  # Extract observation from tuple
-    
-    done = False
-    step_count = 0
-    
-    while step_count < 200:  # Add back step limit for safety
-        # Perfect policy using a linear combination of all state variables
-        # observation[0]: Cart Position 
-        # observation[1]: Cart Velocity
-        # observation[2]: Pole Angle
-        # observation[3]: Pole Angular Velocity
+        # Create Gym handler
+        handler = GymHandler(env_name="CartPole-v1", render_mode="rgb_array")
         
-        # Optimal weights found through reinforcement learning
-        weights = [-0.04, -0.22, 0.8, 0.52]
+        # Create network configuration with meaningful delay
+        network_config = NetworkConfig(
+            source_rate=10.0,  # 100 kbps 
+            flow_weights=[1, 2],   # Weight client->server flows lower than server->client
+            debug=True  # Reduce verbose logging
+        )
+        # Increase link delay to make network effects more visible
+        network_config.topology.link_delay = 0.05  # 50ms delay
         
-        # Calculate weighted sum of state variables
-        weighted_sum = sum(w * obs for w, obs in zip(weights, observation))
+        # Create FogSim environment with network simulation
+        env = Env(handler, network_config, enable_network=True, timestep=0.01)
         
-        # Take action based on weighted sum
-        action = 1 if weighted_sum > 0 else 0
+        # Set up video writer and latency data for plotting
+        frames = []
+        round_trip_latencies = []
+        timesteps = []
         
-        # Record time before step
-        start_time = co_sim.get_current_time()
+        # Run simulation
+        observation, extra_info = env.reset()
+        print("Initial observation shape:", observation.shape)
+        print("Initial observation:", observation)
+        print("Network enabled:", extra_info.get('network_enabled', False))
         
-        # Step the co-simulator
-        step_result = co_sim.step(action)
+        done = False
+        step_count = 0
         
-        # Handle different return formats (obs, reward, done, info) or (obs, reward, terminated, truncated, info)
-        if len(step_result) == 4:
-            observation, reward, done, info = step_result
-        else:
-            observation, reward, terminated, truncated, info = step_result
-            done = terminated or truncated
-        
-        # Record latency information if available in info
-        if 'round_trip_latency' in info:
-            round_trip_latencies.append(info['round_trip_latency'])
-            timesteps.append(start_time)
-        
-        # Get the rendered frame as RGB array
-        frame = co_sim.render()
-        if frame is not None:
-            frames.append(frame)
+        while step_count < 200:  # Step limit for safety
+            # Perfect policy using a linear combination of all state variables
+            # observation[0]: Cart Position 
+            # observation[1]: Cart Velocity
+            # observation[2]: Pole Angle
+            # observation[3]: Pole Angular Velocity
             
-        step_count += 1
-    
-    print(f"Collected {len(frames)} frames and {len(round_trip_latencies)} latency measurements")
-    print(f"CartPole survived for {step_count} steps")
+            # Optimal weights found through reinforcement learning
+            weights = [-0.04, -0.22, 0.8, 0.52]
+            
+            # Calculate weighted sum of state variables
+            weighted_sum = sum(w * obs for w, obs in zip(weights, observation))
+            
+            # Take action based on weighted sum
+            action = 1 if weighted_sum > 0 else 0
+            
+            # Step the environment
+            observation, reward, success, termination, timeout, extra_info = env.step(action)
+            done = termination or timeout
+            
+            
+            # Record latency information if available
+            if extra_info.get('network_latencies'):
+                for lat_info in extra_info['network_latencies']:
+                    if lat_info['type'] == 'action':
+                        round_trip_latencies.append(lat_info['latency'])
+            timesteps.append(extra_info.get('time', step_count * 0.01))
+            
+            # Get the rendered frame as RGB array
+            frame = env.render()
+            if frame is not None:
+                frames.append(frame)
+                
+            step_count += 1
+            
+            if done:
+                break
+        
+        print(f"Collected {len(frames)} frames and {len(round_trip_latencies)} latency measurements")
+        print(f"CartPole survived for {step_count} steps")
 
-    co_sim.close()
-    
-    # Save collected frames as video
-    if frames:
-        print(f"Saving {len(frames)} frames to simulation_video_gym.mp4")
-        height, width, layers = frames[0].shape
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        video = cv2.VideoWriter('simulation_video_gym.mp4', fourcc, 30.0, (width, height))
+        env.close()
         
-        for frame in frames:
-            # Convert RGB to BGR (OpenCV uses BGR)
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            video.write(frame_bgr)
+        # Save collected frames as video
+        if frames:
+            print(f"Saving {len(frames)} frames to simulation_video_gym.mp4")
+            height, width, layers = frames[0].shape
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            video = cv2.VideoWriter('simulation_video_gym.mp4', fourcc, 30.0, (width, height))
+            
+            for frame in frames:
+                # Convert RGB to BGR (OpenCV uses BGR)
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                video.write(frame_bgr)
+            
+            video.release()
+            print(f"Video saved successfully with {len(frames)} frames")
         
-        video.release()
-        print(f"Video saved successfully with {len(frames)} frames")
-    
-    # Plot latency data if available
-    if timesteps:
-        plt.figure(figsize=(10, 6))
-        plt.plot(timesteps, round_trip_latencies, 'r-', linewidth=2.0, label='Round-trip Latency')
-        plt.title("Round-trip Environment-Action Latency")
-        plt.xlabel("Simulation Time (s)")
-        plt.ylabel("Latency (s)")
-        plt.legend()
-        plt.grid(True)
-        plt.savefig("round_trip_latency.png")
-        plt.show()
+        # Plot latency data if available
+        if round_trip_latencies:
+            plt.figure(figsize=(10, 6))
+            # Create time series for latency data
+            latency_times = list(range(len(round_trip_latencies)))
+            plt.plot(latency_times, [lat * 1000 for lat in round_trip_latencies], 'r-', linewidth=2.0, label='Network Latency')
+            plt.title("Network Latency Over Time")
+            plt.xlabel("Measurement Index")
+            plt.ylabel("Latency (ms)")
+            plt.legend()
+            plt.grid(True)
+            plt.savefig("network_latency.png")
+            plt.show()
+            print(f"Latency plot saved as network_latency.png")
+            
+    except Exception as e:
+        print(f"Error running Gym example: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     print("Running Gym example with NS.py network simulator...")

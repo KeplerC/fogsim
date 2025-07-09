@@ -3,7 +3,7 @@ from unittest.mock import Mock, MagicMock, patch
 import simpy
 from typing import Dict, List
 
-from cloudsim.network.nspy_simulator import NSPyNetworkSimulator, PacketTracker
+from fogsim.network.nspy_simulator import NSPyNetworkSimulator, PacketTracker
 
 
 class TestPacketTracker(unittest.TestCase):
@@ -144,8 +144,8 @@ class TestNSPyNetworkSimulator(unittest.TestCase):
             debug=True
         )
     
-    @patch('cloudsim.network.nspy_simulator.VirtualClockServer', MockVirtualClockServer)
-    @patch('cloudsim.network.nspy_simulator.PacketSink', MockPacketSink)
+    @patch('fogsim.network.nspy_simulator.VirtualClockServer', MockVirtualClockServer)
+    @patch('fogsim.network.nspy_simulator.PacketSink', MockPacketSink)
     def test_initialization(self):
         """Test NSPyNetworkSimulator initialization."""
         sim = NSPyNetworkSimulator(
@@ -176,9 +176,9 @@ class TestNSPyNetworkSimulator(unittest.TestCase):
         self.assertEqual(sim.env, custom_env)
         self.assertEqual(sim.packet_tracker, custom_tracker)
     
-    @patch('cloudsim.network.nspy_simulator.uuid.uuid4')
-    @patch('cloudsim.network.nspy_simulator.VirtualClockServer', MockVirtualClockServer)
-    @patch('cloudsim.network.nspy_simulator.PacketSink', MockPacketSink)
+    @patch('fogsim.network.nspy_simulator.uuid.uuid4')
+    @patch('fogsim.network.nspy_simulator.VirtualClockServer', MockVirtualClockServer)
+    @patch('fogsim.network.nspy_simulator.PacketSink', MockPacketSink)
     def test_register_packet(self, mock_uuid):
         """Test packet registration."""
         mock_uuid.return_value = "test-uuid-123"
@@ -220,8 +220,8 @@ class TestNSPyNetworkSimulator(unittest.TestCase):
         # Should advance to future time
         self.assertEqual(self.simulator.env.now, future_time)
     
-    @patch('cloudsim.network.nspy_simulator.VirtualClockServer', MockVirtualClockServer)
-    @patch('cloudsim.network.nspy_simulator.PacketSink', MockPacketSink)
+    @patch('fogsim.network.nspy_simulator.VirtualClockServer', MockVirtualClockServer)
+    @patch('fogsim.network.nspy_simulator.PacketSink', MockPacketSink)
     def test_process_arrivals(self):
         """Test processing packet arrivals."""
         sim = NSPyNetworkSimulator()
@@ -263,8 +263,8 @@ class TestNSPyNetworkSimulator(unittest.TestCase):
         # Verify messages are cleared
         self.assertEqual(len(self.simulator.get_ready_messages()), 0)
     
-    @patch('cloudsim.network.nspy_simulator.VirtualClockServer', MockVirtualClockServer)
-    @patch('cloudsim.network.nspy_simulator.PacketSink', MockPacketSink)
+    @patch('fogsim.network.nspy_simulator.VirtualClockServer', MockVirtualClockServer)
+    @patch('fogsim.network.nspy_simulator.PacketSink', MockPacketSink)
     def test_reset(self):
         """Test resetting the simulator."""
         # Add some state
@@ -285,7 +285,7 @@ class TestNSPyNetworkSimulator(unittest.TestCase):
         # Should not raise any exceptions
         self.simulator.close()
     
-    @patch('cloudsim.network.nspy_simulator.logger')
+    @patch('fogsim.network.nspy_simulator.logger')
     def test_logging(self, mock_logger):
         """Test that appropriate logging occurs."""
         sim = NSPyNetworkSimulator()
@@ -300,8 +300,8 @@ class TestNSPyNetworkSimulator(unittest.TestCase):
 class TestIntegration(unittest.TestCase):
     """Integration tests for the network simulator."""
     
-    @patch('cloudsim.network.nspy_simulator.VirtualClockServer', MockVirtualClockServer)
-    @patch('cloudsim.network.nspy_simulator.PacketSink', MockPacketSink)
+    @patch('fogsim.network.nspy_simulator.VirtualClockServer', MockVirtualClockServer)
+    @patch('fogsim.network.nspy_simulator.PacketSink', MockPacketSink)
     def test_full_message_flow(self):
         """Test complete message flow through the simulator."""
         sim = NSPyNetworkSimulator(source_rate=10000.0, weights=[1, 1])

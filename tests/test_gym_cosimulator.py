@@ -3,7 +3,7 @@ from unittest.mock import Mock, MagicMock, patch
 import numpy as np
 from typing import Dict, Any, Tuple
 
-from cloudsim.environment.gym_co_simulator import (
+from fogsim.environment.gym_co_simulator import (
     GymCoSimulator, 
     ObservationTracker, 
     NetworkObservationState,

@@ -1,116 +1,222 @@
-CLOUDSIM CODEBASE STRUCTURE ANALYSIS
-====================================
+FOGSIM CODEBASE STRUCTURE AND REFACTORING PLAN
+==============================================
 
 PROJECT OVERVIEW
 ================
 FogSim is a co-simulation framework that enables integration between robotics simulation environments 
-(Gym, CARLA) and network simulation to study the effects of network latency and bandwidth constraints 
-on robotic systems. The framework combines two main components:
+(Gym, CARLA, Mujoco, etc.) and network simulation to study the effects of network latency and bandwidth constraints 
+on robotic systems. 
 
-1. FogSim Co-Simulator Framework (./fogsim/)
-2. NS.py Network Simulation Library (./ns.py/)
+The interface to users aligns with standard Mujoco/Roboverse interfaces:
+```python
+class Env:
+    def __init__(self, handler, network_config=None):
+        self.handler = handler
+        self.network_config = network_config or NetworkConfig()
+        self.network_sim = self._setup_network()
+        handler.launch()
+    
+    def reset(self):
+        handler.set_states()
+        states = handler.get_states()
+        return get_observation(states), handler.get_extra()
+    
+    def step(self, action):
+        handler.set_states(action=action)
+        handler.step()
+        states = handler.get_states()
+        return (get_observation(states), 
+                get_reward(states), 
+                get_success(states),
+                get_termination(states), 
+                get_time_out(states), 
+                handler.get_extra())
+    
+    def render(self):
+        return handler.render()
+    
+    def close(self):
+        handler.close()
+```
 
-ROOT DIRECTORY STRUCTURE
-========================
+TARGET DIRECTORY STRUCTURE
+==========================
 /home/kych/fogsim/
 ├── README.md                     # Main project documentation
-├── pyproject.toml               # Python package configuration
-├── fogsim/                    # Main co-simulation framework
+├── pyproject.toml               # Python package configuration (renamed to fogsim)
+├── fogsim/                      # Main co-simulation framework
+│   ├── __init__.py              # Package initialization
+│   ├── env.py                   # Main Env class (Mujoco/Roboverse style)
+│   ├── base.py                  # BaseCoSimulator abstract class
+│   ├── handlers/                # Handler-based architecture
+│   │   ├── __init__.py
+│   │   ├── base_handler.py     # Abstract handler interface
+│   │   ├── carla_handler.py    # CARLA-specific handler
+│   │   ├── gym_handler.py      # Gym-specific handler  
+│   │   └── mujoco_handler.py   # Mujoco-specific handler
+│   ├── environment/             # Environment-specific simulators
+│   │   ├── __init__.py
+│   │   ├── carla_co_simulator.py
+│   │   └── gym_co_simulator.py
+│   ├── network/                 # Network simulation adapters
+│   │   ├── __init__.py
+│   │   ├── nspy_simulator.py   # Enhanced NS.py adapter
+│   │   └── config.py           # Network configuration classes
 ├── ns.py/                       # Network simulation library (submodule)
 ├── examples/                    # Usage examples and demonstrations
-├── tests/                       # Test suite
+├── tests/                       # Comprehensive test suite
+│   ├── unit/                    # Unit tests
+│   │   ├── test_env.py
+│   │   ├── test_handlers/
+│   │   ├── test_network/
+│   │   └── test_base_cosimulator.py
+│   ├── integration/             # Integration tests
+│   └── fixtures/               # Test fixtures and mocks
 
-MAIN COMPONENTS BREAKDOWN
-=========================
-
-1. CLOUDSIM FRAMEWORK (./fogsim/)
-   ├── __init__.py               # Package initialization
-   ├── base.py                   # BaseCoSimulator abstract class
-   ├── environment/              # Environment-specific simulators
-   │   ├── carla_co_simulator.py # CARLA integration
-   │   └── gym_co_simulator.py   # OpenAI Gym integration
-   ├── network/                  # Network simulation adapters
-   │   └── nspy_simulator.py     # NS.py network simulator adapter
-
-2. NS.PY NETWORK SIMULATOR (./ns.py/)
-   ├── README.md                # Network simulator documentation
-   ├── setup.py                 # Package setup configuration
-   ├── requirements.txt         # Dependencies
-   ├── ns/                      # Core network simulation modules
-   │   ├── packet/              # Packet handling and generators
-   │   ├── flow/                # Flow control and congestion algorithms
-   │   ├── scheduler/           # Packet scheduling algorithms
-   │   ├── port/                # Network port implementations
-   │   ├── switch/              # Switch implementations
-   │   ├── shaper/              # Traffic shaping components
-   │   ├── demux/               # Demultiplexing components
-   │   ├── topos/               # Network topologies
-   │   └── utils/               # Utility functions
-   ├── examples/                # Network simulation examples
-   └── docs/                    # Documentation and references
-
-3. EXAMPLES AND DEMONSTRATIONS (./examples/)
-   ├── co_simulator_example.py          # Main co-simulation example
-   ├── simple_network_simulator.py      # Basic network simulation
-   ├── simple_network_test.py           # Network simulation test
-   └── carla_monte_carlo/               # Advanced CARLA simulation
-       ├── main.py                      # Monte Carlo simulation
-       ├── configs.py                   # Configuration parameters
-       ├── utils.py                     # Utility functions
-       └── results/                     # Simulation results
-
-ARCHITECTURE PATTERNS
+REFACTORING COMPONENTS
 =====================
 
-1. ABSTRACT BASE CLASS PATTERN
-   - BaseCoSimulator defines the interface for all co-simulators
-   - Concrete implementations: GymCoSimulator, CarlaCoSimulator
-   - Unified timestep management across all simulation components
+1. FOGSIM FRAMEWORK (./fogsim/)
+   ├── __init__.py               # Package initialization
+   ├── env.py                    # Main environment interface
+   ├── base.py                   # BaseCoSimulator abstract class
+   ├── handlers/                 # Handler-based architecture
+   │   ├── base_handler.py       # Abstract handler with required methods:
+   │   │                         # - launch(), set_states(), get_states()
+   │   │                         # - step(), render(), close(), get_extra()
+   │   ├── carla_handler.py      # CARLA handler implementation
+   │   ├── gym_handler.py        # Gym handler implementation
+   │   └── mujoco_handler.py     # Mujoco handler implementation
+   ├── environment/              # Legacy co-simulators (for compatibility)
+   │   ├── carla_co_simulator.py # Will be refactored to use CarlaHandler
+   │   └── gym_co_simulator.py   # Will be refactored to use GymHandler
+   ├── network/                  # Network simulation configuration
+   │   ├── nspy_simulator.py     # Enhanced with NetworkConfig support
+   │   └── config.py             # NetworkConfig dataclass exposing:
+   │                             # - topology, congestion_control, scheduler
+   │                             # - source_rate, flow_weights, packet_loss
+   │                             # - traffic shaping parameters
 
-2. ADAPTER PATTERN
-   - NSPyNetworkSimulator adapts ns.py library for co-simulation
-   - Environment-specific adapters for Gym and CARLA
+2. NS.PY NETWORK SIMULATOR (./ns.py/)
+   [Existing ns.py structure - used as submodule for network simulation]
 
-3. OBSERVER PATTERN
-   - Message passing system between network and robotics simulators
-   - Event-driven network simulation using SimPy discrete-event framework
+3. EXAMPLES (./examples/)
+   ├── basic_gym_example.py              # Basic Gym integration
+   ├── carla_network_example.py          # CARLA with network effects
+   ├── mujoco_example.py                 # Mujoco integration example
+   ├── network_config_example.py         # Network configuration showcase
+   └── carla_monte_carlo/                # Advanced CARLA simulation
 
-KEY TECHNICAL COMPONENTS
-========================
+4. TEST SUITE (./tests/)
+   ├── unit/
+   │   ├── test_env.py                   # Test main Env interface
+   │   ├── test_handlers/
+   │   │   ├── test_base_handler.py      # Test abstract handler
+   │   │   ├── test_carla_handler.py     # Test CARLA handler
+   │   │   ├── test_gym_handler.py       # Test Gym handler
+   │   │   └── test_mujoco_handler.py    # Test Mujoco handler
+   │   ├── test_network/
+   │   │   ├── test_nspy_simulator.py    # Test network simulator
+   │   │   └── test_network_config.py    # Test configuration
+   │   └── test_base_cosimulator.py      # Test base functionality
+   ├── integration/
+   │   ├── test_gym_integration.py       # End-to-end Gym tests
+   │   ├── test_carla_integration.py     # End-to-end CARLA tests
+   │   └── test_network_integration.py   # Network behavior tests
+   └── fixtures/
+       ├── mock_handlers.py              # Mock implementations
+       └── test_configs.py               # Test configurations
 
-NETWORK SIMULATION FEATURES:
-- Discrete-event simulation using SimPy
-- Advanced queuing disciplines (WFQ, DRR, Virtual Clock)
-- Traffic shaping with token buckets
-- TCP/UDP flow simulation
-- Congestion control algorithms (BBR, CUBIC)
-- Network topology modeling (Fat-tree, real-world topologies)
-- Packet loss and delay modeling
+REFACTORING PLAN
+================
 
-ROBOTICS INTEGRATION:
-- OpenAI Gym environment support
-- CARLA autonomous driving simulator integration
-- Action/observation message passing with network delays
-- Latency-aware control loop simulation
-- Video recording and visualization capabilities
+PHASE 1: CORE RESTRUCTURING
+---------------------------
+1. Rename cloudsim/ to fogsim/
+2. Update all imports from cloudsim to fogsim
+3. Update pyproject.toml project name to "fogsim"
+4. Create handler-based architecture in fogsim/handlers/
 
-SIMULATION FLOW
-===============
+PHASE 2: HANDLER IMPLEMENTATION
+-------------------------------
+1. Create BaseHandler abstract class with required interface
+2. Implement CarlaHandler wrapping CarlaCoSimulator
+3. Implement GymHandler wrapping GymCoSimulator
+4. Implement MujocoHandler for Mujoco environments
 
-1. INITIALIZATION PHASE
-   - Network simulator setup with topology and parameters
-   - Robotics simulator initialization
-   - Co-simulator binding with unified timestep
+PHASE 3: MAIN ENVIRONMENT INTERFACE
+-----------------------------------
+1. Create fogsim/env.py with Mujoco/Roboverse-style Env class
+2. Integrate handler system with network simulation
+3. Implement observation/reward/termination helper functions
 
-2. SIMULATION LOOP
-   - Robotics simulator generates observations
-   - Observations sent through network with realistic delays
-   - Network simulator processes packets according to scheduling policies
-   - Delayed observations delivered to control algorithm
-   - Control actions sent back through network
-   - Actions applied to robotics simulator with network-induced latency
+PHASE 4: NETWORK CONFIGURATION
+------------------------------
+1. Create fogsim/network/config.py with NetworkConfig dataclass
+2. Enhance NSPyNetworkSimulator to accept NetworkConfig
+3. Expose ns.py configuration options:
+   - Topology (simple, fattree, custom, internet_topo_zoo)
+   - Congestion control (cubic, bbr)
+   - Scheduler (virtual_clock, wfq, drr)
+   - Traffic shaping parameters
+   - Flow weights and rates
 
-3. VISUALIZATION AND LOGGING
-   - Real-time frame capture and streaming
-   - Network metrics collection (latency, throughput, packet loss)
-   - Performance data logging and analysis
+PHASE 5: TEST SUITE DEVELOPMENT
+--------------------------------
+1. Create comprehensive unit tests for all components
+2. Implement integration tests for end-to-end scenarios
+3. Create mock handlers and test configurations
+4. Ensure >80% test coverage
+
+PHASE 6: EXAMPLES AND DOCUMENTATION
+-----------------------------------
+1. Update existing examples to use new interface
+2. Create new examples showcasing network configuration
+3. Add Mujoco integration examples
+4. Update README and documentation
+
+TODO LIST
+=========
+☑ Analyze current codebase structure
+☑ Compare actual structure with structure.txt requirements  
+☑ Create detailed refactoring plan
+☑ Present plan to user for approval
+☑ Update refactoring plan based on user feedback
+☑ Update structure.txt with new architecture
+
+UPCOMING TASKS:
+☐ Rename cloudsim to fogsim throughout codebase
+☐ Create handler base class and implementations
+☐ Implement main Env interface
+☐ Create NetworkConfig and enhance network simulator
+☐ Develop comprehensive test suite
+☐ Update examples and documentation
+
+KEY DESIGN PRINCIPLES
+====================
+
+1. HANDLER-BASED ARCHITECTURE
+   - Handlers encapsulate simulator-specific logic
+   - Uniform interface across different simulators
+   - Easy to extend with new simulator types
+
+2. NETWORK CONFIGURATION EXPOSURE
+   - Rich configuration options from ns.py
+   - No explicit latency handling - leverages ns.py's built-in capabilities
+   - Configurable topologies, congestion control, and scheduling
+
+3. MUJOCO/ROBOVERSE COMPATIBILITY
+   - Standard Env interface familiar to robotics researchers
+   - Separate success/termination/timeout flags
+   - Extra metadata through handler.get_extra()
+
+4. COMPREHENSIVE TESTING
+   - Unit tests for individual components
+   - Integration tests for full scenarios
+   - Mock implementations for testing
+   - High test coverage target
+
+5. BACKWARD COMPATIBILITY
+   - Legacy co-simulators remain functional
+   - Migration path for existing code
+   - Deprecation warnings where appropriate

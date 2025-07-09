@@ -4,7 +4,7 @@ import numpy as np
 import logging
 from typing import Any, List
 
-from cloudsim.base import (
+from fogsim.base import (
     BaseCoSimulator, 
     TimeManager, 
     MessageHandler,
@@ -170,7 +170,7 @@ class TestMessageHandler(unittest.TestCase):
         self.assertEqual(packet['flow_id'], flow_id)
         self.assertEqual(packet['size'], size)
     
-    @patch('cloudsim.base.logger')
+    @patch('fogsim.base.logger')
     def test_logging(self, mock_logger):
         """Test that appropriate logging occurs."""
         self.message_handler.process_messages(1.0)

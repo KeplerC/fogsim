@@ -28,12 +28,11 @@ import argparse
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # Import CloudSim modules
-from cloudsim.visualization.visualization_server import VisualizationServer
-from cloudsim.visualization.simulator_wrapper import VisualizationCoSimulator
-from cloudsim.environment.carla_co_simulator import CarlaCoSimulator
+from fogsim.environment.carla_co_simulator import CarlaCoSimulator
+from fogsim.network.nspy_simulator import NSPyNetworkSimulator
 
 # Import a simple network simulator for demonstration
-from simple_network_simulator import SimpleNetworkSimulator
+from examples.simple_network_simulator import SimpleNetworkSimulator
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, 
@@ -42,13 +41,7 @@ logger = logging.getLogger(__name__)
 
 def run_example(args):
     """Run the visualization example with Carla."""
-    # Create and start the visualization server
-    logger.info("Starting visualization server on port %d", args.port)
-    server = VisualizationServer(host=args.host, port=args.port)
-    server_thread = server.run_in_thread()
-    
-    # Wait for server to start
-    time.sleep(1)
+    logger.info("Starting Carla example")
     
     try:
         # Conditional import for Carla to handle environments without it installed
@@ -85,18 +78,9 @@ def run_example(args):
         timestep=args.timestep
     )
     
-    # Wrap with visualization capabilities
-    logger.info("Creating visualization wrapper")
-    viz_sim = VisualizationCoSimulator(
-        co_simulator=co_sim,
-        server_url=f"http://{args.host}:{args.port}",
-        simulation_id=f"carla_{world.get_map().name}",
-        auto_connect=True
-    )
-    
     # Reset the environment
     logger.info("Resetting environment")
-    observation = viz_sim.reset()
+    observation = co_sim.reset()
     
     # Run the simulation loop
     logger.info("Starting simulation loop")
@@ -106,7 +90,7 @@ def run_example(args):
             action = np.array([0.5, np.sin(step * 0.1) * 0.5, 0.0])  # Simple driving pattern
             
             # Step the environment
-            observation = viz_sim.step(action)
+            observation = co_sim.step(action)
             
             logger.info(f"Step {step}/{args.steps}")
             
@@ -119,9 +103,8 @@ def run_example(args):
     finally:
         # Close the environment
         logger.info("Closing environment")
-        viz_sim.close()
+        co_sim.close()
         
-        # Note: The server thread is daemonic and will close automatically when the script exits
         logger.info("Example completed")
 
 class SimpleCarlaEnv:

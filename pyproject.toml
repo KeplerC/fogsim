@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "cosimulator"
+name = "fogsim"
 version = "0.1.0"
-description = "A co-simulation framework for robotics and network simulation"
+description = "FogSim: A co-simulation framework for robotics and network simulation"
 readme = "README.md"
 requires-python = ">=3.7"
 license = {text = "MIT"}
@@ -55,4 +55,4 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/cosimulator" 
+Homepage = "https://github.com/yourusername/fogsim" 
