@@ -1,235 +1,61 @@
+"""
+Configuration for CARLA synchronous vs asynchronous mode comparison
+Crossroad scenario: ego vehicle approaches stationary obstacle at intersection
+"""
 
-unprotected_right_turn_config = {
-    'simulation': {
-        'host': 'localhost',
-        'port': 2000,
-        'fps': 100,
-        'delta_seconds': 0.01,  # 100fps
-        'prediction_steps': 8000,  # 100 frames, need to be divided to delta_k 
-        'l_max': 40,
-        'delta_k': 40,
-        'emergency_brake_threshold': 1.1,
-        'cautious_threshold': 0.0,
-        'cautious_delta_k': 15,
-        'tracker_type': 'ekf'
+# Simple scenario - ego approaches stationary obstacle on straight road
+CROSSROAD_CONFIG = {
+    'host': 'localhost',
+    'port': 2000,
+    'delta_seconds': 0.01,  # 100 FPS
+    'max_steps': 1200,  # 12 seconds at 100 FPS
+    
+    # Ego vehicle configuration - on straight road
+    'ego_spawn_offset': {
+        'x': 4.0,
+        'y': -90.0,
+        'z': 0,
+        'yaw': 0.0  # Facing west
     },
-    'trajectories': {
-        'ego': './ego_trajectory.csv',
-        'obstacle': './obstacle_trajectory.csv'
+    'throttle': 0.5,
+    
+    # Obstacle vehicle configuration - stationary on same road
+    'obstacle_spawn_offset': {
+        'x': 3,
+        'y': -30.0,
+        'z': 0.0,
+        'yaw': 0.0  # Same orientation
     },
-    'video': {
-        'filename': './bev_images/unprotected_right_turn_collision.mp4',
-        'fps': 100,
-        'width': 800,
-        'height': 800,
-    },
-    'ego_vehicle': {
-        'model': 'vehicle.tesla.model3',
-        'spawn_offset': {
-            'x': 4,
-            'y': -90,
-            'yaw': 0
-        },
-        'go_straight_ticks': 500,  # * 10ms = 5s
-        'turn_ticks': 250,  # * 10ms = 2.5s
-        'after_turn_ticks': 200,  # Add this new parameter for post-turn straight driving
-        'throttle': {
-            'straight': 0.4,
-            'turn': 0.4,
-            'after_turn': 0.4  # Add throttle for after turn
-        },
-        'steer': {
-            'turn': 0.3
-        }
-    },
-    'obstacle_vehicle': {
-        'model': 'vehicle.lincoln.mkz_2020',
-        'spawn_offset': {
-            'x': 19,
-            'y': 28,
-            'yaw': 90
-        },
-        'go_straight_ticks': 400,  # * 10ms = 4s
-        'turn_ticks': 200,  # * 10ms = 2s
-        'after_turn_ticks': 350,  # * 10ms = 3.5s
-        'throttle': {
-            'straight': 0.52,
-            'turn': 0.4,
-            'after_turn': 0.5
-        },
-        'steer': {
-            'straight': 0.0,
-            'turn': 0.0,
-            'after_turn': 0.0
-        }
-    },
-    'camera': {
-        'height': 50,
-        'offset': {
-            'x': 10,
-            'y': 35
-        },
+    'obstacle_throttle': 0.0,  # Stationary
+    
+    # Collision detection
+    'collision_threshold': 30.0,  # meters - distance to start braking
+    
+    # Camera settings for viewing scenario (offset from base spawn point)
+    'camera_offset': {
+        'x': 8.0,      # Offset in x direction
+        'y': -70.0,     # Offset in y direction
+        'z': 50.0,      # Height above ground
         'fov': '90'
-    },
-    'save_options': {
-        'save_video': False,
-        'save_images': True,
     }
 }
 
-unprotected_left_turn_config = {
-    'simulation': {
-        'host': 'localhost',
-        'port': 2000,
-        'fps': 100,
-        'delta_seconds': 0.01,  # 100fps
-        'prediction_steps': 8000,  # 100 frames, need to be divided to delta_k 
-        'l_max': 40,
-        'delta_k': 40,
-        'emergency_brake_threshold': 1.1,
-        'cautious_threshold': 0.0,
-        'cautious_delta_k': 20,
-        'tracker_type': 'ekf'
+EXPERIMENT_CONFIGS = {
+    'sync': {
+        **CROSSROAD_CONFIG,
+        'synchronous_mode': True,
     },
-    'trajectories': {
-        'ego': './ego_trajectory.csv',
-        'obstacle': './obstacle_trajectory.csv'
-    },
-    'video': {
-        'filename': './bev_images/unprotected_left_turn_collision.mp4',
-        'fps': 100,
-        'width': 800,
-        'height': 800,
-    },
-    'ego_vehicle': {
-        'model': 'vehicle.tesla.model3',
-        'spawn_offset': {
-            'x': 7.5,
-            'y': -90,
-            'yaw': 0
-        },
-        'go_straight_ticks': 500,  # * 10ms = 5s
-        'turn_ticks': 250,  # * 10ms = 2.5s
-        'after_turn_ticks': 200,  # Add this new parameter for post-turn straight driving
-        'throttle': {
-            'straight': 0.4,
-            'turn': 0.4,
-            'after_turn': 0.4  # Add throttle for after turn
-        },
-        'steer': {
-            'turn': -0.3
-        }
-    },
-    'obstacle_vehicle': {
-        'model': 'vehicle.lincoln.mkz_2020',
-        'spawn_offset': {
-            'x': 3.5,
-            'y': 55,
-            'yaw': 180
-        },
-        'go_straight_ticks': 400,
-        'turn_ticks': 200,
-        'after_turn_ticks': 350,
-        'throttle': {
-            'straight': 0.53,
-            'turn': 0.4,
-            'after_turn': 0.52
-        },
-        'steer': {
-            'straight': 0.0,
-            'turn': 0.0,
-            'after_turn': 0.0
-        }
-    },
-    'camera': {
-        'height': 50,
-        'offset': {
-            'x': 10,
-            'y': 35
-        },
-        'fov': '90'
-    },
-    'save_options': {
-        'save_video': False,
-        'save_images': True,
+    
+    'async': {
+        **CROSSROAD_CONFIG,
+        'synchronous_mode': False,
     }
 }
 
-opposite_direction_merge_config = {
-    'simulation': {
-        'host': 'localhost',
-        'port': 2000,
-        'fps': 100,
-        'delta_seconds': 0.01,  # 100fps
-        'prediction_steps': 8000,  # 100 frames, need to be divided to delta_k 
-        'l_max': 40,
-        'delta_k': 40,
-        'emergency_brake_threshold': 1.1,
-        'cautious_threshold': 0.0,
-        'cautious_delta_k': 20,
-        'tracker_type': 'ekf'
-    },
-    'trajectories': {
-        'ego': './ego_trajectory.csv',
-        'obstacle': './obstacle_trajectory.csv'
-    },
-    'video': {
-        'filename': './bev_images/opposite_direction_merge_collision.mp4',
-        'fps': 100,
-        'width': 800,
-        'height': 800,
-    },
-    'ego_vehicle': {
-        'model': 'vehicle.tesla.model3',
-        'spawn_offset': {
-            'x': 4,
-            'y': -90,
-            'yaw': 0
-        },
-        'go_straight_ticks': 500,  # * 10ms = 5s
-        'turn_ticks': 250,  # * 10ms = 2.5s
-        'after_turn_ticks': 200,  # Add this new parameter for post-turn straight driving
-        'throttle': {
-            'straight': 0.4,
-            'turn': 0.4,
-            'after_turn': 0.4  # Add throttle for after turn
-        },
-        'steer': {
-            'turn': 0.3
-        }
-    },
-    'obstacle_vehicle': {
-        'model': 'vehicle.lincoln.mkz_2020',
-        'spawn_offset': {
-            'x': 8,
-            'y': 35,
-            'yaw': 180
-        },
-        'go_straight_ticks': 100,
-        'turn_ticks': 400,
-        'after_turn_ticks': 350,
-        'throttle': {
-            'straight': 0.52,
-            'turn': 0.45,
-            'after_turn': 0.5
-        },
-        'steer': {
-            'straight': 0.0,
-            'turn': -0.4,
-            'after_turn': 0.0
-        }
-    },
-    'camera': {
-        'height': 50,
-        'offset': {
-            'x': 10,
-            'y': 35
-        },
-        'fov': '90'
-    },
-    'save_options': {
-        'save_video': False,
-        'save_images': True,
-    }
+# Network bandwidth configurations for different experiments
+BANDWIDTH_CONFIGS = {
+    'high': 100.0,    # 100 Mbps - minimal latency
+    'medium': 10.0,   # 10 Mbps - moderate latency
+    'low': 1.0,       # 1 Mbps - high latency
+    'very_low': 0.1   # 0.1 Mbps - very high latency
 }
-

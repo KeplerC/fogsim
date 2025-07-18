@@ -1,445 +1,454 @@
-from abc import ABC
-from abc import abstractmethod
 import argparse
-import math
 import os
 import time
-
-import carla
-import cv2
-from filterpy.kalman import KalmanFilter
-import numpy as np
-from scipy.stats import norm
-
-from configs import *
-from utils import *
-from fogsim import GymCoSimulator, CarlaCoSimulator
-from fogsim.network.nspy_simulator import NSPyNetworkSimulator
 import logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),  # Output to console
-        logging.FileHandler("carla_cosimulator.log")  # Save logs to file
-    ]
-)
+import statistics
+import carla
+import numpy as np
+import cv2
+from configs import EXPERIMENT_CONFIGS
+from utils import CollisionDetector
+from fogsim.network.nspy_simulator import NSPyNetworkSimulator
+from fogsim import CarlaCoSimulator
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class CarlaLatencySimulator:
-    """
-    A gym-like interface for CARLA simulator with latency simulation.
-    Implements the standard gym methods: step(), reset(), render().
-    """
-    
-    def __init__(self, config, output_dir=None):
-        """
-        Initialize the CARLA simulator with latency.
-        
-        Args:
-            config (dict): Configuration dictionary
-            output_dir (str): Directory to store results
-        """
+class CarlaSimulator:
+    def __init__(self, config):
         self.config = config
-        self.output_dir = output_dir
-        
-        # Connection to CARLA
         self.client = None
         self.world = None
         self.original_settings = None
-        
-        # Actors
         self.ego_vehicle = None
         self.obstacle_vehicle = None
-        self.camera = None
         self.collision_sensor = None
-        
-        # Simulation state
         self.has_collided = False
-        self.frame_queue = []
         self.tick = 0
+        self.visualization_enabled = False
+        self.top_camera = None
+        self.video_writer = None
+        self.camera_frames = []
         
-        # Tracking
-        self.obstacle_buffer = []
-        
-        # Connect to CARLA and initialize
-        self._connect_to_carla()
-        
-    def _connect_to_carla(self):
-        """Connect to CARLA and set up the simulation environment."""
-        self.client = carla.Client(self.config['simulation']['host'],
-                              self.config['simulation']['port'])
+    def connect_to_carla(self):
+        self.client = carla.Client(self.config['host'], self.config['port'])
         self.client.set_timeout(10.0)
         self.world = self.client.load_world("Town03")
-
-        # Set synchronous mode
+        
         self.original_settings = self.world.get_settings()
         settings = self.world.get_settings()
-        settings.fixed_delta_seconds = self.config['simulation']['delta_seconds']
-        settings.synchronous_mode = False
+        settings.fixed_delta_seconds = self.config['delta_seconds']
+        settings.synchronous_mode = self.config['synchronous_mode']
         settings.no_rendering_mode = False
         self.world.apply_settings(settings)
         
+    def spawn_actors(self):
+        blueprint_library = self.world.get_blueprint_library()
+        
+        # Get spawn points from the map
+        spawn_points = self.world.get_map().get_spawn_points()
+        if not spawn_points:
+            raise RuntimeError("No spawn points available in the map")
+            
+        # Use first spawn point as base
+        base_spawn_point = spawn_points[0]
+        
+        # Spawn ego vehicle with offset from base spawn point
+        ego_bp = blueprint_library.find('vehicle.tesla.model3')
+        ego_offset = self.config['ego_spawn_offset']
+        ego_transform = carla.Transform(
+            carla.Location(
+                x=base_spawn_point.location.x + ego_offset['x'],
+                y=base_spawn_point.location.y + ego_offset['y'],
+                z=base_spawn_point.location.z + ego_offset.get('z', 0.0)
+            ),
+            carla.Rotation(
+                yaw=base_spawn_point.rotation.yaw + ego_offset.get('yaw', 0.0)
+            )
+        )
+        self.ego_vehicle = self.world.try_spawn_actor(ego_bp, ego_transform)
+        if self.ego_vehicle is None:
+            raise RuntimeError(f"Failed to spawn ego vehicle with offset {ego_offset}")
+        
+        # Spawn obstacle vehicle with offset from base spawn point
+        obstacle_bp = blueprint_library.find('vehicle.lincoln.mkz_2020')
+        obstacle_offset = self.config['obstacle_spawn_offset']
+        obstacle_transform = carla.Transform(
+            carla.Location(
+                x=base_spawn_point.location.x + obstacle_offset['x'],
+                y=base_spawn_point.location.y + obstacle_offset['y'],
+                z=base_spawn_point.location.z + obstacle_offset.get('z', 0.0)
+            ),
+            carla.Rotation(
+                yaw=base_spawn_point.rotation.yaw + obstacle_offset.get('yaw', 0.0)
+            )
+        )
+        self.obstacle_vehicle = self.world.try_spawn_actor(obstacle_bp, obstacle_transform)
+        if self.obstacle_vehicle is None:
+            raise RuntimeError("Failed to spawn obstacle vehicle")
+        
+        # Add collision sensor
+        collision_bp = blueprint_library.find('sensor.other.collision')
+        self.collision_sensor = self.world.spawn_actor(
+            collision_bp, carla.Transform(), attach_to=self.ego_vehicle
+        )
+        self.collision_sensor.listen(lambda event: self._on_collision(event))
+        
+        # Add top-down camera for visualization if enabled
+        if self.visualization_enabled:
+            self._spawn_top_camera()
+        
+    def _on_collision(self, event):
+        self.has_collided = True
+        
     def reset(self):
-        """
-        Reset the simulation to initial state.
-        
-        Returns:
-            observation: Initial observation (usually a camera frame)
-        """
-        # Clean up any existing actors
-        self._clean_up_actors()
-        
-        # Reset simulation state
+        self.cleanup()
         self.has_collided = False
-        self.frame_queue = []
-        self.obstacle_buffer = []
-        
-        # Spawn the vehicles and sensors
-        self._spawn_actors()
-        
-        # Tick the world to get initial observation
+        self.tick = 0
+        self.connect_to_carla()
+        self.spawn_actors()
         self.world.tick()
         
-        # Return the initial observation
-        return self._get_observation()
-    
-    def step(self, action=None):
-        """
-        Take a step in the simulation.
-        
-        Args:
-            action: Boolean indicating whether to apply emergency brake
-        
-        Returns:
-            observation: Current observation
-        """
-        if action is None:
-            brake = False
-        else:
-            brake = action
-            
-        # Generate and apply ego vehicle control based on current tick and brake flag
+    def step(self, brake=False):
         if brake:
-            # Emergency brake
-            ego_control = carla.VehicleControl(throttle=0.0, brake=1.0)
+            control = carla.VehicleControl(throttle=0.0, brake=1.0)
         else:
-            # Normal driving based on config
-            ego_control = carla.VehicleControl()
-            
-            if self.tick < self.config['ego_vehicle']['go_straight_ticks']:
-                ego_control.throttle = self.config['ego_vehicle']['throttle']['straight']
-                ego_control.steer = self.config['ego_vehicle']['steer']['straight'] if 'straight' in self.config['ego_vehicle']['steer'] else 0.0
-            elif self.tick < self.config['ego_vehicle']['go_straight_ticks'] + self.config['ego_vehicle']['turn_ticks']:
-                ego_control.throttle = self.config['ego_vehicle']['throttle']['turn']
-                ego_control.steer = self.config['ego_vehicle']['steer']['turn']
-            else:
-                ego_control.throttle = self.config['ego_vehicle']['throttle']['after_turn']
-                ego_control.steer = self.config['ego_vehicle']['steer']['after_turn'] if 'after_turn' in self.config['ego_vehicle']['steer'] else 0.0
+            control = carla.VehicleControl(throttle=self.config['throttle'], steer=0.0)
         
-        # Apply the calculated control
-        self.ego_vehicle.apply_control(ego_control)
+        self.ego_vehicle.apply_control(control)
         
-        # Tick the world
+        # Keep obstacle vehicle stationary
+        obstacle_control = carla.VehicleControl(throttle=0.0, brake=1.0)
+        self.obstacle_vehicle.apply_control(obstacle_control)
+        
         self.world.tick()
         self.tick += 1
         
-        # Apply obstacle controls
-        self._apply_obstacle_controls()
-        
-        # Get observation
-        observation = self._get_observation()
-
+        observation = self.get_observation()
+        if self.visualization_enabled and observation:
+            self.update_visualization(observation)
         return observation
     
-    def _apply_obstacle_controls(self):
-        obstacle_control = carla.VehicleControl()
-
-        if self.tick < self.config['obstacle_vehicle']['go_straight_ticks']:
-            # Initial straight phase
-            obstacle_control.throttle = self.config['obstacle_vehicle']['throttle']['straight']
-            obstacle_control.steer = self.config['obstacle_vehicle']['steer']['straight']
-        elif self.tick < self.config['obstacle_vehicle']['go_straight_ticks'] + self.config[
-                'obstacle_vehicle']['turn_ticks']:
-            # Turning phase
-            obstacle_control.throttle = self.config['obstacle_vehicle']['throttle']['turn']
-            obstacle_control.steer = self.config['obstacle_vehicle']['steer']['turn']
-        else:
-            # After turn straight phase
-            obstacle_control.throttle = self.config['obstacle_vehicle']['throttle']['after_turn']
-            obstacle_control.steer = self.config['obstacle_vehicle']['steer']['after_turn']
-
-        self.obstacle_vehicle.apply_control(obstacle_control)
-            
-    def render(self, mode='rgb_array'):
-        """
-        Render the current simulation state.
-        
-        Args:
-            mode (str): Rendering mode ('rgb_array')
-            
-        Returns:
-            numpy.ndarray: Camera frame if available, otherwise None
-        """
-        if self.frame_queue:
-            return self.frame_queue[-1]
-        return None
-    
-    def close(self):
-        """Clean up resources and reset CARLA settings."""
-        self._clean_up_actors()
-        
-        if self.world is not None:
-            self.world.apply_settings(self.original_settings)
-            
-    def _spawn_actors(self):
-        """Spawn vehicles and sensors in the simulation."""
-        blueprint_library = self.world.get_blueprint_library()
-
-        # Get spawn points
-        spawn_points = self.world.get_map().get_spawn_points()
-
-        # Setup ego vehicle spawn point
-        ego_spawn_point = spawn_points[0]
-        ego_spawn_point.location.x += self.config['ego_vehicle']['spawn_offset']['x']
-        ego_spawn_point.location.y += self.config['ego_vehicle']['spawn_offset']['y']
-        ego_spawn_point.rotation.yaw += self.config['ego_vehicle']['spawn_offset']['yaw']
-
-        obstacle_spawn_point = spawn_points[1]
-        obstacle_spawn_point.location.x = ego_spawn_point.location.x + self.config[
-            'obstacle_vehicle']['spawn_offset']['x']
-        obstacle_spawn_point.location.y = ego_spawn_point.location.y + self.config[
-            'obstacle_vehicle']['spawn_offset']['y']
-        obstacle_spawn_point.rotation.yaw = ego_spawn_point.rotation.yaw + self.config[
-            'obstacle_vehicle']['spawn_offset']['yaw']
-
-        # Spawn both vehicles
-        ego_bp = blueprint_library.find(self.config['ego_vehicle']['model'])
-        ego_bp.set_attribute('role_name', 'ego')
-        self.ego_vehicle = self.world.try_spawn_actor(ego_bp, ego_spawn_point)
-
-        obstacle_bp = blueprint_library.find(self.config['obstacle_vehicle']['model'])
-        obstacle_bp.set_attribute('role_name', 'obstacle')
-        self.obstacle_vehicle = self.world.try_spawn_actor(obstacle_bp, obstacle_spawn_point)
-
-        # Attach camera
-        camera_bp = blueprint_library.find('sensor.camera.rgb')
-        camera_bp.set_attribute('image_size_x', str(self.config['video']['width']))
-        camera_bp.set_attribute('image_size_y', str(self.config['video']['height']))
-        camera_bp.set_attribute('fov', self.config['camera']['fov'])
-
-        camera_transform = carla.Transform(
-            carla.Location(
-                x=ego_spawn_point.location.x + self.config['camera']['offset']['x'],
-                y=ego_spawn_point.location.y + self.config['camera']['offset']['y'],
-                z=self.config['camera']['height']), carla.Rotation(pitch=-90))
-        self.camera = self.world.spawn_actor(camera_bp, camera_transform, attach_to=None)
-
-        # Setup camera callback
-        def camera_callback(image):
-            image.convert(carla.ColorConverter.Raw)
-            img_array = np.frombuffer(image.raw_data, dtype=np.uint8)
-            img_array = img_array.reshape((image.height, image.width, 4))
-            frame_bgr = img_array[:, :, :3].copy()
-            self.frame_queue.append(frame_bgr)
-
-        self.camera.listen(camera_callback)
-
-        # Add collision sensor
-        collision_bp = blueprint_library.find('sensor.other.collision')
-        self.collision_sensor = self.world.spawn_actor(collision_bp,
-                                             carla.Transform(),
-                                             attach_to=self.ego_vehicle)
-
-        def collision_callback(event):
-            self.has_collided = True
-
-        self.collision_sensor.listen(collision_callback)
-        
-    def _clean_up_actors(self):
-        """Clean up all actors in the simulation."""
-        if self.collision_sensor is not None:
-            self.collision_sensor.stop()
-            self.collision_sensor.destroy()
-            self.collision_sensor = None
-
-        if self.camera is not None:
-            self.camera.stop()
-            self.camera.destroy()
-            self.camera = None
-
-        if self.ego_vehicle is not None:
-            self.ego_vehicle.destroy()
-            self.ego_vehicle = None
-            
-        if self.obstacle_vehicle is not None:
-            self.obstacle_vehicle.destroy()
-            self.obstacle_vehicle = None
-    
-    def _get_observation(self):
-        """Get the current observation from the simulation."""
-        # Make sure vehicles are initialized
+    def get_observation(self):
         if self.ego_vehicle is None or self.obstacle_vehicle is None:
             return None
-        
-        # Convert transform to numpy array with position and rotation
+            
         ego_transform = self.ego_vehicle.get_transform()
         obstacle_transform = self.obstacle_vehicle.get_transform()
         
-        # Get position data
-        ego_pos = np.array([
-            ego_transform.location.x,
-            ego_transform.location.y,
-            ego_transform.location.z
-        ])
+        return {
+            'ego_pos': [ego_transform.location.x, ego_transform.location.y],
+            'obstacle_pos': [obstacle_transform.location.x, obstacle_transform.location.y],
+            'tick': self.tick,
+            'has_collided': self.has_collided
+        }
+    
+    def enable_visualization(self):
+        self.visualization_enabled = True
+        self.camera_frames = []
         
-        obstacle_pos = np.array([
-            obstacle_transform.location.x,
-            obstacle_transform.location.y,
-            obstacle_transform.location.z
-        ])
+        # Create output directory for video
+        os.makedirs('video_output', exist_ok=True)
         
-        # Get rotation data (yaw, pitch, roll in degrees)
-        ego_rot = np.array([
-            ego_transform.rotation.yaw,
-            ego_transform.rotation.pitch,
-            ego_transform.rotation.roll
-        ])
+        # Initialize video writer (will be set up when first frame is received)
+        self.video_writer = None
         
-        obstacle_rot = np.array([
-            obstacle_transform.rotation.yaw,
-            obstacle_transform.rotation.pitch,
-            obstacle_transform.rotation.roll
-        ])
+        logger.info("Top-down camera visualization enabled")
         
-        # Construct observation with position, rotation and tick
-        current_observation = (
-            ego_pos,
-            obstacle_pos,
-            ego_rot,
-            obstacle_rot, 
-            self.tick
+    def _spawn_top_camera(self):
+        """Spawn a top-down camera to record the simulation"""
+        blueprint_library = self.world.get_blueprint_library()
+        
+        # Create top-down camera
+        camera_bp = blueprint_library.find('sensor.camera.rgb')
+        camera_bp.set_attribute('image_size_x', '800')
+        camera_bp.set_attribute('image_size_y', '600')
+        camera_bp.set_attribute('fov', '90')
+        
+        # Get base spawn point for reference
+        spawn_points = self.world.get_map().get_spawn_points()
+        if not spawn_points:
+            raise RuntimeError("No spawn points available for camera reference")
+        base_spawn_point = spawn_points[0]
+        
+        # Position camera with offset from base spawn point
+        camera_offset = self.config.get('camera_offset', {})
+        camera_transform = carla.Transform(
+            carla.Location(
+                x=base_spawn_point.location.x + camera_offset.get('x', 10.0), 
+                y=base_spawn_point.location.y + camera_offset.get('y', 0.0), 
+                z=base_spawn_point.location.z + camera_offset.get('z', 50.0)
+            ),
+            carla.Rotation(pitch=-90.0)  # Looking straight down
         )
         
-        return current_observation
+        self.top_camera = self.world.spawn_actor(camera_bp, camera_transform)
+        
+        # Set up camera callback
+        def camera_callback(image):
+            self._process_camera_frame(image)
+        
+        self.top_camera.listen(camera_callback)
+        logger.info("Top-down camera spawned and listening")
+        
+    def _process_camera_frame(self, image):
+        """Process incoming camera frames"""
+        if not self.visualization_enabled:
+            return
+            
+        # Convert CARLA image to numpy array
+        image.convert(carla.ColorConverter.Raw)
+        img_array = np.frombuffer(image.raw_data, dtype=np.uint8)
+        img_array = img_array.reshape((image.height, image.width, 4))
+        frame_bgr = img_array[:, :, :3]  # Remove alpha channel
+        frame_bgr = cv2.cvtColor(frame_bgr, cv2.COLOR_RGB2BGR)  # Convert to BGR for OpenCV
+        
+        # Add text overlay with information
+        ego_pos = [0, 0]
+        obstacle_pos = [0, 0]
+        distance = 0
+        
+        if hasattr(self, 'ego_vehicle') and self.ego_vehicle:
+            ego_transform = self.ego_vehicle.get_transform()
+            ego_pos = [ego_transform.location.x, ego_transform.location.y]
+            
+        if hasattr(self, 'obstacle_vehicle') and self.obstacle_vehicle:
+            obstacle_transform = self.obstacle_vehicle.get_transform()
+            obstacle_pos = [obstacle_transform.location.x, obstacle_transform.location.y]
+            
+        distance = np.sqrt((ego_pos[0] - obstacle_pos[0])**2 + (ego_pos[1] - obstacle_pos[1])**2)
+        
+        # Add text overlay
+        cv2.putText(frame_bgr, f'Distance: {distance:.2f}m', (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(frame_bgr, f'Tick: {self.tick}', (10, 60), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        if self.has_collided:
+            cv2.putText(frame_bgr, 'COLLISION!', (10, 100), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+        
+        # Initialize video writer on first frame
+        if self.video_writer is None:
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            self.video_writer = cv2.VideoWriter(
+                'video_output/simulation.mp4', fourcc, 20.0, 
+                (frame_bgr.shape[1], frame_bgr.shape[0])
+            )
+            logger.info("Video writer initialized")
+        
+        # Write frame to video
+        self.video_writer.write(frame_bgr)
+        
+        # Store frame for later processing if needed
+        self.camera_frames.append(frame_bgr)
     
+    def update_visualization(self, observation):
+        """Update visualization - camera automatically records frames"""
+        if not self.visualization_enabled:
+            return
+        # Camera callback handles frame recording automatically
+        pass
+    
+    def cleanup(self):
+        try:
+            if self.visualization_enabled:
+                if self.top_camera:
+                    self.top_camera.stop()
+                    self.top_camera.destroy()
+                    self.top_camera = None
+                if self.video_writer:
+                    self.video_writer.release()
+                    self.video_writer = None
+                    logger.info("Video saved to video_output/simulation.mp4")
+        except Exception as e:
+            logger.warning(f"Error cleaning up visualization: {e}")
+            
+        try:
+            if self.collision_sensor:
+                self.collision_sensor.stop()
+                self.collision_sensor.destroy()
+                self.collision_sensor = None
+        except Exception as e:
+            logger.warning(f"Error cleaning up collision sensor: {e}")
+            
+        try:
+            if self.ego_vehicle:
+                self.ego_vehicle.destroy()
+                self.ego_vehicle = None
+        except Exception as e:
+            logger.warning(f"Error cleaning up ego vehicle: {e}")
+            
+        try:
+            if self.obstacle_vehicle:
+                self.obstacle_vehicle.destroy()
+                self.obstacle_vehicle = None
+        except Exception as e:
+            logger.warning(f"Error cleaning up obstacle vehicle: {e}")
+            
+        try:
+            if self.world and self.original_settings:
+                self.world.apply_settings(self.original_settings)
+        except Exception as e:
+            logger.warning(f"Error restoring world settings: {e}")
+
+def run_trial(config, bandwidth, mode, enable_vis=False):
+    """Run a single trial with given configuration"""
+    simulator = CarlaSimulator(config)
+    
+    # Setup network simulator
+    network_sim = NSPyNetworkSimulator(
+        source_rate=bandwidth,
+        weights=[1, 1]
+    )
+    
+    # Initialize collision detector
+    collision_detector = CollisionDetector(threshold=config['collision_threshold'])
+    
+    # Initialize co-simulator for network simulation
+    co_sim = CarlaCoSimulator(network_sim, simulator, timestep=config['delta_seconds'])
+    
+    # Enable visualization if requested (before reset)
+    if enable_vis:
+        simulator.enable_visualization()
+    
+    # Reset simulation
+    simulator.reset()
+    
+    collisions = 0
+    total_steps = config['max_steps']
+    brake_applied = False
+    
+    last_observation = None
+    steps_without_observation = 0
+    
+    for step in range(total_steps):
+        # Step with network simulation
+        observation = co_sim.step(brake_applied)
+        brake_applied = False  # Reset brake flag
+        
+        if observation is not None:
+            last_observation = observation
+            steps_without_observation = 0
+        else:
+            # No observation received due to network delay
+            steps_without_observation += 1
+            if last_observation is None:
+                continue
+            # Use last known observation but with increased uncertainty
+            observation = last_observation
+            
+        # Check for collision
+        if observation['has_collided']:
+            collisions = 1
+            logger.info(f"Collision detected at step {step}")
+            break
+            
+        # Get positions
+        ego_pos = observation['ego_pos']
+        obstacle_pos = observation['obstacle_pos']
+        distance = np.sqrt((ego_pos[0] - obstacle_pos[0])**2 + (ego_pos[1] - obstacle_pos[1])**2)
+        
+        # Emergency braking logic - effectiveness depends on observation freshness
+        if distance < config['collision_threshold']:
+            # With network delay, brake response is delayed
+            if steps_without_observation <= 5:  # Recent observation
+                logger.info(f"Emergency brake at step {step}, distance: {distance:.2f}m (fresh data)")
+                brake_applied = True
+            else:
+                # Stale observation - brake anyway but may be too late
+                logger.info(f"Emergency brake at step {step}, distance: {distance:.2f}m (stale data, delay={steps_without_observation})")
+                brake_applied = True
+            
+        # Show progress
+        if step % 100 == 0:
+            logger.info(f"Step {step}: Distance = {distance:.2f}m, Brake = {brake_applied}, Delay = {steps_without_observation}")
+            
+    if enable_vis:
+        logger.info("Simulation completed, video saved")
+        
+    simulator.cleanup()
+    return collisions
+
+def run_experiment(config, bandwidth, mode, num_trials, enable_vis=False):
+    """Run multiple trials and calculate collision statistics"""
+    collision_rates = []
+    
+    logger.info(f"Running {num_trials} trials for {mode} mode with {bandwidth} Mbps bandwidth")
+    
+    for trial in range(num_trials):
+        logger.info(f"Trial {trial + 1}/{num_trials}")
+        # Only enable visualization for the first trial
+        vis_enabled = enable_vis and trial == 0
+        collisions = run_trial(config, bandwidth, mode, vis_enabled)
+        collision_rates.append(collisions)
+        
+        # Small delay between trials
+        time.sleep(1)
+    
+    collision_rate = sum(collision_rates) / num_trials
+    variance = statistics.variance(collision_rates) if len(collision_rates) > 1 else 0
+    
+    return collision_rate, variance
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Run CARLA simulation with configurable parameters')
-    parser.add_argument('--config_type',
-                        type=str,
-                        choices=['right_turn', 'left_turn', 'merge'],
-                        default='right_turn',
-                        help='Type of configuration to use')
-    parser.add_argument('--emergency_brake_threshold',
-                        type=float,
-                        default=1.1,
-                        help='Threshold for emergency braking')
-    parser.add_argument('--output_dir',
-                        type=str,
-                        default='./results',
-                        help='Directory to store results')
-
+    parser = argparse.ArgumentParser(description='CARLA Sync/Async Collision Comparison')
+    parser.add_argument('--bandwidth', type=float, default=10.0, 
+                       help='Network bandwidth in Mbps')
+    parser.add_argument('--trials', type=int, default=10, 
+                       help='Number of trials to run')
+    parser.add_argument('--output_dir', type=str, default='./results',
+                       help='Output directory for results')
+    parser.add_argument('--visualize', action='store_true',
+                       help='Enable visualization for the first trial')
+    
     args = parser.parse_args()
-
-    network_sim = NSPyNetworkSimulator(
-        source_rate=10000000.0,  # 10 Mbps
-        weights=[1, 2],       # Weight client->server flows lower than server->client
-    )
-    # Select configuration based on argument
-    config_map = {
-        'right_turn': unprotected_right_turn_config,
-        'left_turn': unprotected_left_turn_config,
-        'merge': opposite_direction_merge_config
-    }
-
-    base_config = config_map[args.config_type]
-
-    # Update emergency brake threshold
-    base_config['simulation'][
-        'emergency_brake_threshold'] = args.emergency_brake_threshold
-
+    
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
-
-    # Run in gym-like mode for interactive use or testing
-    simulator = CarlaLatencySimulator(base_config, args.output_dir)
     
-    # Get initial observation
-    observation = simulator.reset()
+    # Run experiments for both modes
+    results = {}
     
-    # Create the relative position tracker with time step and debug setting
-    rel_tracker = EKFObstacleTracker(
-        simulator.ego_vehicle,
-        simulator.obstacle_vehicle,
-        dt=base_config['simulation']['delta_seconds']
-    )
-    
-    # Initialize co-simulator
-    co_sim = CarlaCoSimulator(network_sim, simulator, timestep=0.01)
-
-    brake = False
-    
-    logger.info(f"Starting simulation with {base_config['simulation']['prediction_steps']} prediction steps")
-    logger.info(f"Emergency brake threshold: {base_config['simulation']['emergency_brake_threshold']}")
-
-    total_steps = base_config['ego_vehicle']['go_straight_ticks'] + base_config['ego_vehicle']['turn_ticks'] + base_config['ego_vehicle']['after_turn_ticks']
-    # Run for specified number of steps
-    for cur_step in range(total_steps):
+    for mode in ['sync', 'async']:
+        config = EXPERIMENT_CONFIGS[mode].copy()
+        collision_rate, variance = run_experiment(config, args.bandwidth, mode, args.trials, args.visualize)
         
-        # Step the simulation with brake flag
-        observation = co_sim.step(brake)
+        results[mode] = {
+            'collision_rate': collision_rate,
+            'variance': variance
+        }
         
-        # Reset brake flag
-        brake = False
-        
-        # Predict future positions and calculate collision probability
-        if observation is not None:
-            ego_pos = observation[0]
-            obstacle_pos = observation[1]
-            ego_rot = observation[2]
-            obstacle_rot = observation[3]
-            logger.warning(f"Current latency is {cur_step - observation[4]}")
-            
-            tick = cur_step
-            
-            # relative x, y, yaw
-            rel_x = obstacle_pos[0] - ego_pos[0]
-            rel_y = obstacle_pos[1] - ego_pos[1]
-            rel_yaw_deg = obstacle_rot[0] - ego_rot[0] 
-            rel_yaw_rad = rel_yaw_deg * np.pi / 180.0
-                        
-            # Update the tracker with the observation data
-            rel_tracker.update((rel_x, rel_y, rel_yaw_rad), tick)
-            
-            # Predict future positions
-            predicted_positions = rel_tracker.predict_future_position(100)
-            
-            
-            # Calculate collision probabilities
-            ego_trajectory = np.zeros((total_steps, 3))
-
-            max_collision_prob, collision_time, collision_probabilities = calculate_collision_probabilities(
-                rel_tracker, predicted_positions, ego_trajectory, tick)
-            logger.info(f"Step {cur_step}: Collision probability: {max_collision_prob:.4f}")
-            
-            # Apply emergency brake if collision probability exceeds threshold
-            # if max_collision_prob > base_config['simulation']['emergency_brake_threshold']:
-            if max_collision_prob > 0:
-                logger.info(f"Step {cur_step}: EMERGENCY BRAKE ACTIVATED")
-                brake = True
-                
-            if simulator.has_collided:
-                logger.info(f"Step {cur_step}: Collision detected")
-                break
-        else:
-            logger.info(f"Step {cur_step}: No observation received from simulator")
-
-    logger.info("Simulation completed")
+        logger.info(f"{mode.upper()} Mode - Collision Rate: {collision_rate:.3f}, Variance: {variance:.6f}")
     
-
+    # Save results
+    results_file = os.path.join(args.output_dir, f'results_bandwidth_{args.bandwidth}Mbps.txt')
+    with open(results_file, 'w') as f:
+        f.write(f"Network Bandwidth: {args.bandwidth} Mbps\n")
+        f.write(f"Number of Trials: {args.trials}\n\n")
+        
+        for mode in ['sync', 'async']:
+            f.write(f"{mode.upper()} Mode:\n")
+            f.write(f"  Collision Rate: {results[mode]['collision_rate']:.3f}\n")
+            f.write(f"  Variance: {results[mode]['variance']:.6f}\n\n")
+    
+    # Print summary
+    print("\n" + "="*50)
+    print("EXPERIMENT RESULTS")
+    print("="*50)
+    print(f"Bandwidth: {args.bandwidth} Mbps")
+    print(f"Trials: {args.trials}")
+    print()
+    
+    for mode in ['sync', 'async']:
+        print(f"{mode.upper()} Mode:")
+        print(f"  Collision Rate: {results[mode]['collision_rate']:.3f}")
+        print(f"  Variance: {results[mode]['variance']:.6f}")
+        print()
+    
+    variance_diff = results['async']['variance'] - results['sync']['variance']
+    print(f"Variance Difference (Async - Sync): {variance_diff:.6f}")
+    print(f"Results saved to: {results_file}")
 
 if __name__ == '__main__':
     main()

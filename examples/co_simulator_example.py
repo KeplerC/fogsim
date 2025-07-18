@@ -23,12 +23,10 @@ def run_gym_example():
         
         # Create network configuration with meaningful delay
         network_config = NetworkConfig(
-            source_rate=10.0,  # 100 kbps 
+            source_rate=1000000.0,  # 100 kbps 
             flow_weights=[1, 2],   # Weight client->server flows lower than server->client
             debug=True  # Reduce verbose logging
         )
-        # Increase link delay to make network effects more visible
-        network_config.topology.link_delay = 0.05  # 50ms delay
         
         # Create FogSim environment with network simulation
         env = Env(handler, network_config, enable_network=True, timestep=0.01)
