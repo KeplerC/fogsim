@@ -143,9 +143,11 @@ class CarlaSimulator:
             'has_collided': self.has_collided
         }
     
-    def enable_visualization(self):
+    def enable_visualization(self, mode=None, trial_num=None):
         self.visualization_enabled = True
         self.camera_frames = []
+        self.mode = mode
+        self.trial_num = trial_num
         
         # Create output directory for video
         os.makedirs('video_output', exist_ok=True)
@@ -231,11 +233,16 @@ class CarlaSimulator:
         # Initialize video writer on first frame
         if self.video_writer is None:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            # Create filename based on mode and trial number
+            if self.mode and self.trial_num is not None:
+                filename = f'video_output/simulation_{self.mode}_trial_{self.trial_num}.mp4'
+            else:
+                filename = 'video_output/simulation.mp4'
             self.video_writer = cv2.VideoWriter(
-                'video_output/simulation.mp4', fourcc, 20.0, 
+                filename, fourcc, 20.0, 
                 (frame_bgr.shape[1], frame_bgr.shape[0])
             )
-            logger.info("Video writer initialized")
+            logger.info(f"Video writer initialized: {filename}")
         
         # Write frame to video
         self.video_writer.write(frame_bgr)
@@ -259,8 +266,12 @@ class CarlaSimulator:
                     self.top_camera = None
                 if self.video_writer:
                     self.video_writer.release()
+                    if self.mode and self.trial_num is not None:
+                        filename = f'video_output/simulation_{self.mode}_trial_{self.trial_num}.mp4'
+                    else:
+                        filename = 'video_output/simulation.mp4'
                     self.video_writer = None
-                    logger.info("Video saved to video_output/simulation.mp4")
+                    logger.info(f"Video saved to {filename}")
         except Exception as e:
             logger.warning(f"Error cleaning up visualization: {e}")
             
@@ -292,7 +303,7 @@ class CarlaSimulator:
         except Exception as e:
             logger.warning(f"Error restoring world settings: {e}")
 
-def run_trial(config, bandwidth, mode, enable_vis=False):
+def run_trial(config, bandwidth, mode, enable_vis=False, trial_num=None):
     """Run a single trial with given configuration"""
     simulator = CarlaSimulator(config)
     
@@ -310,7 +321,7 @@ def run_trial(config, bandwidth, mode, enable_vis=False):
     
     # Enable visualization if requested (before reset)
     if enable_vis:
-        simulator.enable_visualization()
+        simulator.enable_visualization(mode, trial_num)
     
     # Reset simulation
     simulator.reset()
@@ -378,9 +389,9 @@ def run_experiment(config, bandwidth, mode, num_trials, enable_vis=False):
     
     for trial in range(num_trials):
         logger.info(f"Trial {trial + 1}/{num_trials}")
-        # Only enable visualization for the first trial
-        vis_enabled = enable_vis and trial == 0
-        collisions = run_trial(config, bandwidth, mode, vis_enabled)
+        # Enable visualization for each trial if requested
+        vis_enabled = enable_vis
+        collisions = run_trial(config, bandwidth, mode, vis_enabled, trial + 1)
         collision_rates.append(collisions)
         
         # Small delay between trials
@@ -393,14 +404,14 @@ def run_experiment(config, bandwidth, mode, num_trials, enable_vis=False):
 
 def main():
     parser = argparse.ArgumentParser(description='CARLA Sync/Async Collision Comparison')
-    parser.add_argument('--bandwidth', type=float, default=10.0, 
+    parser.add_argument('--bandwidth', type=float, default=1000000.0, 
                        help='Network bandwidth in Mbps')
-    parser.add_argument('--trials', type=int, default=10, 
+    parser.add_argument('--trials', type=int, default=3, 
                        help='Number of trials to run')
     parser.add_argument('--output_dir', type=str, default='./results',
                        help='Output directory for results')
     parser.add_argument('--visualize', action='store_true',
-                       help='Enable visualization for the first trial')
+                       help='Enable visualization and save separate videos for each trial')
     
     args = parser.parse_args()
     
