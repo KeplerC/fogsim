@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Training Convergence Demo - High Frame Rate Benefits
+Training Convergence Demo - High Frame Rate Benefits with PPO
 
 This example demonstrates the training convergence metric from CLAUDE.md:
-- Training policies with network delay/packet loss across all three FogSim modes
+- Training PPO policies with network delay/packet loss across all three FogSim modes
 - Comparing convergence curves with wallclock time
 - Success rate comparison after fixed training duration
 
 Shows how Virtual Timeline mode enables faster RL training by decoupling from wallclock.
+Uses PPO (Proximal Policy Optimization) with PyTorch and stable-baselines3.
 """
 
 import numpy as np
@@ -17,200 +18,229 @@ from typing import Dict, List, Tuple, Optional
 from collections import deque
 import random
 import argparse
+import torch
+
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.vec_env import VecMonitor
 
 from fogsim import FogSim, SimulationMode, NetworkConfig
 from fogsim.handlers import GymHandler
 
 
-class SimpleRLAgent:
-    """Simple Q-learning agent for CartPole."""
+class TrainingMetricsCallback(BaseCallback):
+    """Callback to track training metrics during PPO training."""
     
-    def __init__(self, state_bins: int = 10, action_space_size: int = 2):
-        self.state_bins = state_bins
-        self.action_space_size = action_space_size
-        self.q_table = {}
-        self.learning_rate = 1
-        self.discount_factor = 0.95
-        self.epsilon = 1.0
-        self.epsilon_decay = 0.995
-        self.epsilon_min = 0.01
+    def __init__(self, max_duration: float, verbose=0):
+        super().__init__(verbose)
+        self.episode_rewards = []
+        self.episode_lengths = []
+        self.success_episodes = []
+        self.timestamps = []
+        self.network_delays = []
+        self.start_time = time.time()
+        self.episode_count = 0
+        self.total_steps = 0
+        self.max_duration = max_duration
         
-    def discretize_state(self, observation: np.ndarray) -> Tuple:
-        """Discretize continuous state into bins."""
-        # Simple discretization for CartPole
-        # [cart_position, cart_velocity, pole_angle, pole_velocity]
-        if len(observation) >= 4:
-            bins = [
-                np.clip(int((observation[0] + 2.4) * 2), 0, 9),  # position
-                np.clip(int((observation[1] + 3) * 2), 0, 9),    # velocity
-                np.clip(int((observation[2] + 0.21) * 20), 0, 9), # angle
-                np.clip(int((observation[3] + 3) * 2), 0, 9)     # angular velocity
-            ]
-            return tuple(bins)
-        return (0, 0, 0, 0)
-    
-    def get_action(self, state: np.ndarray, training: bool = True) -> int:
-        """Get action using epsilon-greedy policy."""
-        discrete_state = self.discretize_state(state)
+    def _on_step(self) -> bool:
+        # Check if max duration has been reached
+        elapsed_time = time.time() - self.start_time
+        if elapsed_time >= self.max_duration:
+            print(f"\\nTraining stopped after {elapsed_time:.1f}s (reached max duration)")
+            return False  # Stop training
         
-        # Exploration vs exploitation
-        if training and random.random() < self.epsilon:
-            return random.randint(0, self.action_space_size - 1)
+        # Track total steps
+        self.total_steps += 1
         
-        # Get Q-values for state
-        if discrete_state not in self.q_table:
-            self.q_table[discrete_state] = np.zeros(self.action_space_size)
-        
-        return int(np.argmax(self.q_table[discrete_state]))
-    
-    def update(self, state: np.ndarray, action: int, reward: float, 
-               next_state: np.ndarray, done: bool, training: bool = True):
-        """Update Q-table using Q-learning."""
-        if not training:
-            return
+        # Check if episode ended
+        if self.locals.get('dones', [False])[0]:
+            info = self.locals.get('infos', [{}])[0]
             
-        discrete_state = self.discretize_state(state)
-        discrete_next_state = self.discretize_state(next_state)
+            # Get episode info from VecMonitor
+            if 'episode' in info:
+                self.episode_count += 1
+                episode_reward = info['episode']['r']
+                episode_length = info['episode']['l']
+                
+                self.episode_rewards.append(episode_reward)
+                self.episode_lengths.append(episode_length)
+                self.success_episodes.append(1 if episode_length >= 195 else 0)
+                self.timestamps.append(time.time() - self.start_time)
+                
+                # Track network delays if available
+                if 'network_latencies' in info:
+                    delays = [lat.get('latency', 0) for lat in info['network_latencies']]
+                    self.network_delays.append(np.mean(delays) if delays else 0)
+                else:
+                    self.network_delays.append(150)  # Default 150ms
+                
+                # Progress reporting
+                if self.episode_count % 100 == 0:
+                    recent_success_rate = np.mean(self.success_episodes[-100:]) if len(self.success_episodes) >= 100 else np.mean(self.success_episodes)
+                    avg_delay = np.mean(self.network_delays[-100:]) if self.network_delays else 0
+                    elapsed = time.time() - self.start_time
+                    print(f"  Episode {self.episode_count} ({elapsed:.1f}s): Success rate = {recent_success_rate*100:.1f}%, Avg delay = {avg_delay:.1f}ms")
         
-        # Initialize Q-values if needed
-        if discrete_state not in self.q_table:
-            self.q_table[discrete_state] = np.zeros(self.action_space_size)
-        if discrete_next_state not in self.q_table:
-            self.q_table[discrete_next_state] = np.zeros(self.action_space_size)
-        
-        # Q-learning update
-        current_q = self.q_table[discrete_state][action]
-        max_next_q = np.max(self.q_table[discrete_next_state]) if not done else 0
-        new_q = current_q + self.learning_rate * (reward + self.discount_factor * max_next_q - current_q)
-        
-        self.q_table[discrete_state][action] = new_q
-        
-        # Decay epsilon
-        if done:
-            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+        return True
 
 
 def train_agent_for_duration(mode: SimulationMode, 
                            training_duration: float = 60.0,  # seconds
                            timestep: float = 0.01) -> Dict:
-    """Train an agent for a fixed wallclock duration."""
+    """Train a PPO agent for a fixed wallclock duration."""
     
-    print(f"\nTraining in {mode.value.upper()} mode for {training_duration}s...")
+    print(f"\\nTraining PPO in {mode.value.upper()} mode for {training_duration}s...")
     
     # Create FogSim environment with 150ms network latency
     handler = GymHandler(env_name="CartPole-v1")
     
     # Configure network with 150ms latency
     network_config = NetworkConfig()
-    network_config.topology.link_delay = 0.006 # 150ms
+    network_config.topology.link_delay = 0.15  # 150ms
     network_config.source_rate = 1e6  # 1 Mbps
     network_config.packet_loss_rate = 0.01  # 1% packet loss for realism
     
     fogsim = FogSim(handler, mode=mode, timestep=timestep, network_config=network_config)
     
-    # Create agent
-    agent = SimpleRLAgent()
+    # Wrap environment for stable-baselines3
+    from gymnasium import Env
+    from gymnasium.spaces import Box, Discrete
     
-    # Training metrics
-    episode_rewards = []
-    episode_lengths = []
-    success_episodes = []  # Episodes with length >= 195
-    timestamps = []
-    network_delays = []
-    
-    # Training loop
-    start_time = time.time()
-    episode = 0
-    total_steps = 0
-    
-    while time.time() - start_time < training_duration:
-        observation, info = fogsim.reset()
-        episode_reward = 0
-        episode_length = 0
-        episode_delays = []
-        
-        done = False
-        while not done:
-            # Agent selects action
-            action = agent.get_action(observation, training=True)
+    class FogSimWrapper(Env):
+        """Wrapper to make FogSim compatible with stable-baselines3."""
+        def __init__(self, fogsim):
+            super().__init__()
+            self.fogsim = fogsim
+            self.observation_space = Box(low=-np.inf, high=np.inf, shape=(4,), dtype=np.float32)
+            self.action_space = Discrete(2)
+            self._reset_episode_vars()
             
-            # Step environment
-            next_observation, reward, success, termination, timeout, info = fogsim.step(action)
-            done = termination or timeout
+        def reset(self, seed=None, options=None):
+            self._reset_episode_vars()
+            obs, info = self.fogsim.reset()
+            return obs.astype(np.float32), info
             
-            # Track network delays - use configured delay if no messages received yet
+        def step(self, action):
+            obs, reward, success, terminated, truncated, info = self.fogsim.step(action)
+            self._episode_reward += reward
+            self._episode_length += 1
+            
+            # Accumulate network delays during episode
             if 'network_latencies' in info and info['network_latencies']:
                 for latency_info in info['network_latencies']:
-                    episode_delays.append(latency_info.get('latency', 0))
-            else:
-                # Use the configured network delay as expected latency
-                if hasattr(network_config.topology, 'link_delay'):
-                    episode_delays.append(network_config.topology.link_delay * 1000)  # Convert to ms
+                    # Convert latency from seconds to milliseconds
+                    latency_ms = latency_info.get('latency', 0) * 1000
+                    self._episode_network_delays.append(latency_ms)
             
-            # Update agent
-            agent.update(observation, action, reward, next_observation, done, training=True)
+            # Track episode metrics
+            if terminated or truncated:
+                info['episode'] = {
+                    'r': self._episode_reward,
+                    'l': self._episode_length,
+                    't': time.time() - self._episode_start
+                }
+                # Include network delays in episode info (already in milliseconds)
+                if self._episode_network_delays:
+                    info['network_latencies'] = [{'latency': delay} for delay in self._episode_network_delays]
+                else:
+                    # Use configured delay if no actual delays recorded
+                    info['network_latencies'] = [{'latency': 150}]  # 150ms default
             
-            observation = next_observation
-            episode_reward += reward
-            episode_length += 1
-            total_steps += 1
+            return obs.astype(np.float32), reward, terminated, truncated, info
             
-            # Check time limit
-            if time.time() - start_time >= training_duration:
-                done = True
-        
-        # Record metrics
-        episode_rewards.append(episode_reward)
-        episode_lengths.append(episode_length)
-        success_episodes.append(1 if episode_length >= 195 else 0)
-        timestamps.append(time.time() - start_time)
-        
-        if episode_delays:
-            network_delays.append(np.mean(episode_delays))
-        else:
-            network_delays.append(0.0)
-        
-        episode += 1
-        
-        # Progress reporting
-        if episode % 100 == 0:
-            recent_success_rate = np.mean(success_episodes[-100:]) if len(success_episodes) >= 100 else np.mean(success_episodes)
-            avg_delay = np.mean(network_delays[-100:]) if network_delays else 0
-            print(f"  Episode {episode}: Success rate = {recent_success_rate*100:.1f}%, Avg delay = {avg_delay:.1f}ms")
+        def render(self):
+            pass
+            
+        def close(self):
+            self.fogsim.close()
+            
+        def _reset_episode_vars(self):
+            self._episode_reward = 0
+            self._episode_length = 0
+            self._episode_start = time.time()
+            self._episode_network_delays = []
     
-    fogsim.close()
+    # Create wrapped environment
+    env = FogSimWrapper(fogsim)
     
-    # Calculate final metrics
-    final_success_rate = np.mean(success_episodes[-100:]) if len(success_episodes) >= 100 else np.mean(success_episodes)
-    avg_network_delay = np.mean(network_delays) if network_delays else 0
+    # Use VecMonitor to track episode statistics
+    vec_env = VecMonitor(make_vec_env(lambda: env, n_envs=1))
+    
+    # Create PPO model with appropriate hyperparameters for CartPole
+    model = PPO(
+        "MlpPolicy",
+        vec_env,
+        learning_rate=1e-5,
+        n_steps=32,  # Reduced for faster updates
+        batch_size=32,
+        n_epochs=10,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        ent_coef=0.01,
+        verbose=0,
+        device='cuda' if torch.cuda.is_available() else 'cpu'
+    )
+    
+    # Create callback to track metrics and handle time limit
+    callback = TrainingMetricsCallback(max_duration=training_duration)
+    
+    # Use a very large number of timesteps - the callback will stop training when duration is reached
+    total_timesteps = 10_000_000  # Large number, will be stopped by callback
+    
+    # Train the model
+    start_time = time.time()
+    try:
+        model.learn(
+            total_timesteps=total_timesteps,
+            callback=callback,
+            progress_bar=False
+        )
+    except KeyboardInterrupt:
+        print("Training interrupted by user")
+    
+    actual_duration = time.time() - start_time
+    
+    # Close environment
+    vec_env.close()
+    
+    # Calculate final metrics from callback
+    if callback.episode_rewards:
+        final_success_rate = np.mean(callback.success_episodes[-100:]) if len(callback.success_episodes) >= 100 else np.mean(callback.success_episodes)
+        avg_network_delay = np.mean(callback.network_delays) if callback.network_delays else 150
+    else:
+        final_success_rate = 0
+        avg_network_delay = 150
     
     return {
         'mode': mode,
-        'episode_rewards': episode_rewards,
-        'episode_lengths': episode_lengths,
-        'success_episodes': success_episodes,
-        'timestamps': timestamps,
-        'network_delays': network_delays,
-        'total_episodes': episode,
-        'total_steps': total_steps,
+        'episode_rewards': callback.episode_rewards,
+        'episode_lengths': callback.episode_lengths,
+        'success_episodes': callback.success_episodes,
+        'timestamps': callback.timestamps,
+        'network_delays': callback.network_delays,
+        'total_episodes': callback.episode_count,
+        'total_steps': callback.total_steps,
         'final_success_rate': final_success_rate,
         'avg_network_delay': avg_network_delay,
-        'training_duration': time.time() - start_time,
-        'episodes_per_second': episode / (time.time() - start_time),
-        'steps_per_second': total_steps / (time.time() - start_time)
+        'training_duration': actual_duration,
+        'episodes_per_second': callback.episode_count / actual_duration if actual_duration > 0 else 0,
+        'steps_per_second': callback.total_steps / actual_duration if actual_duration > 0 else 0,
+        'model': model  # Store the trained model
     }
 
 
-def evaluate_trained_agent(agent: SimpleRLAgent, mode: SimulationMode, 
+def evaluate_trained_model(model: PPO, mode: SimulationMode, 
                          num_episodes: int = 100) -> float:
-    """Evaluate a trained agent's performance."""
+    """Evaluate a trained PPO model's performance."""
     
     handler = GymHandler(env_name="CartPole-v1")
     
     # Configure network with same latency as training
     network_config = NetworkConfig()
-    # Use 20ms for evaluation to match training with small timesteps
-    network_config.topology.link_delay = 0.006 # 20ms
+    network_config.topology.link_delay = 0.15  # 150ms
     network_config.source_rate = 1e6  # 1 Mbps
     network_config.packet_loss_rate = 0.01  # 1% packet loss
     
@@ -224,8 +254,9 @@ def evaluate_trained_agent(agent: SimpleRLAgent, mode: SimulationMode,
         
         done = False
         while not done and episode_length < 500:
-            action = agent.get_action(observation, training=False)
-            observation, _, _, termination, timeout, _ = fogsim.step(action)
+            # Use PPO model to predict action
+            action, _ = model.predict(observation.astype(np.float32), deterministic=True)
+            observation, _, _, termination, timeout, _ = fogsim.step(int(action))
             done = termination or timeout
             episode_length += 1
         
@@ -324,28 +355,29 @@ def plot_training_results(results: List[Dict], save_path: str = 'training_conver
         
         plt.tight_layout()
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"\nResults saved to {save_path}")
+        print(f"\\nResults saved to {save_path}")
         
     except Exception as e:
-        print(f"\nCould not generate plots: {e}")
+        print(f"\\nCould not generate plots: {e}")
         import traceback
         traceback.print_exc()
 
 
 def main():
     """Run the training convergence experiment."""
-    parser = argparse.ArgumentParser(description="FogSim RL Training Convergence Demo")
-    parser.add_argument("--duration", type=int, default=60, help="Training duration in seconds")
+    parser = argparse.ArgumentParser(description="FogSim PPO Training Convergence Demo")
+    parser.add_argument("--duration", type=int, default=120, help="Training duration in seconds")
     parser.add_argument("--modes", nargs='+', choices=['virtual', 'simulated', 'real'], 
                        default=['virtual', 'simulated', 'real'], help="Modes to compare")
     parser.add_argument("--timestep", type=float, default=0.01, help="Simulation timestep")
+    parser.add_argument("--evaluate", action="store_true", help="Evaluate trained models after training")
     
     args = parser.parse_args()
     
-    print("FogSim RL Training Convergence Demo")
+    print("FogSim PPO Training Convergence Demo")
     print("="*70)
-    print("Demonstrating FogSim's high frame rate benefits for RL training")
-    print(f"Training agents for {args.duration} seconds of wallclock time")
+    print("Demonstrating FogSim's high frame rate benefits for PPO training")
+    print(f"Training PPO agents for {args.duration} seconds of wallclock time")
     print(f"Network configuration: 150ms latency, 1% packet loss")
     print(f"Comparing modes: {', '.join(args.modes)}")
     
@@ -362,7 +394,7 @@ def main():
         result = train_agent_for_duration(mode, args.duration, args.timestep)
         results.append(result)
         
-        print(f"\n{mode.value.upper()} Results:")
+        print(f"\\n{mode.value.upper()} Results:")
         print(f"  Total episodes: {result['total_episodes']}")
         print(f"  Total steps: {result['total_steps']}")
         print(f"  Episodes/second: {result['episodes_per_second']:.2f}")
@@ -373,8 +405,23 @@ def main():
     # Plot results
     plot_training_results(results)
     
+    # Evaluate trained models on test episodes if requested
+    if hasattr(args, 'evaluate') and args.evaluate:
+        print("\\n" + "="*70)
+        print("EVALUATING TRAINED MODELS")
+        print("="*70)
+        
+        for result in results:
+            if 'model' in result:
+                eval_success_rate = evaluate_trained_model(
+                    result['model'], 
+                    result['mode'], 
+                    num_episodes=100
+                )
+                print(f"\\n{result['mode'].value.upper()} - Evaluation Success Rate: {eval_success_rate*100:.1f}%")
+    
     # Summary comparison
-    print("\n" + "="*70)
+    print("\\n" + "="*70)
     print("TRAINING CONVERGENCE COMPARISON")
     print("="*70)
     
@@ -387,7 +434,7 @@ def main():
                 break
         
         if virtual_result:
-            print(f"\nTraining Efficiency (in {args.duration}s wallclock time):")
+            print(f"\\nTraining Efficiency (in {args.duration}s wallclock time):")
             
             for result in results:
                 if result['mode'] == SimulationMode.VIRTUAL:
@@ -396,12 +443,12 @@ def main():
                 episode_speedup = virtual_result['total_episodes'] / result['total_episodes'] if result['total_episodes'] > 0 else 0
                 step_speedup = virtual_result['total_steps'] / result['total_steps'] if result['total_steps'] > 0 else 0
                 
-                print(f"\n  Virtual vs {result['mode'].value}:")
+                print(f"\\n  Virtual vs {result['mode'].value}:")
                 print(f"    Episodes: {virtual_result['total_episodes']} vs {result['total_episodes']} ({episode_speedup:.2f}x speedup)")
                 print(f"    Steps: {virtual_result['total_steps']} vs {result['total_steps']} ({step_speedup:.2f}x speedup)")
                 print(f"    Success Rate: {virtual_result['final_success_rate']*100:.1f}% vs {result['final_success_rate']*100:.1f}%")
         
-        print(f"\nKey Insights:")
+        print(f"\\nKey Insights:")
         print(f"✓ Virtual Timeline mode enables significantly more training iterations")
         print(f"✓ Higher frame rates lead to faster policy convergence")
         print(f"✓ Network delays affect both training speed and final performance")
@@ -411,7 +458,7 @@ def main():
         if virtual_result and len(results) > 1:
             max_other_episodes = max([r['total_episodes'] for r in results if r['mode'] != SimulationMode.VIRTUAL])
             advantage = virtual_result['total_episodes'] / max_other_episodes if max_other_episodes > 0 else 1
-            print(f"\n🚀 FogSim Virtual Timeline advantage: {advantage:.1f}x more training episodes!")
+            print(f"\\n🚀 FogSim Virtual Timeline advantage: {advantage:.1f}x more training episodes!")
 
 
 if __name__ == "__main__":
