@@ -1,22 +1,5 @@
 
 
-code structure: 
-examples 
-- evaluation 
--- RL policy training 
--- CARLA 
-
-fogsim 
-- environment 
-- handler 
-- network 
--- current nspy simulator 
--- client-server message passing with real network 
-- clock 
--- real clock via sleep
--- virtual clock 
-other top level message defintions 
-
 Evaluate each aspect of the solution with these key questions:
 
 Does the analysis directly address the problem?

@@ -90,6 +90,47 @@ class GymHandler(BaseHandler):
         self._step_count = 0
         logger.info("Gym environment launched successfully")
     
+    def reset(self) -> tuple:
+        """Reset the environment and return initial observation and info."""
+        if not self._launched:
+            raise RuntimeError("Handler not launched. Call launch() first.")
+        
+        # Reset environment
+        reset_result = self._env.reset()
+        if isinstance(reset_result, tuple):
+            self._last_observation, self._last_info = reset_result
+        else:
+            self._last_observation = reset_result
+            self._last_info = {}
+        
+        # Reset tracking variables
+        self._last_reward = 0.0
+        self._last_done = False
+        self._step_count = 0
+        self._episode_count += 1
+        
+        logger.debug(f"Environment reset, episode {self._episode_count}")
+        return self._last_observation, self._last_info
+    
+    def step_with_action(self, action) -> tuple:
+        """Step environment with given action and return gym interface."""
+        if not self._launched:
+            raise RuntimeError("Handler not launched. Call launch() first.")
+        
+        # Step the environment (handle both old and new Gym API)
+        step_result = self._env.step(action)
+        if len(step_result) == 5:
+            # New Gym API: (observation, reward, terminated, truncated, info)
+            obs, reward, terminated, truncated, info = step_result
+            done = terminated or truncated
+            # Return in new format: obs, reward, success, termination, timeout, info
+            return obs, reward, not done, terminated, truncated, info
+        else:
+            # Old Gym API: (observation, reward, done, info)
+            obs, reward, done, info = step_result
+            # Return in new format: obs, reward, success, termination, timeout, info
+            return obs, reward, not done, done, False, info
+    
     def set_states(self, states: Optional[Dict[str, Any]] = None, 
                    action: Optional[np.ndarray] = None) -> None:
         """Set simulator states.
@@ -234,3 +275,17 @@ class GymHandler(BaseHandler):
     def env(self) -> Any:
         """Get the underlying Gym environment."""
         return self._env
+    
+    @property
+    def action_space(self):
+        """Get action space from environment."""
+        if not self._launched or self._env is None:
+            raise RuntimeError("Handler not launched. Call launch() first.")
+        return self._env.action_space
+    
+    @property
+    def observation_space(self):
+        """Get observation space from environment."""
+        if not self._launched or self._env is None:
+            raise RuntimeError("Handler not launched. Call launch() first.")
+        return self._env.observation_space

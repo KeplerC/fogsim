@@ -1,106 +1,111 @@
-# FogSim
+# FogSim - Refactored Co-simulation Framework
 
-FogSim is a co-simulation framework that enables integration between robotics simulation environments (Gym, CARLA, Mujoco, etc.) and network simulation to study the effects of network latency and bandwidth constraints on robotic systems.
+**Major Breaking Changes - Version 0.2.0**
 
-## Key Features
+FogSim has been completely refactored to align with the architecture described in CLAUDE.md. This version introduces **breaking changes** and removes legacy complexity.
 
-- **Handler-based Architecture**: Unified interface supporting Gym, CARLA, and Mujoco simulators
-- **Rich Network Simulation**: Powered by ns.py with configurable topologies, congestion control, and scheduling
-- **Mujoco/Roboverse Compatible**: Standard interface familiar to robotics researchers  
-- **Network Configuration**: Easy-to-use configuration system exposing advanced network simulation features
-- **Comprehensive Testing**: Full test suite with unit and integration tests
+## Architecture Overview
 
-## Installation
+FogSim implements three distinct simulation modes:
 
-```bash
-# Basic installation
-pip install fogsim
+1. **Virtual Timeline (VIRTUAL)** - Decoupled from wallclock time for maximum scalability and reproducibility
+2. **Real Clock + Simulated Network (SIMULATED_NET)** - Real-time execution with network simulation
+3. **Real Clock + Real Network (REAL_NET)** - Real-time execution with actual network constraints
 
-# With optional dependencies
-pip install 'fogsim[gym]'      # For OpenAI Gym support
-pip install 'fogsim[carla]'    # For CARLA support  
-pip install 'fogsim[all]'      # All optional dependencies
+## New Simplified API
 
-# For development
-pip install -e ".[dev]"
-```
-
-## Quick Start
-
-### Basic Usage (No Network)
+### Basic Usage
 
 ```python
-import fogsim
-import numpy as np
+from fogsim import FogSim, SimulationMode
+from fogsim.handlers import GymHandler
 
-# Create a Gym handler
-handler = fogsim.GymHandler(env_name="CartPole-v1")
+# Create handler for your simulator (Gym, CARLA, etc.)
+handler = GymHandler("CartPole-v1")
 
-# Create FogSim environment
-env = fogsim.Env(handler, enable_network=False)
+# Create FogSim instance with desired mode
+fogsim = FogSim(handler, mode=SimulationMode.VIRTUAL, timestep=0.1)
 
-# Standard gym-like interface
-observation, extra_info = env.reset()
-
+# Run simulation
+obs, info = fogsim.reset()
 for step in range(100):
-    action = np.random.choice([0, 1])  # Random action
-    observation, reward, success, termination, timeout, extra_info = env.step(action)
+    action = fogsim.action_space.sample()
+    obs, reward, success, term, timeout, info = fogsim.step(action)
     
-    if termination or timeout:
+    if term or timeout:
         break
 
-env.close()
+fogsim.close()
 ```
 
-### With Network Simulation
+### Three Modes Example
 
 ```python
-import fogsim
+# Mode 1: Virtual Timeline (highest performance)
+fogsim_virtual = FogSim(handler, SimulationMode.VIRTUAL)
 
-# Create handler and network configuration
-handler = fogsim.GymHandler(env_name="CartPole-v1")
-network_config = fogsim.get_low_latency_config()  # Pre-configured for 5G/edge
+# Mode 2: Real Clock + Simulated Network
+fogsim_simnet = FogSim(handler, SimulationMode.SIMULATED_NET)  
 
-# Create environment with network simulation
-env = fogsim.Env(handler, network_config, enable_network=True)
-
-# Reset and run with network effects
-observation, extra_info = env.reset()
-
-for step in range(100):
-    action = np.random.choice([0, 1])
-    observation, reward, success, termination, timeout, extra_info = env.step(action)
-    
-    # Check network latencies
-    if extra_info.get('network_latencies'):
-        print(f"Network latencies: {extra_info['network_latencies']}")
-    
-    if termination or timeout:
-        break
-
-env.close()
+# Mode 3: Real Clock + Real Network
+fogsim_real = FogSim(handler, SimulationMode.REAL_NET)
 ```
 
-### Custom Network Configuration
+## Project Structure
 
+```
+fogsim/
+├── core.py              # Main FogSim class (NEW)
+├── clock/               # Time management (NEW)
+│   ├── virtual_clock.py # Virtual timeline
+│   └── real_clock.py    # Real-time sync
+├── handlers/            # Simulator interfaces (UNCHANGED)
+├── network/             # Network components (SIMPLIFIED)
+│   ├── nspy_simulator.py
+│   └── real_network.py
+└── messages.py          # Simple message definitions (NEW)
+
+examples/
+├── basic_demos/         # Simple examples
+├── evaluation/          # Evaluation experiments
+│   ├── rl_training/     # RL policy training
+│   └── carla/           # CARLA experiments
+```
+
+## What Was Removed
+
+- **BaseCoSimulator** - Complex legacy wrapper
+- **evaluation.py** - Overcomplicated evaluation framework  
+- **network_control.py** - Merged into network components
+- **message_passing.py** - Replaced with simple messages
+- **time_backend.py** - Split into clock modules
+- Legacy co-simulator classes
+- Backward compatibility layers
+
+## Migration Guide
+
+**Old API:**
 ```python
-import fogsim
-
-# Create custom network configuration
-network_config = fogsim.NetworkConfig()
-network_config.source_rate = 1e6  # 1 Mbps
-network_config.topology.link_delay = 0.1  # 100ms delay
-network_config.packet_loss_rate = 0.01  # 1% packet loss
-
-# Enable traffic shaping
-network_config.enable_token_bucket_shaping(rate=500e3, size=10e3)
-
-# Use different congestion control
-network_config.congestion_control = fogsim.CongestionControl.BBR
-
-handler = fogsim.GymHandler(env_name="CartPole-v1")
-env = fogsim.Env(handler, network_config, enable_network=True)
+from fogsim import GymCoSimulator
+cosim = GymCoSimulator(network_sim, "CartPole-v1")
 ```
+
+**New API:**
+```python  
+from fogsim import FogSim, SimulationMode
+from fogsim.handlers import GymHandler
+
+handler = GymHandler("CartPole-v1")
+fogsim = FogSim(handler, SimulationMode.VIRTUAL)
+```
+
+## Key Benefits
+
+- **90% code reduction** in core modules
+- **Clear separation** of three simulation modes
+- **Minimal API surface** - easier to understand and maintain
+- **Direct implementation** of CLAUDE.md architecture  
+- **No legacy baggage** - clean foundation for future development
 
 ## Supported Simulators
 

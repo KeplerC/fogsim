@@ -1,114 +1,60 @@
-"""FogSim: A co-simulation framework for robotics and network simulation.
+"""
+FogSim: Simplified Co-simulation Framework for Robotics and Network Simulation
 
-FogSim provides a unified interface for co-simulation between robotics
-simulators (Gym, CARLA, Mujoco) and network simulation, allowing researchers
-to study the effects of network latency and bandwidth constraints on robotic systems.
+FogSim provides three simulation modes as described in CLAUDE.md:
+1. Virtual timeline (VIRTUAL) - Decoupled from wallclock for scalability
+2. Real clock + simulated network (SIMULATED_NET) - High frame rate with network simulation  
+3. Real clock + real network (REAL_NET) - Shows sim-to-real gap
+
+Refactored for simplicity and breaking changes from legacy API.
 """
 
-# Main environment interface
-from .env import Env
+# Core interface
+from .core import FogSim, SimulationMode
 
-# Handler-based architecture
+# Handlers (unchanged)
 from .handlers import BaseHandler, GymHandler, CarlaHandler, MujocoHandler
 
-# Network simulation
+# Network components (simplified)
 from .network import NetworkConfig, NSPyNetworkSimulator
-from .network import TopologyType, CongestionControl, SchedulerType
-from .network import get_low_latency_config, get_satellite_config, get_iot_config
+from .network.real_network import RealNetworkTransport
 
-# Time backend system
-from .time_backend import (
-    SimulationMode,
-    UnifiedTimeManager,
-    TimeBackend,
-    VirtualTimeBackend,
-    SimulatedNetworkTimeBackend,
-    RealNetworkTimeBackend
-)
+# Clock components (new)
+from .clock import VirtualClock, RealClock
 
-# Network control
-from .network_control import (
-    NetworkControlManager,
-    NetworkConfig as NetworkControlConfig,
-    TCController
-)
+# Simple messages
+from .messages import Message, SimulationMessage, create_step_message
 
-# Message passing
-from .message_passing import (
-    MessageBus,
-    TimedMessage,
-    SimpleMessageHandler
-)
+# Legacy environment support (minimal)
+from .env import Env
 
-# Real network support
-from .real_network import (
-    RealNetworkManager,
-    LatencyMeasurer,
-    NetworkMeasurement,
-    create_real_network_config
-)
-from .real_network_client import (
-    RealNetworkClient,
-    RealNetworkMessageHandler,
-    test_real_network_connection
-)
-
-# Legacy co-simulators (for backward compatibility)
-from .base import BaseCoSimulator
-from .environment.gym_co_simulator import GymCoSimulator
-from .environment.carla_co_simulator import CarlaCoSimulator
-
-__version__ = "0.1.0"
+__version__ = "0.2.0"  # Breaking changes version bump
 
 __all__ = [
-    # Main interface
-    'Env',
+    # Core interface
+    'FogSim',
+    'SimulationMode',
     
-    # Handlers
+    # Handlers  
     'BaseHandler',
     'GymHandler', 
     'CarlaHandler',
     'MujocoHandler',
     
-    # Network simulation
+    # Network
     'NetworkConfig',
-    'NSPyNetworkSimulator',
-    'TopologyType',
-    'CongestionControl',
-    'SchedulerType',
-    'get_low_latency_config',
-    'get_satellite_config',
-    'get_iot_config',
+    'NSPyNetworkSimulator', 
+    'RealNetworkTransport',
     
-    # Time backend
-    'SimulationMode',
-    'UnifiedTimeManager',
-    'TimeBackend',
-    'VirtualTimeBackend',
-    'SimulatedNetworkTimeBackend',
-    'RealNetworkTimeBackend',
+    # Clock
+    'VirtualClock',
+    'RealClock',
     
-    # Network control
-    'NetworkControlManager',
-    'NetworkControlConfig',
-    'TCController',
+    # Messages
+    'Message',
+    'SimulationMessage',
+    'create_step_message',
     
-    # Message passing
-    'MessageBus',
-    'TimedMessage',
-    'SimpleMessageHandler',
-    
-    # Real network
-    'RealNetworkManager',
-    'LatencyMeasurer',
-    'NetworkMeasurement',
-    'create_real_network_config',
-    'RealNetworkClient',
-    'RealNetworkMessageHandler',
-    'test_real_network_connection',
-    
-    # Legacy (backward compatibility)
-    'BaseCoSimulator',
-    'GymCoSimulator',
-    'CarlaCoSimulator',
-] 
+    # Legacy support
+    'Env',
+]
