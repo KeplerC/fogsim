@@ -49,7 +49,8 @@ class NSPyNetworkSimulator:
     """Network simulator implementation using ns.py with VirtualClock scheduler."""
     
     def __init__(self, source_rate: float = 4600.0, weights: List[int] = [1, 1], debug: bool = False,
-                 env: Optional[simpy.Environment] = None, packet_tracker: Optional[PacketTracker] = None):
+                 env: Optional[simpy.Environment] = None, packet_tracker: Optional[PacketTracker] = None,
+                 link_delay: float = 0.0):
         """
         Initialize the network simulator with ns.py.
         
@@ -59,11 +60,13 @@ class NSPyNetworkSimulator:
             debug: Enable debug output (default: False)
             env: Optional SimPy environment for dependency injection
             packet_tracker: Optional packet tracker for dependency injection
+            link_delay: Additional propagation delay in seconds (default: 0.0)
         """
         self.env = env or simpy.Environment()
         self.source_rate = source_rate
         self.flow_weights = weights
         self.debug = debug
+        self.link_delay = link_delay
         self.vc_server = VirtualClockServer(self.env, source_rate, weights, debug=debug)
         self.sink = PacketSink(self.env)
         self.vc_server.out = self.sink
@@ -71,8 +74,8 @@ class NSPyNetworkSimulator:
         # Message tracking
         self.packet_tracker = packet_tracker or PacketTracker()
         
-        logger.info("NSPyNetworkSimulator initialized with rate=%f, weights=%s, debug=%s", 
-                    source_rate, weights, debug)
+        logger.info("NSPyNetworkSimulator initialized with rate=%f, weights=%s, debug=%s, link_delay=%f", 
+                    source_rate, weights, debug, link_delay)
         
     def register_packet(self, message: Any, flow_id: int = 0, size: float = 1000.0) -> str:
         """
@@ -115,13 +118,13 @@ class NSPyNetworkSimulator:
                         time_point, self.env.now)
             return
             
-        logger.info("Running simulation from %f to %f", self.env.now, time_point)
+        logger.debug("Running simulation from %f to %f", self.env.now, time_point)
             
         # Run the simulation
         try:
             self.env.run(until=time_point)
         except simpy.core.EmptySchedule:
-            logger.info("No more events to process in simulation")
+            logger.debug("No more events to process in simulation")
             pass  # No more events to process
             
         # Check for new packet arrivals
@@ -144,8 +147,11 @@ class NSPyNetworkSimulator:
                 for i in range(last_idx, len(arrivals)):
                     arrival_time = arrivals[i]
                     
-                    # If this packet arrived by our time_point
-                    if arrival_time <= time_point:
+                    # Add link delay to the arrival time
+                    actual_delivery_time = arrival_time + self.link_delay
+                    
+                    # If this packet has been delivered (including link delay) by our time_point
+                    if actual_delivery_time <= time_point:
                         new_arrivals += 1
                         # In a real implementation, we would need a way to map arrival positions to
                         # specific packet IDs. Since we don't have access to the actual packet objects,
@@ -153,10 +159,14 @@ class NSPyNetworkSimulator:
                         # as delivered.
                         for packet_id, (message, sent_time, message_flow_id) in self.packet_tracker.pending_packets.items():
                             if message_flow_id == flow_id and packet_id not in delivered_packet_ids:
+                                # Add latency information to the message (in milliseconds)
+                                if isinstance(message, dict):
+                                    message['latency'] = (actual_delivery_time - sent_time) * 1000  # Convert to ms
                                 self.packet_tracker.mark_packet_delivered(packet_id)
                                 delivered_packet_ids.add(packet_id)
-                                logger.info("Packet ID=%s delivered at time=%f, latency=%f", 
-                                            packet_id, arrival_time, arrival_time - sent_time)
+                                logger.info("Packet ID=%s delivered at time=%f, total_latency=%fms (queue=%fms + link=%fms)", 
+                                            packet_id, actual_delivery_time, (actual_delivery_time - sent_time) * 1000,
+                                            (arrival_time - sent_time) * 1000, self.link_delay * 1000)
                                 break
                 
                 # Update the last checked index for next time
@@ -181,6 +191,7 @@ class NSPyNetworkSimulator:
     def reset(self) -> None:
         """Reset the network simulator."""
         logger.info("Resetting network simulator")
+        # Don't create a new environment - keep the existing one but reset its time
         self.env = simpy.Environment()
         self.vc_server = VirtualClockServer(
             self.env, 

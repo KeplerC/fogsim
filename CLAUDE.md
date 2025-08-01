@@ -46,11 +46,9 @@ background:
 Baseline: 
 
 * implement FogSIM into three modes   
-  1. **FogSIM** (Virtual timeline)  
-  2. **real clock \+ simulated network:** rely on network simulator that can simulate   
-     * used for high frame rate and simulation reproducibility   
+  1. **FogSIM** (Virtual timeline) that uses virtual timeline to coordinate the progression of the time of the network simulator and physical simulator 
+  2. **real clock \+ simulated network:** rely on network simulator that can simulate, but rely on sleep to simulate the latency
   3. **real clock \+ real network:** a simulation server that is located on network \- which contains simulation feedback and can be done one request at a time (proceed timestep without virtual clocking)
-     * used for showing sim\<-\>real gap 
 
 **FogSim achieves high simulation frame rate**  
 Training policies in simulation environment with network delay / packet loss   

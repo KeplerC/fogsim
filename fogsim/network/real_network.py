@@ -30,7 +30,14 @@ class RealNetworkTransport:
     """
     
     def __init__(self, config: Optional[NetworkConfig] = None):
-        self.config = config or NetworkConfig()
+        # Handle both types of NetworkConfig
+        if config and hasattr(config, 'server_host'):
+            # It's the real network config
+            self.config = config
+        else:
+            # It's the general NetworkConfig, create a real network config
+            self.config = NetworkConfig()
+        
         self.client = EchoClient(self.config.server_host, self.config.server_port)
         self.server = None
         self.message_count = 0

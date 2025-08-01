@@ -28,7 +28,7 @@ class FogSim:
     """
     
     def __init__(self, handler, mode: SimulationMode = SimulationMode.VIRTUAL, 
-                 timestep: float = 0.1):
+                 timestep: float = 0.1, network_config=None):
         """
         Initialize FogSim.
         
@@ -36,10 +36,12 @@ class FogSim:
             handler: Environment handler (GymHandler, CarlaHandler, etc.)
             mode: Simulation mode
             timestep: Simulation timestep in seconds
+            network_config: Network configuration (optional)
         """
         self.handler = handler
         self.mode = mode
         self.timestep = timestep
+        self.network_config = network_config
         
         # Initialize clock based on mode
         if mode == SimulationMode.VIRTUAL:
@@ -64,14 +66,29 @@ class FogSim:
     def _init_network(self):
         """Initialize network component based on simulation mode."""
         if self.mode == SimulationMode.VIRTUAL:
-            # No network simulation in virtual mode
-            return None
-        elif self.mode == SimulationMode.SIMULATED_NET:
             from .network.nspy_simulator import NSPyNetworkSimulator
-            return NSPyNetworkSimulator()
+            # Use network config if provided
+            if self.network_config:
+                source_rate = getattr(self.network_config, 'source_rate', 4600.0)
+                link_delay = getattr(self.network_config.topology, 'link_delay', 0.0) if hasattr(self.network_config, 'topology') else 0.0
+                return NSPyNetworkSimulator(source_rate=source_rate, link_delay=link_delay)
+            else:
+                return NSPyNetworkSimulator()
+        elif self.mode == SimulationMode.SIMULATED_NET:
+            from .network.wallclock_simulator import WallclockNetworkSimulator
+            # Use network config if provided
+            if self.network_config:
+                source_rate = getattr(self.network_config, 'source_rate', 4600.0)
+                link_delay = getattr(self.network_config.topology, 'link_delay', 0.0) if hasattr(self.network_config, 'topology') else 0.0
+                return WallclockNetworkSimulator(source_rate=source_rate, link_delay=link_delay)
+            else:
+                return WallclockNetworkSimulator()
         else:  # REAL_NET
             from .network.real_network import RealNetworkTransport
-            return RealNetworkTransport()
+            if self.network_config:
+                return RealNetworkTransport(self.network_config)
+            else:
+                return RealNetworkTransport()
     
     def step(self, action) -> Tuple[np.ndarray, float, bool, bool, bool, Dict[str, Any]]:
         """
