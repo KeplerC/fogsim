@@ -11,11 +11,15 @@ import logging
 from .handlers.base_handler import BaseHandler
 from .network.nspy_simulator import NSPyNetworkSimulator
 from .network.config import NetworkConfig
+from .time_backend import SimulationMode, UnifiedTimeManager, TimeSubscriber
+from .message_passing import MessageBus, SimpleMessageHandler, TimedMessage
+from .network_control import NetworkControlManager, NetworkConfig as NetworkControlConfig
+from .real_network_client import RealNetworkClient, RealNetworkMessageHandler
 
 logger = logging.getLogger(__name__)
 
 
-class Env:
+class Env(TimeSubscriber):
     """Main FogSim environment class.
     
     This class provides a unified interface for co-simulation between robotics
@@ -26,29 +30,66 @@ class Env:
         network_config: Network simulation configuration
         enable_network: Whether to enable network simulation (default: True)
         timestep: Simulation timestep in seconds (default: 0.1)
+        mode: Simulation mode (VIRTUAL, SIMULATED_NET, or REAL_NET)
     """
     
     def __init__(self,
                  handler: BaseHandler,
                  network_config: Optional[NetworkConfig] = None,
                  enable_network: bool = True,
-                 timestep: float = 0.1):
+                 timestep: float = 0.1,
+                 mode: SimulationMode = SimulationMode.VIRTUAL,
+                 real_network_host: str = "127.0.0.1",
+                 real_network_port: int = 8765):
         """Initialize the FogSim environment."""
         self.handler = handler
         self.network_config = network_config or NetworkConfig()
         self.enable_network = enable_network
         self.timestep = timestep
+        self.mode = mode
+        self.real_network_host = real_network_host
+        self.real_network_port = real_network_port
+        
+        # Initialize unified time manager
+        self.time_manager = UnifiedTimeManager(mode, timestep)
+        self.time_manager.register_subscriber(self)
         
         # Setup network simulator if enabled
         self.network_sim = None
         if self.enable_network:
             self.network_sim = self._setup_network()
         
+        # Initialize message bus
+        self.message_bus = MessageBus(self.time_manager, self.network_sim)
+        
+        # Initialize network control
+        self.network_control = NetworkControlManager(mode, network_simulator=self.network_sim)
+        
+        # Setup message handlers
+        if self.mode == SimulationMode.REAL_NET and self.enable_network:
+            # Real network mode: use client that forwards to server
+            self.real_network_client = RealNetworkClient(
+                server_host=real_network_host,
+                server_port=real_network_port,
+                protocol="tcp"
+            )
+            self.real_network_client.start()
+            
+            self.robot_handler = RealNetworkMessageHandler(self.real_network_client, "robot")
+            self.controller_handler = RealNetworkMessageHandler(self.real_network_client, "controller")
+        else:
+            # Virtual or simulated modes: use simple handlers
+            self.real_network_client = None
+            self.robot_handler = SimpleMessageHandler()
+            self.controller_handler = SimpleMessageHandler()
+            
+        self.message_bus.register_handler("robot", self.robot_handler)
+        self.message_bus.register_handler("controller", self.controller_handler)
+        
         # Launch handler
         handler.launch()
         
         # Initialize state tracking
-        self._current_time = 0.0
         self._step_count = 0
         self._episode_count = 0
         
@@ -58,7 +99,7 @@ class Env:
         self._last_action_received = None
         self._network_latencies = []
         
-        logger.info(f"FogSim environment initialized with {type(handler).__name__}")
+        logger.info(f"FogSim environment initialized with {type(handler).__name__} in {mode.value} mode")
     
     def _setup_network(self) -> NSPyNetworkSimulator:
         """Setup network simulator based on configuration."""
@@ -91,13 +132,17 @@ class Env:
             self.network_sim.reset()
         
         # Reset tracking variables
-        self._current_time = 0.0
+        self.time_manager.reset()
         self._step_count = 0
         self._episode_count += 1
         self._pending_observation_id = 0
         self._last_observation_sent = None
         self._last_action_received = None
         self._network_latencies.clear()
+        
+        # Clear message handlers
+        self.robot_handler.clear()
+        self.controller_handler.clear()
         
         # Get observation and extra info
         observation = self._get_observation(states)
@@ -107,7 +152,8 @@ class Env:
         extra_info.update({
             'network_enabled': self.enable_network,
             'timestep': self.timestep,
-            'episode': self._episode_count
+            'episode': self._episode_count,
+            'mode': self.mode.value
         })
         
         logger.info("Environment reset, episode %d", self._episode_count)
@@ -139,7 +185,7 @@ class Env:
         extra_info.update(info)
         extra_info.update({
             'step': self._step_count,
-            'time': self._current_time,
+            'time': self.time_manager.now(),
             'network_latencies': self._network_latencies.copy()
         })
         
@@ -157,7 +203,7 @@ class Env:
         states = self.handler.get_states()
         
         # Update time tracking
-        self._current_time += self.timestep
+        self.time_manager.advance_time()
         self._step_count += 1
         
         # Get observation and compute reward
@@ -178,46 +224,50 @@ class Env:
         # Send current observation through network
         states = self.handler.get_states()
         observation = self._get_observation(states)
+        current_time = self.time_manager.now()
         
         # Create observation message
         self._pending_observation_id += 1
         obs_message = {
             'observation': observation,
             'observation_id': self._pending_observation_id,
-            'timestamp': self._current_time,
+            'timestamp': current_time,
             'states': states
         }
         
-        # Send observation to "client" (controller)
-        obs_msg_id = self.network_sim.register_packet(
-            obs_message,
-            flow_id=1,  # Server to client
-            size=self._estimate_message_size(observation)
+        # Send observation from robot to controller
+        obs_delay = self._calculate_network_delay(observation)
+        self.message_bus.send(
+            sender_id="robot",
+            receiver_id="controller",
+            payload=obs_message,
+            delay=obs_delay,
+            message_type="observation"
         )
         self._last_observation_sent = obs_message
         
-        # Send action to "server" (robot)
+        # Send action from controller to robot
         action_message = {
             'action': action,
             'responding_to_observation': self._pending_observation_id - 1,
-            'timestamp': self._current_time
+            'timestamp': current_time
         }
         
-        action_msg_id = self.network_sim.register_packet(
-            action_message,
-            flow_id=0,  # Client to server
-            size=self._estimate_message_size(action)
+        action_delay = self._calculate_network_delay(action)
+        self.message_bus.send(
+            sender_id="controller",
+            receiver_id="robot",
+            payload=action_message,
+            delay=action_delay,
+            message_type="action"
         )
         
         # Advance time
-        self._current_time += self.timestep
+        self.time_manager.advance_time()
         self._step_count += 1
         
-        # Run network simulation
-        self.network_sim.run_until(self._current_time)
-        
         # Process received messages
-        messages = self.network_sim.get_ready_messages()
+        messages = self.robot_handler.received_messages + self.controller_handler.received_messages
         
         # Default values if no messages received
         received_action = None  # Don't use current action as fallback
@@ -225,30 +275,33 @@ class Env:
         network_states = states
         
         for msg in messages:
-            if 'action' in msg:
+            # Extract payload from TimedMessage
+            payload = msg.payload if hasattr(msg, 'payload') else msg
+            
+            if isinstance(payload, dict) and 'action' in payload:
                 # Received action from network
-                received_action = msg['action']
-                self._last_action_received = msg
+                received_action = payload['action']
+                self._last_action_received = payload
                 
                 # Calculate action latency
-                action_latency = self._current_time - msg['timestamp']
+                action_latency = self.time_manager.now() - payload['timestamp']
                 self._network_latencies.append({
                     'type': 'action',
                     'latency': action_latency,
-                    'time': self._current_time
+                    'time': self.time_manager.now()
                 })
                 
-            elif 'observation' in msg:
+            elif isinstance(payload, dict) and 'observation' in payload:
                 # Received observation from network
-                network_observation = msg['observation']
-                network_states = msg.get('states', states)
+                network_observation = payload['observation']
+                network_states = payload.get('states', states)
                 
                 # Calculate observation latency
-                obs_latency = self._current_time - msg['timestamp']
+                obs_latency = self.time_manager.now() - payload['timestamp']
                 self._network_latencies.append({
                     'type': 'observation',
                     'latency': obs_latency,
-                    'time': self._current_time
+                    'time': self.time_manager.now()
                 })
         
         # Apply the received action (which may be delayed)
@@ -279,6 +332,18 @@ class Env:
             'num_messages_received': len(messages)
         }
         
+        # Add real network statistics if available
+        if self.real_network_client:
+            network_stats = self.real_network_client.get_stats()
+            info['real_network_stats'] = network_stats
+            # Update network latencies with actual measured values
+            if network_stats['average_latency_ms'] > 0:
+                self._network_latencies.append({
+                    'type': 'real_network',
+                    'latency': network_stats['average_latency_ms'] / 1000.0,  # Convert to seconds
+                    'time': self.time_manager.now()
+                })
+        
         # Return the network-delayed observation (what the controller sees)
         return network_observation, reward, done, info
     
@@ -290,9 +355,29 @@ class Env:
         """
         return self.handler.render()
     
+    def sync_to_time(self, time: float) -> None:
+        """TimeSubscriber interface - called when time is synchronized."""
+        # Clear processed messages from handlers
+        self.robot_handler.clear()
+        self.controller_handler.clear()
+    
+    def configure_network(self, config: NetworkControlConfig) -> None:
+        """Configure network parameters."""
+        self.network_control.configure(config)
+    
     def close(self) -> None:
         """Close the environment and clean up resources."""
         logger.info("Closing FogSim environment")
+        
+        # Unregister from time manager
+        self.time_manager.unregister_subscriber(self)
+        
+        # Reset network control
+        self.network_control.reset()
+        
+        # Close real network client if used
+        if self.real_network_client:
+            self.real_network_client.stop()
         
         # Close handler
         self.handler.close()
@@ -390,3 +475,17 @@ class Env:
             return len(data) * 100.0  # Rough estimate
         else:
             return 1000.0  # Default size
+    
+    def _calculate_network_delay(self, data: Any) -> float:
+        """Calculate network delay based on mode and data size."""
+        if self.mode == SimulationMode.VIRTUAL:
+            # Virtual mode: use configured delays
+            return 0.01  # 10ms default
+        elif self.mode == SimulationMode.SIMULATED_NET:
+            # Let network simulator calculate delay
+            size = self._estimate_message_size(data)
+            # Simple model: 10ms base + size-dependent delay
+            return 0.01 + (size / 1e7)  # 10MB/s
+        else:  # REAL_NET
+            # Real network: no artificial delay
+            return 0.0

@@ -4,6 +4,10 @@ import numpy as np
 import time
 import logging
 
+from .time_backend import UnifiedTimeManager, SimulationMode, TimeSubscriber
+from .message_passing import MessageBus, MessageHandler as MessageHandlerInterface, TimedMessage
+from .network_control import NetworkControlManager, NetworkConfig
+
 # Set up logging
 logger = logging.getLogger(__name__)
 
@@ -28,22 +32,21 @@ class NetworkSimulatorProtocol(Protocol):
         ...
 
 
-class TimeManager:
-    """Manages simulation time progression."""
+class LegacyTimeManager:
+    """Legacy time manager for backward compatibility."""
     
-    def __init__(self, timestep: float):
-        self.timestep = timestep
-        self.current_time = timestep
-        self._last_step_time: Optional[float] = None
+    def __init__(self, unified_manager: UnifiedTimeManager):
+        self.unified_manager = unified_manager
+        self.timestep = unified_manager.timestep
     
     def advance_time(self) -> None:
         """Advance the simulation time by one timestep."""
-        self.current_time += self.timestep
+        self.unified_manager.advance_time()
         logger.info("Advanced simulation time to %f", self.current_time)
     
     def get_current_time(self) -> float:
         """Get the current simulation time."""
-        return self.current_time
+        return self.unified_manager.now()
     
     def get_timestep(self) -> float:
         """Get the simulation timestep."""
@@ -51,39 +54,80 @@ class TimeManager:
     
     def reset_time(self) -> None:
         """Reset time to initial state."""
-        self.current_time = self.timestep
-        self._last_step_time = None
+        self.unified_manager.reset()
+    
+    @property
+    def current_time(self) -> float:
+        return self.unified_manager.now()
+    
+    @current_time.setter
+    def current_time(self, value: float) -> None:
+        # This is a compatibility hack - should not be used
+        logger.warning("Direct time setting is deprecated")
 
 
-class MessageHandler:
-    """Handles message sending and receiving through network simulator."""
+class LegacyMessageHandler:
+    """Legacy message handler for backward compatibility."""
     
     CLIENT_TO_SERVER_FLOW = 0
     SERVER_TO_CLIENT_FLOW = 1
     
-    def __init__(self, network_simulator: NetworkSimulatorProtocol):
-        self.network_simulator = network_simulator
+    def __init__(self, message_bus: MessageBus, node_id: str):
+        self.message_bus = message_bus
+        self.node_id = node_id
+        self.pending_messages = []
+        
+        # Register a handler to collect messages
+        handler = LegacyMessageCollector(self.pending_messages)
+        self.message_bus.register_handler(node_id, handler)
     
     def process_messages(self, current_time: float) -> List[Any]:
         """Process any messages that should be visible at the current timestep."""
         logger.info("Processing network messages at time %f", current_time)
-        self.network_simulator.run_until(current_time)
-        messages = self.network_simulator.get_ready_messages()
+        
+        # Messages are automatically processed by the message bus
+        # Return and clear pending messages
+        messages = list(self.pending_messages)
+        self.pending_messages.clear()
+        
         logger.info("Retrieved %d messages ready for processing", len(messages))
         return messages
     
     def send_message(self, message: Any, flow_id: int = 0, size: float = 1000.0) -> str:
         """Send a message through the network simulator."""
         logger.info("Sending message with flow_id=%d, size=%f", flow_id, size)
-        msg_id = self.network_simulator.register_packet(message, flow_id, size)
-        logger.info("Message sent with ID: %s", msg_id)
-        return msg_id
+        
+        # Map flow_id to sender/receiver
+        if flow_id == self.CLIENT_TO_SERVER_FLOW:
+            sender = f"{self.node_id}_client"
+            receiver = f"{self.node_id}_server"
+        else:
+            sender = f"{self.node_id}_server"
+            receiver = f"{self.node_id}_client"
+        
+        # Calculate delay based on size (simple model)
+        delay = size / 1e6  # 1MB/s for now
+        
+        self.message_bus.send(sender, receiver, message, delay)
+        return f"{sender}->{receiver}-{current_time}"
 
 
-class BaseCoSimulator(ABC):
+class LegacyMessageCollector(MessageHandlerInterface):
+    """Collects messages for legacy interface."""
+    
+    def __init__(self, message_list: List[Any]):
+        self.message_list = message_list
+    
+    def handle_message(self, message: TimedMessage) -> None:
+        """Collect message payload."""
+        self.message_list.append(message.payload)
+
+
+class BaseCoSimulator(TimeSubscriber, ABC):
     """Base class for co-simulation between robotics and network simulation."""
     
-    def __init__(self, network_simulator: Any, robotics_simulator: Any, timestep: float = 0.1):
+    def __init__(self, network_simulator: Any, robotics_simulator: Any, 
+                 timestep: float = 0.1, mode: SimulationMode = SimulationMode.VIRTUAL):
         """
         Initialize the co-simulator.
         
@@ -91,24 +135,34 @@ class BaseCoSimulator(ABC):
             network_simulator: Instance of network simulator (e.g., NSPyNetworkSimulator)
             robotics_simulator: Instance of robotics simulator (e.g., gym, carla)
             timestep: Unified simulation timestep in seconds (default: 0.1)
+            mode: Simulation mode (VIRTUAL, SIMULATED_NET, or REAL_NET)
         """
         self.network_simulator = network_simulator
         self.robotics_simulator = robotics_simulator
+        self.mode = mode
         
         # Set a single unified timestep for all simulation components
         self.timestep = timestep
         
-        # Initialize time manager
-        self._time_manager = TimeManager(timestep)
+        # Initialize unified time manager
+        self._unified_time_manager = UnifiedTimeManager(mode, timestep)
+        self._unified_time_manager.register_subscriber(self)
         
-        # Initialize message handler
-        self._message_handler = MessageHandler(network_simulator)
+        # Initialize message bus
+        self._message_bus = MessageBus(self._unified_time_manager, network_simulator)
+        
+        # Initialize network control
+        self._network_control = NetworkControlManager(mode, network_simulator=network_simulator)
+        
+        # Legacy compatibility
+        self._time_manager = LegacyTimeManager(self._unified_time_manager)
+        self._message_handler = LegacyMessageHandler(self._message_bus, "cosim")
         
         # Define flow IDs for different message types (for backward compatibility)
-        self.CLIENT_TO_SERVER_FLOW = MessageHandler.CLIENT_TO_SERVER_FLOW
-        self.SERVER_TO_CLIENT_FLOW = MessageHandler.SERVER_TO_CLIENT_FLOW
+        self.CLIENT_TO_SERVER_FLOW = LegacyMessageHandler.CLIENT_TO_SERVER_FLOW
+        self.SERVER_TO_CLIENT_FLOW = LegacyMessageHandler.SERVER_TO_CLIENT_FLOW
         
-        logger.info("BaseCoSimulator initialized with unified timestep: %f", self.timestep)
+        logger.info("BaseCoSimulator initialized with mode: %s, timestep: %f", mode.value, self.timestep)
         
     @abstractmethod
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict]:
@@ -182,7 +236,7 @@ class BaseCoSimulator(ABC):
     
     def _advance_time(self) -> None:
         """Advance the simulation time by one timestep."""
-        self._time_manager.advance_time()
+        self._unified_time_manager.advance_time()
         
     def get_current_time(self) -> float:
         """
@@ -191,7 +245,7 @@ class BaseCoSimulator(ABC):
         Returns:
             float: Current simulation time in seconds
         """
-        return self._time_manager.get_current_time()
+        return self._unified_time_manager.now()
     
     def get_timestep(self) -> float:
         """
@@ -200,20 +254,31 @@ class BaseCoSimulator(ABC):
         Returns:
             float: Unified simulation timestep in seconds
         """
-        return self._time_manager.get_timestep()
+        return self.timestep
     
     @property
     def current_time(self) -> float:
         """Property for backward compatibility."""
-        return self._time_manager.get_current_time()
+        return self._unified_time_manager.now()
     
     @current_time.setter
     def current_time(self, value: float) -> None:
         """Setter for backward compatibility."""
-        self._time_manager.current_time = value
+        logger.warning("Direct time setting is deprecated in new architecture")
+    
+    def sync_to_time(self, time: float) -> None:
+        """TimeSubscriber interface - called when time is synchronized."""
+        # Process any pending network messages
+        self._process_network_messages()
+    
+    def configure_network(self, config: NetworkConfig) -> None:
+        """Configure network parameters (for modes 2 and 3)."""
+        self._network_control.configure(config)
     
     def close(self) -> None:
         """Clean up resources."""
         logger.info("Closing simulators")
+        self._unified_time_manager.unregister_subscriber(self)
+        self._network_control.reset()
         self.robotics_simulator.close()
         self.network_simulator.close() 
