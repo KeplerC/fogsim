@@ -111,7 +111,8 @@ def run_scenario(world, destination_parking_spot, parked_spots, latency, ious, r
         with spawn_actors(world, destination_parking_spot, parked_spots) as actors:
             # Initialize ego vehicle
             car = town04_spawn_ego_vehicle(world, destination_parking_spot)
-            recording_cam = car.init_recording(recording_file)
+            if recording_file:
+                recording_cam = car.init_recording(recording_file)
             
             # Initialize perception with static obstacles
             static_bbs = actors['parked_cars_bbs'] + actors['traffic_cone_bbs']
@@ -144,7 +145,8 @@ def run_scenario(world, destination_parking_spot, parked_spots, latency, ious, r
                 
                 # Execute step
                 car.run_step()
-                car.process_recording_frames(latency=latency)
+                if recording_file:
+                    car.process_recording_frames(latency=latency)
                 frame_idx += 1
             
             # Calculate and record IOU
@@ -193,6 +195,15 @@ def plot_iou_results(latency_ious):
 
 def main():
     """Main experiment runner."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Parking Experiment")
+    parser.add_argument("--no-video", action="store_true", 
+                       help="Skip video recording for faster execution")
+    parser.add_argument("--no-plot", action="store_true",
+                       help="Skip visualization plotting")
+    args = parser.parse_args()
+    
     recording_file = None
     
     try:
@@ -201,9 +212,10 @@ def main():
         world = town04_load(client)
         town04_spectator_bev(world)
         
-        # Setup video recording
-        recording_file = iio.imopen('./test.mp4', 'w', plugin='pyav')
-        recording_file.init_video_stream('vp9', fps=VIDEO_FPS)
+        # Setup video recording if not disabled
+        if not args.no_video:
+            recording_file = iio.imopen('./test.mp4', 'w', plugin='pyav')
+            recording_file.init_video_stream('vp9', fps=VIDEO_FPS)
         
         # Run experiments for each latency configuration
         latency_ious = []
@@ -222,9 +234,12 @@ def main():
             if ious:
                 print(f'  Results: mean IOU = {np.mean(ious):.3f}, std = {np.std(ious):.3f}')
         
-        # Generate visualization
-        plot_iou_results(latency_ious)
-        print('\nResults saved to iou_scatter.png')
+        # Generate visualization if not disabled
+        if not args.no_plot:
+            plot_iou_results(latency_ious)
+            print('\nResults saved to iou_scatter.png')
+        else:
+            print('\nVisualization skipped (--no-plot option)')
         
     except KeyboardInterrupt:
         print('\nSimulation interrupted by user')

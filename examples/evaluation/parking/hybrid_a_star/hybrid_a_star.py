@@ -300,7 +300,7 @@ def hybrid_a_star_planning(start, goal, ox, oy, xy_resolution, yaw_resolution):
             current, goal_node, config, ox, oy, obstacle_kd_tree)
 
         if is_updated:
-            print("path found")
+            # print("path found")  # Commented to reduce output noise
             break
 
         for neighbor in get_neighbors(current, config, ox, oy,
