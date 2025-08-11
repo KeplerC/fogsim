@@ -22,6 +22,8 @@ import torch
 import json
 from dataclasses import dataclass, asdict
 from pathlib import Path
+import cv2
+import gymnasium as gym
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
@@ -78,8 +80,8 @@ PREDEFINED_SCENARIOS = {
         network_delay=0.005,
         packet_loss_rate=0.0,
         source_rate=8000000000.0, 
-        success_threshold=195.0,
-        max_episode_steps=500
+        success_threshold=4950.0,
+        max_episode_steps=5000
     ),
     
     # Ant - MuJoCo locomotion task
@@ -203,7 +205,8 @@ class TrainingMetricsCallback(BaseCallback):
                     recent_success_rate = np.mean(self.success_episodes[-100:]) if len(self.success_episodes) >= 100 else np.mean(self.success_episodes)
                     avg_delay = np.mean(self.network_delays[-100:]) if self.network_delays else 0
                     elapsed = time.time() - self.start_time
-                    print(f"  Episode {self.episode_count} ({elapsed:.1f}s): Success rate = {recent_success_rate*100:.1f}%, Avg delay = {avg_delay:.1f}ms")
+                    avg_timesteps = np.mean(self.episode_lengths[-100:]) if len(self.episode_lengths) >= 100 else np.mean(self.episode_lengths)
+                    print(f"  Episode {self.episode_count} ({elapsed:.1f}s): Success rate = {recent_success_rate*100:.1f}%, Avg timesteps survived = {avg_timesteps:.1f}, Avg delay = {avg_delay:.1f}ms")
         
         return True
     
@@ -419,12 +422,144 @@ def train_agent_for_duration(mode: SimulationMode,
     }
 
 
+def render_cartpole_frame(env, action: int = None, timestep: int = 0) -> np.ndarray:
+    """Render a CartPole frame with action indicator and timestep.
+    
+    Args:
+        env: The CartPole environment
+        action: The action taken (0=left, 1=right, None=no action)
+        timestep: Current timestep survived
+    
+    Returns:
+        RGB frame as numpy array
+    """
+    # Try to get the render mode and render appropriately
+    try:
+        # For Gymnasium environments with render_mode='rgb_array'
+        if hasattr(env, 'render_mode') and env.render_mode == 'rgb_array':
+            frame = env.render()
+        else:
+            # Try to render anyway
+            frame = env.render()
+    except:
+        frame = None
+    
+    if frame is None:
+        # If render returns None, create a blank frame
+        frame = np.zeros((400, 600, 3), dtype=np.uint8)
+    
+    # Add action indicator overlay
+    if action is not None:
+        height, width = frame.shape[:2]
+        
+        # Create overlay for action visualization
+        overlay = frame.copy()
+        
+        # Define arrow parameters
+        arrow_y = int(height * 0.1)  # Position near top
+        arrow_length = int(width * 0.15)
+        arrow_thickness = 3
+        
+        if action == 0:  # Left action
+            # Draw left arrow
+            start_point = (int(width * 0.3), arrow_y)
+            end_point = (int(width * 0.3 - arrow_length), arrow_y)
+            cv2.arrowedLine(overlay, start_point, end_point, 
+                          (255, 0, 0), arrow_thickness, tipLength=0.3)
+            # Add text
+            cv2.putText(overlay, "LEFT", (int(width * 0.15), arrow_y - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+        elif action == 1:  # Right action
+            # Draw right arrow
+            start_point = (int(width * 0.7), arrow_y)
+            end_point = (int(width * 0.7 + arrow_length), arrow_y)
+            cv2.arrowedLine(overlay, start_point, end_point,
+                          (0, 255, 0), arrow_thickness, tipLength=0.3)
+            # Add text
+            cv2.putText(overlay, "RIGHT", (int(width * 0.75), arrow_y - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
+        # Blend overlay with original frame
+        alpha = 0.8
+        frame = cv2.addWeighted(frame, 1 - alpha, overlay, alpha, 0)
+    
+    # Add timestep counter
+    height, width = frame.shape[:2]
+    text = f"Timesteps Survived: {timestep}"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.8
+    thickness = 2
+    text_size = cv2.getTextSize(text, font, font_scale, thickness)[0]
+    text_x = (width - text_size[0]) // 2
+    text_y = int(height * 0.9)
+    
+    # Add background rectangle for better visibility
+    cv2.rectangle(frame, 
+                  (text_x - 10, text_y - text_size[1] - 10),
+                  (text_x + text_size[0] + 10, text_y + 10),
+                  (0, 0, 0), -1)
+    
+    # Add the text
+    cv2.putText(frame, text, (text_x, text_y),
+                font, font_scale, (255, 255, 255), thickness)
+    
+    return frame
+
+
+def save_video_frames(frames: List[np.ndarray], output_path: str, fps: int = 30):
+    """Save a list of frames as a video file.
+    
+    Args:
+        frames: List of RGB frames as numpy arrays
+        output_path: Path to save the video file
+        fps: Frames per second for the output video
+    """
+    if not frames:
+        print("No frames to save")
+        return
+    
+    # Get frame dimensions from first frame
+    height, width = frames[0].shape[:2]
+    
+    # Define codec and create VideoWriter
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    
+    # Write frames to video
+    for frame in frames:
+        # Convert RGB to BGR for OpenCV
+        bgr_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        out.write(bgr_frame)
+    
+    # Release the video writer
+    out.release()
+    print(f"Video saved: {output_path} ({len(frames)} frames at {fps} fps)")
+
+
 def evaluate_trained_model(model: PPO, mode: SimulationMode, 
                          config: RLScenarioConfig,
-                         num_episodes: int = 100) -> float:
-    """Evaluate a trained PPO model's performance."""
+                         num_episodes: int = 100,
+                         save_video: bool = False,
+                         video_path: str = None) -> float:
+    """Evaluate a trained PPO model's performance.
     
-    handler = GymHandler(env_name=config.env_name)
+    Args:
+        model: Trained PPO model
+        mode: Simulation mode to use
+        config: Scenario configuration
+        num_episodes: Number of episodes to evaluate
+        save_video: Whether to save a video of the last episode
+        video_path: Path to save the video (auto-generated if None)
+    """
+    
+    # Create handler with render mode if saving video for CartPole
+    if save_video and 'CartPole' in config.env_name:
+        # Create a special environment with render_mode for video recording
+        import gymnasium as gym
+        render_env = gym.make(config.env_name, render_mode='rgb_array')
+        handler = GymHandler(env=render_env)
+    else:
+        handler = GymHandler(env_name=config.env_name)
     
     # Configure network with same settings as training
     network_config = NetworkConfig()
@@ -436,17 +571,32 @@ def evaluate_trained_model(model: PPO, mode: SimulationMode,
     
     successes = 0
     
-    for _ in range(num_episodes):
+    # Prepare video recording for the last episode if requested
+    video_frames = []
+    should_record_this_episode = False
+    
+    for episode_idx in range(num_episodes):
+        # Record video for the last episode only
+        should_record_this_episode = save_video and (episode_idx == num_episodes - 1)
+        
         observation, _ = fogsim.reset()
         episode_length = 0
+        episode_reward = 0
         
         done = False
         while not done and episode_length < config.max_episode_steps:
             # Use PPO model to predict action
             action, _ = model.predict(observation.astype(np.float32), deterministic=True)
-            observation, _, _, termination, timeout, _ = fogsim.step(int(action)) 
+            
+            # Capture frame for video if recording
+            if should_record_this_episode and 'CartPole' in config.env_name:
+                frame = render_cartpole_frame(fogsim.handler.env, action, episode_length)
+                video_frames.append(frame)
+            
+            observation, reward, _, termination, timeout, _ = fogsim.step(int(action)) 
             done = termination or timeout
             episode_length += 1
+            episode_reward += reward
         
         # Check success based on environment type
         if 'CartPole' in config.env_name:
@@ -459,6 +609,13 @@ def evaluate_trained_model(model: PPO, mode: SimulationMode,
                 successes += 1
     
     fogsim.close()
+    
+    # Save video if frames were collected
+    if video_frames and save_video:
+        if video_path is None:
+            video_path = f"inference_{config.name}_{mode.value}_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
+        save_video_frames(video_frames, video_path, fps=30)
+        print(f"  Saved inference video to: {video_path}")
     
     return successes / num_episodes
 
@@ -769,8 +926,9 @@ def main():
                        choices=list(PREDEFINED_SCENARIOS.keys()), 
                        help="Predefined scenarios to run (default: run 4 scenarios)")
     parser.add_argument("--config", type=str, help="Path to custom config JSON file")
-    parser.add_argument("--trials", type=int, default=3, help="Number of trials per mode")
+    parser.add_argument("--trials", type=int, default=1, help="Number of trials per mode")
     parser.add_argument("--evaluate", action="store_true", help="Evaluate trained models after training")
+    parser.add_argument("--save-video", action="store_true", help="Save inference video for the final policy")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument("--save-config", type=str, help="Save current config to JSON file")
     parser.add_argument("--device", type=str, choices=["auto", "cuda", "cpu"], default="auto",
@@ -890,13 +1048,19 @@ def main():
             print("="*50)
             
             for result in results:
+                # Determine if we should save video (only for CartPole and if requested)
+                should_save_video = args.save_video and 'CartPole' in config.env_name
+                
                 if 'model' in result:
                     # Single trial - evaluate the model
+                    video_path = f"inference_{config.name}_{result['mode'].value}.mp4" if should_save_video else None
                     eval_success_rate = evaluate_trained_model(
                         result['model'], 
                         result['mode'],
                         config,
-                        num_episodes=100
+                        num_episodes=100,
+                        save_video=should_save_video,
+                        video_path=video_path
                     )
                     print(f"{result['mode'].value.upper()} - Evaluation Success Rate: {eval_success_rate*100:.1f}%")
                 elif 'all_results' in result:
@@ -904,11 +1068,14 @@ def main():
                     best_idx = np.argmax([r['final_success_rate'] for r in result['all_results']])
                     best_model = result['all_results'][best_idx].get('model')
                     if best_model:
+                        video_path = f"inference_{config.name}_{result['mode'].value}_best.mp4" if should_save_video else None
                         eval_success_rate = evaluate_trained_model(
                             best_model,
                             result['mode'],
                             config,
-                            num_episodes=100
+                            num_episodes=100,
+                            save_video=should_save_video,
+                            video_path=video_path
                         )
                         print(f"{result['mode'].value.upper()} - Best Model Evaluation Success Rate: {eval_success_rate*100:.1f}%")
     
