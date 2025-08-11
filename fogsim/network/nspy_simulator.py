@@ -71,6 +71,9 @@ class NSPyNetworkSimulator:
         self.sink = PacketSink(self.env)
         self.vc_server.out = self.sink
         
+        # CRITICAL FIX: Start the VirtualClock server process
+        self.server_process = self.env.process(self.vc_server.run())
+        
         # Message tracking
         self.packet_tracker = packet_tracker or PacketTracker()
         
@@ -134,9 +137,15 @@ class NSPyNetworkSimulator:
         """Process packet arrivals up to the specified time point."""
         delivered_packet_ids = set()
         
-        for flow_id in list(self.packet_tracker.last_checked_arrivals.keys()):
+        # Check all flows that have sent packets
+        all_flow_ids = set(self.packet_tracker.last_checked_arrivals.keys())
+        # Also check flows that have arrivals in the sink
+        if hasattr(self.sink, 'arrivals'):
+            all_flow_ids.update(self.sink.arrivals.keys())
+        
+        for flow_id in all_flow_ids:
             # Check if this flow has any arrivals to process
-            if flow_id in self.sink.arrivals:
+            if flow_id in self.sink.arrivals and self.sink.arrivals[flow_id]:
                 arrivals = self.sink.arrivals[flow_id]
                 
                 # Get last checked index for this flow
@@ -201,6 +210,10 @@ class NSPyNetworkSimulator:
         )
         self.sink = PacketSink(self.env)
         self.vc_server.out = self.sink
+        
+        # CRITICAL FIX: Restart the VirtualClock server process
+        self.server_process = self.env.process(self.vc_server.run())
+        
         self.packet_tracker.reset()
     
     def close(self) -> None:

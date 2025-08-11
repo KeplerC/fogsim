@@ -56,7 +56,7 @@ class ParkingScenarioConfig:
     num_random_cars: int = 25
     replan_interval: int = 10  # Frames between replanning
     distance_threshold: float = 10.0  # Distance to trigger replanning  
-    max_episode_steps: int = 1000  # Reasonable limit to prevent infinite loops
+    max_episode_steps: int = 10000  # Reasonable limit to prevent infinite loops
     video_fps: int = 30
     traffic_cone_positions: List[Tuple[int, int]] = None
     walker_positions: List[Tuple[int, int]] = None
@@ -85,20 +85,23 @@ PREDEFINED_SCENARIOS = {
     
     "low_latency": ParkingScenarioConfig(
         name="low_latency",
-        network_delay=0.05,  # 50ms
+        network_delay=0.01,  # 10ms (reasonable for CARLA timestep)
         packet_loss_rate=0.001,  # 0.1% loss
+        source_rate=1e6,  # 1 Mbps for fast delivery
     ),
     
     "medium_latency": ParkingScenarioConfig(
         name="medium_latency", 
-        network_delay=0.15,  # 150ms
+        network_delay=0.025,  # 25ms (half of typical CARLA timestep)
         packet_loss_rate=0.01,  # 1% loss
+        source_rate=500e3,  # 500 Kbps
     ),
     
     "high_latency": ParkingScenarioConfig(
         name="high_latency",
-        network_delay=0.3,  # 300ms
+        network_delay=0.04,  # 40ms (close to CARLA timestep)
         packet_loss_rate=0.03,  # 3% loss
+        source_rate=200e3,  # 200 Kbps
     ),
 }
 
@@ -129,9 +132,11 @@ class ParkingHandler(BaseHandler):
         self._observation = None
         self._last_iou = 0.0
         self._episode_done = False
+        self._parking_time = None  # Time taken to park (in seconds)
         
-        # NEW: Buffer for handling delayed actions
-        self._last_action = None  # Store last action for when network delays cause None
+        # Track planning state
+        self._planning_active = False  # Whether planner has a valid plan
+        self._last_delayed_obs = None  # Store last delayed observation
         
     def launch(self) -> None:
         """Launch CARLA and initialize the parking scenario."""
@@ -241,7 +246,9 @@ class ParkingHandler(BaseHandler):
         self.frame_idx = 0
         self._episode_done = False
         self._last_iou = 0.0
-        self._last_action = None  # Reset action buffer
+        self._planning_active = False
+        self._last_delayed_obs = None
+        self._parking_time = None  # Reset parking time
         
         # No initial world.tick() or car.localize() or car.plan() here
         # They will be done in the main loop like the original
@@ -294,9 +301,12 @@ class ParkingHandler(BaseHandler):
         # Check if done
         self._episode_done = is_done(self.car)
         
-        # Calculate IoU if parked
+        # Calculate IoU and parking time if parked
         if self._episode_done:
             self._last_iou = self.car.iou()
+            if self._parking_time is None:
+                # Calculate parking time (frames * timestep)
+                self._parking_time = self.frame_idx * self.config.timestep
             
         # Create observation vector
         self._observation = np.array([
@@ -334,13 +344,14 @@ class ParkingHandler(BaseHandler):
             'observation': self._observation,
             'done': self._episode_done,
             'iou': self._last_iou,
+            'parking_time': self._parking_time,
             'frame': self.frame_idx,
             'car_position': [self.car.car.cur.x, self.car.car.cur.y] if self.car else [0, 0],
             'destination': [self.car.car.destination.x, self.car.car.destination.y] if self.car else [0, 0],
         }
         
     def step(self) -> None:
-        """Step the simulation forward matching original logic."""
+        """Step the simulation forward WITHOUT planning - just execute received commands."""
         if not self._launched:
             raise RuntimeError("Handler not launched. Call launch() first.")
         
@@ -355,15 +366,11 @@ class ParkingHandler(BaseHandler):
         self.world.tick()
         self.car.localize()
         
-        # Update perception (matches original update_perception logic)
+        # Update perception
         self._update_perception()
         
-        # Replan if needed (matches original should_replan)
-        if self._should_replan():
-            self.car.plan()
-        
-        # Execute step
-        self.car.run_step()
+        # DO NOT plan here - planning happens remotely and arrives through network
+        # Only execute based on received commands
         
         # Process recording frames if video recording is enabled
         if self.recording_file:
@@ -375,48 +382,58 @@ class ParkingHandler(BaseHandler):
     def step_with_action(self, action: Optional[np.ndarray]) -> Tuple:
         """Step environment with action and return results (required by FogSim).
         
-        Handles network delays properly:
-        - If action arrives from network: use it and save as last action
-        - If no action arrives (network delay): use last action if available
-        - If no action ever received: apply braking (safe default)
+        Correct architecture:
+        1. Observations go through network delay (handled by FogSim core)
+        2. Planner runs on the delayed observation (received as action)
+        3. Planner generates control commands
+        4. Control commands are executed on the vehicle
         
         Args:
-            action: Action to apply, or None if no action arrived from network yet
+            action: The delayed observation that traveled through the network.
+                   When action is not None, it contains the delayed observation
+                   that the planner should use.
         
         Returns:
             Tuple of (observation, reward, success, terminated, truncated, info)
         """
-        # Handle delayed actions with proper fallback logic
-        action_was_delayed = (action is None)
+        # The action parameter contains the delayed observation when available
+        delayed_observation = action
         
-        if action is not None:
-            # New action arrived from network
-            self._last_action = action
-            action_used = action
-            action_source = "network"
-        elif self._last_action is not None:
-            # No action arrived, but we have a previous action - hold it
-            action_used = self._last_action
-            action_source = "held_last"
-        else:
-            # No action arrived and no previous action - apply braking (safe default)
-            # This simulates emergency braking when network connection is lost
-            action_used = np.array([0.0, -1.0])  # [throttle=0, brake=-1]
-            action_source = "emergency_brake"
+        # PLANNING PHASE: Run planner on the DELAYED observation
+        # The planner should only run when we have a delayed observation
+        if delayed_observation is not None:
+            # The delayed observation has already gone through network delay
+            # Now the planner uses this delayed information to generate control commands
             
-            # Ideally, we would apply braking to the car here:
-            # if self.car:
-            #     self.car.actor.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0))
+            # Log for debugging
+            if self.frame_idx % 50 == 0:
+                print(f"Step {self.frame_idx}: Planning with delayed observation")
+            
+            # Run the planner to generate control commands
+            self.car.plan()
+            self._planning_active = True
         
-        # Execute step (parking logic is in step())
-        # Note: The parking handler uses its own planner, but in a real scenario
-        # the delayed action would affect the control
+        # EXECUTION PHASE: Execute the control commands generated by the planner
+        if self._planning_active:
+            # Execute the planned trajectory
+            self.car.run_step()
+        else:
+            # No plan available - just coast
+            if self.car and self.car.actor:
+                try:
+                    import carla
+                    self.car.actor.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0, steer=0.0))
+                except:
+                    pass
+        
+        # Execute physics simulation step (updates world, perception, etc.)
         self.step()
         
-        # Get new state
+        # Get fresh observation (this will be sent through network by FogSim)
         states = self.get_states()
+        fresh_observation = states['observation']
         
-        # Calculate simple reward
+        # Calculate reward
         reward = 0.0
         if states['done']:
             reward = states['iou'] * 100  # Bonus for good parking
@@ -426,12 +443,13 @@ class ParkingHandler(BaseHandler):
         truncated = self.frame_idx >= self.config.max_episode_steps
         success = states['iou'] >= 0.8 if states['done'] else False
         
-        # Add info about action delay and source
-        states['action_was_delayed'] = action_was_delayed
-        states['action_source'] = action_source
-        states['action_used'] = action_used is not None
+        # Add debugging info
+        states['delayed_obs_received'] = delayed_observation is not None
+        states['planning_active'] = self._planning_active
+        states['frame'] = self.frame_idx
         
-        return states['observation'], reward, success, terminated, truncated, states
+        # Return the FRESH observation (FogSim core will handle sending it through network)
+        return fresh_observation, reward, success, terminated, truncated, states
         
     def render(self) -> Optional[np.ndarray]:
         """Render is not implemented for this handler."""
@@ -510,17 +528,16 @@ def run_parking_scenario(mode: SimulationMode,
     # Reset environment
     obs, info = fogsim.reset()
     
-    # Run episode matching original loop structure
+    # Run episode
     step_count = 0
     total_latency = 0.0
     latency_samples = 0
     
     while not handler._episode_done and step_count < config.max_episode_steps:
-        # Send a dummy action to simulate network delays on control commands
-        # The parking uses an internal planner, but we simulate control delay
-        # by sending placeholder actions through the network
-        dummy_action = np.array([0.5, 0.0])  # [throttle, steer] placeholder
-        obs, reward, success, terminated, truncated, info = fogsim.step(dummy_action)
+        # Send the observation through the network
+        # FogSim will handle the network delay and deliver it as 'action' to step_with_action
+        # The observation becomes the 'action' parameter after going through network delay
+        obs, reward, success, terminated, truncated, info = fogsim.step(obs)
         
         # Debug: Print network latency info every 10 steps
         step_count += 1
@@ -535,21 +552,22 @@ def run_parking_scenario(mode: SimulationMode,
                 total_latency += avg_latency
                 latency_samples += 1
                 print(f'    Step {step_count}: avg_latency={avg_latency:.1f}ms, ' +
-                      f'using_delayed_obs={info.get("using_delayed_obs", False)}, ' +
-                      f'using_delayed_action={info.get("using_delayed_action", False)}')
+                      f'planning={info.get("planning_active", False)}, ' +
+                      f'delayed_obs={info.get("delayed_obs_received", False)}')
             else:
-                print(f'    Step {step_count}: No network messages received yet ' +
-                      f'(action_delayed={info.get("action_was_delayed", False)}, ' +
-                      f'obs_delayed={info.get("obs_was_delayed", False)})')
+                print(f'    Step {step_count}: No delayed observations yet, ' +
+                      f'planning={info.get("planning_active", False)}')
     
-    # Get final IoU
+    # Get final IoU and parking time
     final_iou = handler._last_iou
+    final_parking_time = handler._parking_time
     if verbose:
+        parking_time_str = f", Parking Time: {final_parking_time:.2f}s" if final_parking_time else ""
         if latency_samples > 0:
             avg_total_latency = total_latency / latency_samples
-            print(f'  IOU: {final_iou:.3f}, Avg Network Latency: {avg_total_latency:.1f}ms')
+            print(f'  IOU: {final_iou:.3f}{parking_time_str}, Avg Network Latency: {avg_total_latency:.1f}ms')
         else:
-            print(f'  IOU: {final_iou:.3f}, No network latency measured')
+            print(f'  IOU: {final_iou:.3f}{parking_time_str}, No network latency measured')
     
     # Clean up
     fogsim.close()
@@ -559,6 +577,7 @@ def run_parking_scenario(mode: SimulationMode,
         'destination': destination,
         'parked_spots': parked_spots,
         'iou': final_iou,
+        'parking_time': final_parking_time,
         'steps': handler.frame_idx,
     }
 
@@ -569,10 +588,15 @@ def run_experiments_for_mode(mode: SimulationMode,
                             video_enabled: bool = False,
                             mode_name: str = "",
                             latency_ms: float = 0,
-                            verbose: bool = True) -> List[float]:
-    """Run all scenarios for a single mode (matches original structure)."""
+                            verbose: bool = True) -> Tuple[List[float], List[Optional[float]]]:
+    """Run all scenarios for a single mode (matches original structure).
+    
+    Returns:
+        Tuple of (ious, parking_times)
+    """
     
     ious = []
+    parking_times = []
     
     for idx, (destination, parked_spots) in enumerate(scenarios):
         recording_file = None
@@ -594,15 +618,16 @@ def run_experiments_for_mode(mode: SimulationMode,
             verbose=verbose
         )
         ious.append(result['iou'])
+        parking_times.append(result.get('parking_time'))
         
         # Close the recording file for this run
         if recording_file:
             recording_file.close()
     
-    return ious
+    return ious, parking_times
 
 
-def plot_comparison_results(latency_ious: List[Tuple[str, float, List[float]]], 
+def plot_comparison_results(latency_ious: List[Tuple[str, float, List[float], List[Optional[float]]]], 
                            save_path: str = 'parking_fogsim_results.png'):
     """Plot comparison results across different FogSim modes and latencies."""
     
@@ -611,7 +636,7 @@ def plot_comparison_results(latency_ious: List[Tuple[str, float, List[float]]],
     colors = {'virtual': 'blue', 'simulated': 'orange', 'real': 'green'}
     markers = {'virtual': 'o', 'simulated': 's', 'real': '^'}
     
-    for mode_name, latency_ms, ious in latency_ious:
+    for mode_name, latency_ms, ious, parking_times in latency_ious:
         if len(ious) > 0:
             # Add some jitter to x-axis for visibility
             x_scatter = np.random.normal(loc=latency_ms, scale=2, size=len(ious))
@@ -636,10 +661,10 @@ def main():
     """Main experiment runner matching original structure."""
     parser = argparse.ArgumentParser(description="FogSim Parking Experiment")
     parser.add_argument("--modes", nargs='+', choices=['virtual', 'simulated', 'real'],
-                       default=['virtual', 'simulated', 'real'], 
+                       default=['virtual', 'real'], 
                        help="Modes to compare")
     parser.add_argument("--latencies", nargs='+', type=float,
-                       default=[10, 30, 50], 
+                       default=[0.03, 0.05, 0.1], 
                        help="Network latencies in ms (default: [0])")
     parser.add_argument("--video", action="store_true", 
                        help="Enable video recording (disabled by default for speed)")
@@ -695,7 +720,7 @@ def main():
                 
                 print(f'\n=== Running scenarios for {mode_name} mode, latency: {latency_ms}ms ===')
                 
-                ious = run_experiments_for_mode(
+                ious, parking_times = run_experiments_for_mode(
                     mode=mode,
                     config=config,
                     scenarios=SCENARIOS,
@@ -705,11 +730,14 @@ def main():
                     verbose=True
                 )
                 
-                latency_ious.append((mode_name, latency_ms, ious))
+                latency_ious.append((mode_name, latency_ms, ious, parking_times))
                 
                 # Print summary statistics
                 if ious:
                     print(f'  Results: mean IOU = {np.mean(ious):.3f}, std = {np.std(ious):.3f}')
+                    valid_times = [t for t in parking_times if t is not None]
+                    if valid_times:
+                        print(f'           mean parking time = {np.mean(valid_times):.2f}s, std = {np.std(valid_times):.2f}s')
         
         # Generate visualization if not disabled  
         if not args.no_plot:
@@ -724,10 +752,14 @@ def main():
         
         # Group results by mode for comparison
         mode_results = {}
-        for mode_name, latency_ms, ious in latency_ious:
+        mode_times = {}
+        for mode_name, latency_ms, ious, parking_times in latency_ious:
             if mode_name not in mode_results:
                 mode_results[mode_name] = []
+                mode_times[mode_name] = []
             mode_results[mode_name].extend(ious)
+            mode_times[mode_name].extend(parking_times)
+            # Note: We'll need to track parking times separately
         
         # Print mode comparison
         for mode_name, all_ious in mode_results.items():
@@ -736,6 +768,14 @@ def main():
                 print(f"  Mean IoU: {np.mean(all_ious):.3f} (±{np.std(all_ious):.3f})")
                 print(f"  Min IoU: {np.min(all_ious):.3f}")
                 print(f"  Max IoU: {np.max(all_ious):.3f}")
+                
+                # Print parking time statistics if available
+                if mode_name in mode_times:
+                    valid_times = [t for t in mode_times[mode_name] if t is not None]
+                    if valid_times:
+                        print(f"  Mean Parking Time: {np.mean(valid_times):.2f}s (±{np.std(valid_times):.2f}s)")
+                        print(f"  Min Parking Time: {np.min(valid_times):.2f}s")
+                        print(f"  Max Parking Time: {np.max(valid_times):.2f}s")
         
         # Compare virtual vs other modes if available
         if 'virtual' in mode_results and len(mode_results) > 1:

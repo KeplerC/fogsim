@@ -28,7 +28,7 @@ PARKED_VEHICLES = [
     'vehicle.mini.cooper_s',
     'vehicle.toyota.prius'
 ]
-DELTA_SECONDS = 0.1
+DELTA_SECONDS = 0.01
 
 def load_client():
     print(f"starting simulation on {HOST}:{PORT}")

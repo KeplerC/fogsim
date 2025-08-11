@@ -63,11 +63,11 @@ class RLScenarioConfig:
 
 # Predefined scenarios for different environments
 PREDEFINED_SCENARIOS = {
-    # CartPole - Classic control task
+    # CartPole - Classic control task with CONSISTENT UNITS
     "cartpole": RLScenarioConfig(
         name="cartpole",
         env_name="CartPole-v1",
-        learning_rate=1e-3,
+        learning_rate=1e-4,
         n_steps=32,
         batch_size=32,
         n_epochs=10,
@@ -75,8 +75,9 @@ PREDEFINED_SCENARIOS = {
         gae_lambda=0.95,
         clip_range=0.2,
         ent_coef=0.01,
-        network_delay=0.15,
-        packet_loss_rate=0.01,
+        network_delay=0.015,
+        packet_loss_rate=0.0,
+        source_rate=8000000000.0, 
         success_threshold=195.0,
         max_episode_steps=500
     ),
@@ -134,42 +135,6 @@ PREDEFINED_SCENARIOS = {
         success_threshold=4000.0,  # Reward threshold
         max_episode_steps=1000
     ),
-    
-    # CartPole with high latency network
-    "cartpole_high_latency": RLScenarioConfig(
-        name="cartpole_high_latency",
-        env_name="CartPole-v1",
-        learning_rate=1e-3,
-        n_steps=32,
-        batch_size=32,
-        n_epochs=10,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.01,
-        network_delay=0.5,  # 500ms
-        packet_loss_rate=0.05,  # 5% loss
-        success_threshold=195.0,
-        max_episode_steps=500
-    ),
-    
-    # Ant with low latency network
-    "ant_low_latency": RLScenarioConfig(
-        name="ant_low_latency",
-        env_name="Ant-v4",
-        learning_rate=3e-4,
-        n_steps=2048,
-        batch_size=64,
-        n_epochs=10,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.0,
-        network_delay=0.05,  # 50ms
-        packet_loss_rate=0.001,  # 0.1% loss
-        success_threshold=3000.0,
-        max_episode_steps=1000
-    )
 }
 
 
@@ -397,8 +362,8 @@ def train_agent_for_duration(mode: SimulationMode,
     
     # Create a temporary directory for logs (we won't save them, just capture)
     tmp_path = tempfile.mkdtemp()
-    # Configure logger with formats that allow value capture
-    new_logger = configure(tmp_path, ["stdout", "csv"])
+    # Configure logger with formats that allow value capture (csv only, no stdout to suppress output)
+    new_logger = configure(tmp_path, ["csv"])
     model.set_logger(new_logger)
     
     # Create callback to track metrics and handle time limit
@@ -735,7 +700,8 @@ def plot_training_results(results: List[Dict], config: RLScenarioConfig = None, 
         # Plot 5: Loss curves for different modes
         ax5.set_title('Training Loss Over Time')
         ax5.set_xlabel('Wallclock Time (s)')
-        ax5.set_ylabel('PPO Loss')
+        ax5.set_ylabel('PPO Loss (log scale)')
+        ax5.set_yscale('log')
         
         for i, result in enumerate(results):
             mode_name = mode_names.get(result['mode'].value, result['mode'].value)
@@ -803,7 +769,7 @@ def main():
                        choices=list(PREDEFINED_SCENARIOS.keys()), 
                        help="Predefined scenarios to run (default: run 4 scenarios)")
     parser.add_argument("--config", type=str, help="Path to custom config JSON file")
-    parser.add_argument("--trials", type=int, default=5, help="Number of trials per mode")
+    parser.add_argument("--trials", type=int, default=1, help="Number of trials per mode")
     parser.add_argument("--evaluate", action="store_true", help="Evaluate trained models after training")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument("--save-config", type=str, help="Save current config to JSON file")

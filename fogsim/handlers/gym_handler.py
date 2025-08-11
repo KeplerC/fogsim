@@ -113,9 +113,24 @@ class GymHandler(BaseHandler):
         return self._last_observation, self._last_info
     
     def step_with_action(self, action) -> tuple:
-        """Step environment with given action and return gym interface."""
+        """Step environment with given action and return gym interface.
+        
+        Args:
+            action: Action to execute, or None if no action arrived from network.
+                   When None, uses a safe default action (no-op or zero action).
+        """
         if not self._launched:
             raise RuntimeError("Handler not launched. Call launch() first.")
+        
+        # Handle delayed/missing actions
+        if action is None:
+            # No action received from network - use safe default
+            if hasattr(self._env.action_space, 'n'):
+                # Discrete action space - use action 0 (usually no-op or safe default)
+                action = 0
+            else:
+                # Continuous action space - use zero action (no movement)
+                action = np.zeros(self._env.action_space.shape, dtype=self._env.action_space.dtype)
         
         # Step the environment (handle both old and new Gym API)
         step_result = self._env.step(action)

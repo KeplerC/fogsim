@@ -127,13 +127,20 @@ class FogSim:
             else:
                 messages = []
             
+            # DEBUG: Log packet processing
+            if self.episode_step % 10 == 0 or messages:
+                pending = len(self.network.packet_tracker.pending_packets) if hasattr(self.network, 'packet_tracker') else 0
+                logger.info(f"Step {self.episode_step}: Network time={new_time:.3f}, messages_arrived={len(messages)}, pending_packets={pending}")
+            
             # Sort messages by type
             for msg in messages:
                 if isinstance(msg, dict):
                     if msg.get('type') == 'action':
                         arrived_actions.append(msg)
+                        logger.info(f"Action message arrived: {msg}")
                     elif msg.get('type') == 'observation':
                         arrived_observations.append(msg)
+                        logger.info(f"Observation message arrived: {msg}")
         
         # Step 3: Send NEW action through network (will arrive in future)
         if self.network and action is not None:
@@ -153,6 +160,11 @@ class FogSim:
             delayed_action = arrived_actions[-1]['data']
             if isinstance(delayed_action, list):
                 delayed_action = np.array(delayed_action)
+            # Debug logging
+            if self.episode_step % 100 == 0:
+                logger.info(f"FogSim Step {self.episode_step}: Delivering delayed action {delayed_action} from {len(arrived_actions)} arrived")
+        elif self.episode_step % 100 == 0:
+            logger.info(f"FogSim Step {self.episode_step}: No actions arrived yet")
         
         # Handler will use delayed_action if available, otherwise use its internal buffer
         obs, reward, success, termination, timeout, handler_info = self.handler.step_with_action(delayed_action)
