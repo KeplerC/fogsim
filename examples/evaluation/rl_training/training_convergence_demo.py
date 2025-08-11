@@ -185,11 +185,14 @@ class TrainingMetricsCallback(BaseCallback):
         self.network_delays = []
         self.losses = []  # Track PPO losses
         self.loss_timestamps = []  # Timestamps for losses
+        self.value_losses = []  # Track value losses
+        self.policy_losses = []  # Track policy losses
         self.start_time = time.time()
         self.episode_count = 0
         self.total_steps = 0
         self.max_duration = max_duration
         self.config = config
+        self.rollout_count = 0
         
     def _on_step(self) -> bool:
         # Check if max duration has been reached
@@ -200,15 +203,6 @@ class TrainingMetricsCallback(BaseCallback):
         
         # Track total steps
         self.total_steps += 1
-        
-        # Track losses periodically (every n_steps)
-        if hasattr(self.model, 'logger') and self.model.logger is not None:
-            # Check if we just completed a training batch
-            if self.n_calls % self.model.n_steps == 0 and self.n_calls > 0:
-                # Try to get the loss from the model
-                if hasattr(self.model, '_last_loss'):
-                    self.losses.append(self.model._last_loss)
-                    self.loss_timestamps.append(elapsed_time)
         
         # Check if episode ended
         if self.locals.get('dones', [False])[0]:
@@ -247,6 +241,28 @@ class TrainingMetricsCallback(BaseCallback):
                     print(f"  Episode {self.episode_count} ({elapsed:.1f}s): Success rate = {recent_success_rate*100:.1f}%, Avg delay = {avg_delay:.1f}ms")
         
         return True
+    
+    def _on_rollout_end(self) -> None:
+        """Called at the end of a rollout, before training."""
+        self.rollout_count += 1
+        elapsed_time = time.time() - self.start_time
+        
+        # Try to capture loss values from logger after rollout
+        # Note: These will be available after the first training iteration
+        if hasattr(self.model, 'logger') and self.model.logger is not None:
+            # Access the logger's name_to_value dictionary if it exists
+            if hasattr(self.model.logger, 'name_to_value'):
+                # Check for loss values that might have been logged
+                if 'train/loss' in self.model.logger.name_to_value:
+                    self.losses.append(self.model.logger.name_to_value['train/loss'])
+                    self.loss_timestamps.append(elapsed_time)
+                
+                # Also track individual loss components if available
+                if 'train/value_loss' in self.model.logger.name_to_value:
+                    self.value_losses.append(self.model.logger.name_to_value['train/value_loss'])
+                
+                if 'train/policy_gradient_loss' in self.model.logger.name_to_value:
+                    self.policy_losses.append(self.model.logger.name_to_value['train/policy_gradient_loss'])
 
 
 def train_agent_for_duration(mode: SimulationMode, 
@@ -356,22 +372,8 @@ def train_agent_for_duration(mode: SimulationMode,
     if verbose and device == 'cuda':
         print(f"  Using GPU for training: {torch.cuda.get_device_name()}")
     
-    # Custom PPO class to track losses
-    class PPOWithLossTracking(PPO):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self._last_loss = 0.0
-        
-        def train(self) -> None:
-            # Call parent train method
-            result = super().train()
-            # Try to capture the last loss value
-            if hasattr(self, 'logger') and self.logger is not None:
-                if 'train/loss' in self.logger.name_to_value:
-                    self._last_loss = self.logger.name_to_value['train/loss']
-            return result
-    
-    model = PPOWithLossTracking(
+    # Use standard PPO with proper logger setup
+    model = PPO(
         "MlpPolicy",
         vec_env,
         learning_rate=config.learning_rate,
@@ -384,9 +386,20 @@ def train_agent_for_duration(mode: SimulationMode,
         ent_coef=config.ent_coef,
         verbose=0,
         device=device,
-        # Additional optimizations for GPU
-        tensorboard_log=None,  # Disable tensorboard for speed
+        # Enable internal logging to capture metrics
+        tensorboard_log=None,  # We'll use internal logger instead
     )
+    
+    # Set up a simple logger to capture values
+    from stable_baselines3.common.logger import configure
+    from stable_baselines3.common.utils import set_random_seed
+    import tempfile
+    
+    # Create a temporary directory for logs (we won't save them, just capture)
+    tmp_path = tempfile.mkdtemp()
+    # Configure logger with formats that allow value capture
+    new_logger = configure(tmp_path, ["stdout", "csv"])
+    model.set_logger(new_logger)
     
     # Create callback to track metrics and handle time limit
     callback = TrainingMetricsCallback(max_duration=training_duration, config=config, 
@@ -428,6 +441,8 @@ def train_agent_for_duration(mode: SimulationMode,
         'network_delays': callback.network_delays,
         'losses': callback.losses,  # Add losses
         'loss_timestamps': callback.loss_timestamps,  # Add loss timestamps
+        'value_losses': callback.value_losses,  # Add value losses
+        'policy_losses': callback.policy_losses,  # Add policy losses
         'total_episodes': callback.episode_count,
         'total_steps': callback.total_steps,
         'final_success_rate': final_success_rate,

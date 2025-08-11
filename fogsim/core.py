@@ -92,7 +92,16 @@ class FogSim:
     
     def step(self, action) -> Tuple[np.ndarray, float, bool, bool, bool, Dict[str, Any]]:
         """
-        Execute one simulation step.
+        Execute one simulation step with proper network delays.
+        
+        The flow accounts for the fact that messages sent at time T arrive at time T+delay:
+        1. Advance time 
+        2. Run network simulation to current time to deliver any messages
+        3. Get delayed actions/observations that have arrived
+        4. Send NEW action through network (will arrive later)
+        5. Execute handler with delayed or buffered action
+        6. Send NEW observation through network (will arrive later)
+        7. Return delayed or fresh observation
         
         Args:
             action: Action to execute
@@ -100,50 +109,107 @@ class FogSim:
         Returns:
             observation, reward, success, termination, timeout, info
         """
-        # Advance time
+        # Step 1: Advance time
         self.clock.advance()
+        new_time = self.clock.now()
         
-        # Process network messages if applicable
-        network_info = {}
+        # Step 2: Process network to get delayed messages that have arrived
+        arrived_actions = []
+        arrived_observations = []
         if self.network:
-            if hasattr(self.network, 'process_messages'):
-                messages = self.network.process_messages(self.clock.now())
-            elif hasattr(self.network, 'get_ready_messages'):
-                # For NSPy simulator, run until current time first
-                if hasattr(self.network, 'run_until'):
-                    self.network.run_until(self.clock.now())
+            # Run network simulation up to current time
+            if hasattr(self.network, 'run_until'):
+                self.network.run_until(new_time)
+            
+            # Get messages that have arrived
+            if hasattr(self.network, 'get_ready_messages'):
                 messages = self.network.get_ready_messages()
             else:
                 messages = []
             
-            network_info = {
-                'network_latencies': [{'latency': msg.get('latency', 0)} for msg in messages],
-                'num_messages_received': len(messages)
-            }
+            # Sort messages by type
+            for msg in messages:
+                if isinstance(msg, dict):
+                    if msg.get('type') == 'action':
+                        arrived_actions.append(msg)
+                    elif msg.get('type') == 'observation':
+                        arrived_observations.append(msg)
         
-        # Execute handler step
-        obs, reward, success, termination, timeout, handler_info = self.handler.step_with_action(action)
-        
-        # Send network message if applicable
-        if self.network and not termination and not timeout:
-            message = {
+        # Step 3: Send NEW action through network (will arrive in future)
+        if self.network and action is not None:
+            action_msg = {
+                'type': 'action',
+                'data': action.tolist() if isinstance(action, np.ndarray) else action,
                 'step': self.episode_step,
-                'observation': obs.tolist() if isinstance(obs, np.ndarray) else obs,
-                'action': action.tolist() if isinstance(action, np.ndarray) else action
+                'send_time': new_time
             }
-            
-            if hasattr(self.network, 'send_message'):
-                self.network.send_message(message)
-            elif hasattr(self.network, 'register_packet'):
-                self.network.register_packet(message)
+            if hasattr(self.network, 'register_packet'):
+                self.network.register_packet(action_msg, flow_id=0)  # Actions on flow 0
+        
+        # Step 4: Execute handler with most recent arrived action (or let handler use its buffered action)
+        delayed_action = None
+        if arrived_actions:
+            # Use the most recent action that arrived
+            delayed_action = arrived_actions[-1]['data']
+            if isinstance(delayed_action, list):
+                delayed_action = np.array(delayed_action)
+        
+        # Handler will use delayed_action if available, otherwise use its internal buffer
+        obs, reward, success, termination, timeout, handler_info = self.handler.step_with_action(delayed_action)
+        
+        # Step 5: Send observation through network (it will be delayed)
+        if self.network and not termination and not timeout:
+            obs_msg = {
+                'type': 'observation',
+                'data': obs.tolist() if isinstance(obs, np.ndarray) else obs,
+                'step': self.episode_step,
+                'send_time': new_time
+            }
+            if hasattr(self.network, 'register_packet'):
+                self.network.register_packet(obs_msg, flow_id=1)  # Observations on flow 1
+        
+        # Step 6: Get delayed observation to return (or let caller handle None)
+        delayed_obs = None
+        if arrived_observations:
+            # Use the most recent observation that arrived
+            delayed_obs = arrived_observations[-1]['data']
+            if isinstance(delayed_obs, list):
+                delayed_obs = np.array(delayed_obs)
+        
+        # If we have a delayed observation, use it; otherwise return the fresh one
+        # The handler/caller should handle the None case appropriately
+        return_obs = delayed_obs if delayed_obs is not None else obs
+        
+        # Prepare network info
+        network_info = {
+            'network_delay_active': self.network is not None,
+            'actions_received': len(arrived_actions),
+            'observations_received': len(arrived_observations),
+            'action_was_delayed': delayed_action is None and action is not None,
+            'obs_was_delayed': delayed_obs is None,  # True if no delayed obs received (using fresh)
+            'using_delayed_obs': delayed_obs is not None,  # True if using a delayed observation
+            'using_delayed_action': delayed_action is not None,  # True if using a delayed action
+            'simulation_time': new_time
+        }
+        
+        # Add latency info if messages arrived
+        if arrived_actions or arrived_observations:
+            latencies = []
+            for msg in arrived_actions + arrived_observations:
+                if 'latency' in msg:
+                    latencies.append(msg['latency'])
+                elif 'send_time' in msg:
+                    latencies.append((new_time - msg['send_time']) * 1000)  # Convert to ms
+            if latencies:
+                network_info['avg_latency_ms'] = np.mean(latencies)
         
         # Combine info
-        info = {**handler_info, **network_info, 'simulation_time': self.clock.now()}
+        info = {**handler_info, **network_info}
         
-        self.current_obs = obs
+        self.current_obs = return_obs
         self.episode_step += 1
         
-        return obs, reward, success, termination, timeout, info
+        return return_obs, reward, success, termination, timeout, info
     
     def reset(self) -> Tuple[np.ndarray, Dict[str, Any]]:
         """

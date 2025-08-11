@@ -369,7 +369,8 @@ def calc_index(node, c):
           (node.y_index - c.min_y) * c.x_w + (node.x_index - c.min_x)
 
     if ind <= 0:
-        print("Error(calc_index):", ind)
+        # Suppress debug output for invalid indices (common during path planning)
+        pass  # print("Error(calc_index):", ind)
 
     return ind
 

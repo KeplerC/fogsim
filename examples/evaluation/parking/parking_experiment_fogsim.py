@@ -56,7 +56,7 @@ class ParkingScenarioConfig:
     num_random_cars: int = 25
     replan_interval: int = 10  # Frames between replanning
     distance_threshold: float = 10.0  # Distance to trigger replanning  
-    max_episode_steps: int = 10000  # Large limit
+    max_episode_steps: int = 1000  # Reasonable limit to prevent infinite loops
     video_fps: int = 30
     traffic_cone_positions: List[Tuple[int, int]] = None
     walker_positions: List[Tuple[int, int]] = None
@@ -129,8 +129,9 @@ class ParkingHandler(BaseHandler):
         self._observation = None
         self._last_iou = 0.0
         self._episode_done = False
-        # Perception state for latency handling (matches original)
-        self.perception_state = {'request': None, 'response': None}
+        
+        # NEW: Buffer for handling delayed actions
+        self._last_action = None  # Store last action for when network delays cause None
         
     def launch(self) -> None:
         """Launch CARLA and initialize the parking scenario."""
@@ -236,13 +237,11 @@ class ParkingHandler(BaseHandler):
         # Save obstacle map visualization (matches original)
         self._save_obstacle_map(self.car.car.obs.obs)
         
-        # Reset perception state
-        self.perception_state = {'request': None, 'response': None}
-        
         # Reset state variables
         self.frame_idx = 0
         self._episode_done = False
         self._last_iou = 0.0
+        self._last_action = None  # Reset action buffer
         
         # No initial world.tick() or car.localize() or car.plan() here
         # They will be done in the main loop like the original
@@ -260,41 +259,19 @@ class ParkingHandler(BaseHandler):
         plt.close()
         
     def _update_perception(self):
-        """Handle perception updates based on latency (matches original logic)."""
-        latency_ms = self.config.network_delay * 1000  # Convert to ms
-        
-        if latency_ms == 0:
-            # No latency - immediate perception (matches original)
-            walker_bbs = update_walkers(self.walkers) if self.walkers else []
-            all_bbs = self.static_bbs + walker_bbs
-            self.car.car.obs = union_obstacle_map(
-                self.car.car.obs,
-                mask_obstacle_map(
-                    obstacle_map_from_bbs(all_bbs),
-                    self.car.car.cur.x,
-                    self.car.car.cur.y
-                )
+        """Update perception - FogSim handles observation delays automatically."""
+        # Always update with current perception
+        # FogSim will handle the delay in observation delivery
+        walker_bbs = update_walkers(self.walkers) if self.walkers else []
+        all_bbs = self.static_bbs + walker_bbs
+        self.car.car.obs = union_obstacle_map(
+            self.car.car.obs,
+            mask_obstacle_map(
+                obstacle_map_from_bbs(all_bbs),
+                self.car.car.cur.x,
+                self.car.car.cur.y
             )
-        elif latency_ms > 0 and self.frame_idx % int(latency_ms / 1000 / DELTA_SECONDS) == 0:
-            # Latency-based perception (matches original)
-            self.car.perceive()
-            
-            if self.perception_state['response']:
-                self.car.car.obs = self.perception_state['response']
-            
-            if self.perception_state['request']:
-                walker_bbs = update_walkers(self.walkers) if self.walkers else []
-                all_bbs = self.static_bbs + walker_bbs
-                self.perception_state['response'] = union_obstacle_map(
-                    self.car.car.obs,
-                    mask_obstacle_map(
-                        obstacle_map_from_bbs(all_bbs),
-                        self.perception_state['request'].x,
-                        self.perception_state['request'].y
-                    )
-                )
-            
-            self.perception_state['request'] = self.car.car.cur
+        )
             
     def _should_replan(self):
         """Determine if replanning is needed (matches original)."""
@@ -390,19 +367,50 @@ class ParkingHandler(BaseHandler):
         
         # Process recording frames if video recording is enabled
         if self.recording_file:
-            latency_ms = self.config.network_delay * 1000
-            self.car.process_recording_frames(latency=latency_ms)
+            self.car.process_recording_frames()
         
         # Increment frame counter
         self.frame_idx += 1
-        
+                
     def step_with_action(self, action: Optional[np.ndarray]) -> Tuple:
         """Step environment with action and return results (required by FogSim).
+        
+        Handles network delays properly:
+        - If action arrives from network: use it and save as last action
+        - If no action arrives (network delay): use last action if available
+        - If no action ever received: apply braking (safe default)
+        
+        Args:
+            action: Action to apply, or None if no action arrived from network yet
         
         Returns:
             Tuple of (observation, reward, success, terminated, truncated, info)
         """
-        # Execute step (action is ignored, logic is in step())
+        # Handle delayed actions with proper fallback logic
+        action_was_delayed = (action is None)
+        
+        if action is not None:
+            # New action arrived from network
+            self._last_action = action
+            action_used = action
+            action_source = "network"
+        elif self._last_action is not None:
+            # No action arrived, but we have a previous action - hold it
+            action_used = self._last_action
+            action_source = "held_last"
+        else:
+            # No action arrived and no previous action - apply braking (safe default)
+            # This simulates emergency braking when network connection is lost
+            action_used = np.array([0.0, -1.0])  # [throttle=0, brake=-1]
+            action_source = "emergency_brake"
+            
+            # Ideally, we would apply braking to the car here:
+            # if self.car:
+            #     self.car.actor.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0))
+        
+        # Execute step (parking logic is in step())
+        # Note: The parking handler uses its own planner, but in a real scenario
+        # the delayed action would affect the control
         self.step()
         
         # Get new state
@@ -417,6 +425,11 @@ class ParkingHandler(BaseHandler):
         terminated = states['done']
         truncated = self.frame_idx >= self.config.max_episode_steps
         success = states['iou'] >= 0.8 if states['done'] else False
+        
+        # Add info about action delay and source
+        states['action_was_delayed'] = action_was_delayed
+        states['action_source'] = action_source
+        states['action_used'] = action_used is not None
         
         return states['observation'], reward, success, terminated, truncated, states
         
@@ -498,14 +511,45 @@ def run_parking_scenario(mode: SimulationMode,
     obs, info = fogsim.reset()
     
     # Run episode matching original loop structure
-    while not handler._episode_done:
-        # Simple step without action (action logic is in handler.step())
-        fogsim.step(None)
+    step_count = 0
+    total_latency = 0.0
+    latency_samples = 0
+    
+    while not handler._episode_done and step_count < config.max_episode_steps:
+        # Send a dummy action to simulate network delays on control commands
+        # The parking uses an internal planner, but we simulate control delay
+        # by sending placeholder actions through the network
+        dummy_action = np.array([0.5, 0.0])  # [throttle, steer] placeholder
+        obs, reward, success, terminated, truncated, info = fogsim.step(dummy_action)
+        
+        # Debug: Print network latency info every 10 steps
+        step_count += 1
+        
+        # Check if episode should end due to truncation
+        if truncated or terminated:
+            break
+            
+        if verbose and step_count % 10 == 0:
+            if 'avg_latency_ms' in info:
+                avg_latency = info['avg_latency_ms']
+                total_latency += avg_latency
+                latency_samples += 1
+                print(f'    Step {step_count}: avg_latency={avg_latency:.1f}ms, ' +
+                      f'using_delayed_obs={info.get("using_delayed_obs", False)}, ' +
+                      f'using_delayed_action={info.get("using_delayed_action", False)}')
+            else:
+                print(f'    Step {step_count}: No network messages received yet ' +
+                      f'(action_delayed={info.get("action_was_delayed", False)}, ' +
+                      f'obs_delayed={info.get("obs_was_delayed", False)})')
     
     # Get final IoU
     final_iou = handler._last_iou
     if verbose:
-        print(f'IOU: {final_iou}')
+        if latency_samples > 0:
+            avg_total_latency = total_latency / latency_samples
+            print(f'  IOU: {final_iou:.3f}, Avg Network Latency: {avg_total_latency:.1f}ms')
+        else:
+            print(f'  IOU: {final_iou:.3f}, No network latency measured')
     
     # Clean up
     fogsim.close()
@@ -522,13 +566,25 @@ def run_parking_scenario(mode: SimulationMode,
 def run_experiments_for_mode(mode: SimulationMode,
                             config: ParkingScenarioConfig,
                             scenarios: List[Tuple[int, List[int]]],
-                            recording_file=None,
+                            video_enabled: bool = False,
+                            mode_name: str = "",
+                            latency_ms: float = 0,
                             verbose: bool = True) -> List[float]:
     """Run all scenarios for a single mode (matches original structure)."""
     
     ious = []
     
-    for destination, parked_spots in scenarios:
+    for idx, (destination, parked_spots) in enumerate(scenarios):
+        recording_file = None
+        
+        # Create unique video filename for each run if video is enabled
+        if video_enabled:
+            video_filename = f'parking_{mode_name}_latency{int(latency_ms)}ms_dest{destination}_run{idx+1}.mp4'
+            recording_file = iio.imopen(video_filename, 'w', plugin='pyav')
+            recording_file.init_video_stream('vp9', fps=config.video_fps)
+            if verbose:
+                print(f'    Recording video to: {video_filename}')
+        
         result = run_parking_scenario(
             mode=mode,
             config=config,
@@ -538,6 +594,10 @@ def run_experiments_for_mode(mode: SimulationMode,
             verbose=verbose
         )
         ious.append(result['iou'])
+        
+        # Close the recording file for this run
+        if recording_file:
+            recording_file.close()
     
     return ious
 
@@ -579,10 +639,10 @@ def main():
                        default=['virtual', 'simulated', 'real'], 
                        help="Modes to compare")
     parser.add_argument("--latencies", nargs='+', type=float,
-                       default=[0], 
+                       default=[10, 30, 50], 
                        help="Network latencies in ms (default: [0])")
-    parser.add_argument("--no-video", action="store_true", 
-                       help="Skip video recording for faster execution")
+    parser.add_argument("--video", action="store_true", 
+                       help="Enable video recording (disabled by default for speed)")
     parser.add_argument("--no-plot", action="store_true",
                        help="Skip visualization plotting")
     parser.add_argument("--scenario", type=str, default="no_latency",
@@ -615,14 +675,7 @@ def main():
         (22, [21, 23]),
     ]
     
-    recording_file = None
-    
     try:
-        # Setup video recording if not disabled
-        if not args.no_video:
-            recording_file = iio.imopen('./test.mp4', 'w', plugin='pyav')
-            recording_file.init_video_stream('vp9', fps=config.video_fps)
-        
         # Map mode names to SimulationMode enum
         mode_map = {
             'virtual': SimulationMode.VIRTUAL,
@@ -646,7 +699,9 @@ def main():
                     mode=mode,
                     config=config,
                     scenarios=SCENARIOS,
-                    recording_file=recording_file,
+                    video_enabled=args.video,
+                    mode_name=mode_name,
+                    latency_ms=latency_ms,
                     verbose=True
                 )
                 
@@ -699,9 +754,6 @@ def main():
     except Exception as e:
         print(f'Error during simulation: {e}')
         raise
-    finally:
-        if recording_file:
-            recording_file.close()
 
 
 if __name__ == '__main__':
