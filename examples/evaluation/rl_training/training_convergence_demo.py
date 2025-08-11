@@ -75,7 +75,7 @@ PREDEFINED_SCENARIOS = {
         gae_lambda=0.95,
         clip_range=0.2,
         ent_coef=0.01,
-        network_delay=0.015,
+        network_delay=0.005,
         packet_loss_rate=0.0,
         source_rate=8000000000.0, 
         success_threshold=195.0,
@@ -761,15 +761,15 @@ def plot_training_results(results: List[Dict], config: RLScenarioConfig = None, 
 def main():
     """Run the training convergence experiment."""
     parser = argparse.ArgumentParser(description="FogSim PPO Training Convergence Demo")
-    parser.add_argument("--duration", type=int, default=120, help="Training duration in seconds")
+    parser.add_argument("--duration", type=int, default=1200, help="Training duration in seconds")
     parser.add_argument("--modes", nargs='+', choices=['virtual', 'simulated', 'real'], 
                        default=['virtual', 'simulated', 'real'], help="Modes to compare")
     parser.add_argument("--scenarios", nargs='+', 
-                       default=['cartpole', 'cartpole_high_latency', 'ant', 'halfcheetah'],
+                       default=['cartpole', 'ant', 'halfcheetah'],
                        choices=list(PREDEFINED_SCENARIOS.keys()), 
                        help="Predefined scenarios to run (default: run 4 scenarios)")
     parser.add_argument("--config", type=str, help="Path to custom config JSON file")
-    parser.add_argument("--trials", type=int, default=1, help="Number of trials per mode")
+    parser.add_argument("--trials", type=int, default=3, help="Number of trials per mode")
     parser.add_argument("--evaluate", action="store_true", help="Evaluate trained models after training")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument("--save-config", type=str, help="Save current config to JSON file")

@@ -664,7 +664,7 @@ def main():
                        default=['virtual', 'real'], 
                        help="Modes to compare")
     parser.add_argument("--latencies", nargs='+', type=float,
-                       default=[0.03, 0.05, 0.1], 
+                       default=[0.03, 0.05, 0.08, 0.1], 
                        help="Network latencies in ms (default: [0])")
     parser.add_argument("--video", action="store_true", 
                        help="Enable video recording (disabled by default for speed)")
