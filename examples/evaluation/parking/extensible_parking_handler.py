@@ -391,7 +391,15 @@ class ExtensibleParkingHandler(BaseHandler):
         if self.recording_file:
             latency_ms = self.scenario_config.network_delay * 1000.0
             source_rate_kbps = self.scenario_config.source_rate / 1000.0
-            self.car.process_recording_frames(latency_ms, source_rate_kbps)
+            # Create concise cloud mode text for video overlay
+            cloud_mode_short = {
+                "baseline": "Baseline (All Local)",
+                "cloud_perception": "Cloud Perception",
+                "cloud_planning": "Cloud Planning", 
+                "full_cloud": "Full Cloud"
+            }.get(self.cloud_config.name, self.cloud_config.name)
+            cloud_mode = cloud_mode_short
+            self.car.process_recording_frames(latency_ms, source_rate_kbps, cloud_mode)
         
         # Increment frame counter
         self.frame_idx += 1

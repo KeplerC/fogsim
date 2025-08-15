@@ -520,7 +520,7 @@ class ParkingHandler(BaseHandler):
         
         # Process recording frames if video recording is enabled
         if self.recording_file:
-            self.car.process_recording_frames()
+            self.car.process_recording_frames(cloud_mode="FogSim Baseline")
         
         # Increment frame counter
         self.frame_idx += 1

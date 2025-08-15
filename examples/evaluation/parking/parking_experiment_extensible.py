@@ -60,7 +60,8 @@ class ExtensibleScenarioConfig:
     
     def __post_init__(self):
         if self.traffic_cone_positions is None:
-            self.traffic_cone_positions = [(284, -230), (287, -225)]
+            # self.traffic_cone_positions = [(284, -230), (287, -225)]
+            self.traffic_cone_positions  = []
         if self.walker_positions is None:
             self.walker_positions = []
     
@@ -363,7 +364,7 @@ def main():
                        choices=list(CLOUD_SCENARIOS.keys()),
                        default=['cloud_perception', 'cloud_planning'],
                        help="Cloud scenarios to test")
-    parser.add_argument("--latency", type=float, nargs='+', default=[50,0, 100,0],
+    parser.add_argument("--latency", type=float, nargs='+', default=[10, 50, 100],
                        help="List of network latencies in ms to test")
     parser.add_argument("--bandwidth", type=float, nargs='+', default=[100000000.0],
                        help="List of network bandwidths in kbps to test")

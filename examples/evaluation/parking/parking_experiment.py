@@ -146,7 +146,7 @@ def run_scenario(world, destination_parking_spot, parked_spots, latency, ious, r
                 # Execute step
                 car.run_step()
                 if recording_file:
-                    car.process_recording_frames(latency=latency)
+                    car.process_recording_frames(latency=latency, cloud_mode="Classic Baseline")
                 frame_idx += 1
             
             # Calculate and record IOU

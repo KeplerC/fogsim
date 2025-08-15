@@ -239,7 +239,7 @@ class CarlaCar():
         cam.listen(lambda image: self.frames.put(image))
         return cam
     
-    def process_recording_frames(self, latency=None, source_rate_kbps=None):
+    def process_recording_frames(self, latency=None, source_rate_kbps=None, cloud_mode=None):
         while not self.frames.empty():
             if self.has_recorded_segment and self.car.mode == Mode.PARKED:
                 return
@@ -266,9 +266,11 @@ class CarlaCar():
                 color=(255, 255, 255),
                 thickness=2
             )
-            # Always show network information (latency and source rate)
+            # Always show network information (latency, source rate, and cloud mode)
             latency_text = "Latency: {:.1f}ms".format(latency if latency is not None else 0.0)
             rate_text = "Rate: {:.0f}kbps".format(source_rate_kbps if source_rate_kbps is not None else 0.0)
+            cloud_text = "Mode: {}".format(cloud_mode if cloud_mode is not None else "Unknown")
+            
             data = cv2.putText(
                 data,
                 latency_text,
@@ -282,6 +284,15 @@ class CarlaCar():
                 data,
                 rate_text,
                 (20, image.height - 120),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                fontScale=1,
+                color=(255, 255, 255),
+                thickness=2
+            )
+            data = cv2.putText(
+                data,
+                cloud_text,
+                (20, image.height - 160),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 fontScale=1,
                 color=(255, 255, 255),
