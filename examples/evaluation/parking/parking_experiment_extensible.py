@@ -1,0 +1,487 @@
+#!/usr/bin/env python3
+"""
+Extensible Parking Experiment with Cloud Computing Scenarios
+
+This experiment runner supports different cloud computing architectures:
+1. Cloud Perception: Perception on cloud (delayed), planning and control local
+2. Cloud Planning: Perception local, planning on cloud (delayed), control local  
+3. Full Cloud: All processing on cloud (all components delayed)
+
+Uses FogSim to accurately simulate network delays for cloud components.
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import imageio.v3 as iio
+from contextlib import contextmanager
+import time
+import subprocess
+import socket
+import logging
+from typing import Dict, List, Tuple, Optional, Any
+from dataclasses import dataclass, asdict
+import argparse
+import json
+from pathlib import Path
+
+from fogsim import FogSim, SimulationMode, NetworkConfig
+from fogsim.handlers import BaseHandler
+
+# Import extensible components
+from cloud_components import CLOUD_SCENARIOS, CloudArchitectureConfig
+from extensible_parking_handler import ExtensibleParkingHandler
+
+# Import parking-specific utilities
+from experiment_utils import DELTA_SECONDS
+
+# Configure logging for CARLA management
+carla_logger = logging.getLogger('carla_manager')
+carla_logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+carla_logger.addHandler(handler)
+
+
+@dataclass
+class ExtensibleScenarioConfig:
+    """Configuration for extensible parking scenarios."""
+    name: str
+    network_delay: float = 0.0  # seconds
+    packet_loss_rate: float = 0.0  # 0% loss
+    source_rate: float = 1e6  # bps
+    timestep: float = DELTA_SECONDS
+    num_random_cars: int = 25
+    replan_interval: int = 10  # Frames between replanning
+    distance_threshold: float = 10.0  # Distance to trigger replanning  
+    max_episode_steps: int = 5000  # Even longer for better parking
+    video_fps: int = 30
+    traffic_cone_positions: List[Tuple[int, int]] = None
+    walker_positions: List[Tuple[int, int]] = None
+    
+    def __post_init__(self):
+        if self.traffic_cone_positions is None:
+            self.traffic_cone_positions = [(284, -230), (287, -225)]
+        if self.walker_positions is None:
+            self.walker_positions = []
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+    
+    @classmethod
+    def from_dict(cls, config_dict: Dict[str, Any]) -> 'ExtensibleScenarioConfig':
+        return cls(**config_dict)
+
+
+# Predefined network scenarios  
+NETWORK_SCENARIOS = {
+    "no_latency": ExtensibleScenarioConfig(
+        name="no_latency",
+        network_delay=0.0,  # 0ms
+        packet_loss_rate=0.0,
+        source_rate=1e9,  # High bandwidth
+    ),
+    
+    "low_latency": ExtensibleScenarioConfig(
+        name="low_latency",
+        network_delay=0.005,  # 5ms
+        packet_loss_rate=0.001,  # 0.1% loss
+        source_rate=1e6,  # 1 Mbps
+    ),
+    
+    "medium_latency": ExtensibleScenarioConfig(
+        name="medium_latency", 
+        network_delay=0.020,  # 20ms
+        packet_loss_rate=0.01,  # 1% loss
+        source_rate=500e3,  # 500 Kbps
+    ),
+    
+    "high_latency": ExtensibleScenarioConfig(
+        name="high_latency",
+        network_delay=0.050,  # 50ms
+        packet_loss_rate=0.03,  # 3% loss
+        source_rate=200e3,  # 200 Kbps
+    ),
+}
+
+
+def run_extensible_parking_scenario(mode: SimulationMode,
+                                   scenario_config: ExtensibleScenarioConfig,
+                                   cloud_config: CloudArchitectureConfig,
+                                   destination: int,
+                                   parked_spots: List[int],
+                                   recording_file=None,
+                                   verbose: bool = True) -> Dict:
+    """Run a single parking scenario with extensible cloud architecture."""
+    
+    if verbose:
+        print(f'  Scenario: {cloud_config.name} - parking spot {destination}, occupied: {parked_spots}')
+        
+    # Create extensible parking handler
+    handler = ExtensibleParkingHandler(scenario_config, cloud_config)
+    handler.set_scenario(destination, parked_spots)
+    if recording_file:
+        handler.set_recording(recording_file)
+    
+    # Configure network for cloud delays
+    network_config = NetworkConfig()
+    network_config.topology.link_delay = scenario_config.network_delay
+    network_config.topology.link_bandwidth = scenario_config.source_rate * 8.0  # Convert to bits/sec
+    network_config.source_rate = scenario_config.source_rate
+    network_config.packet_loss_rate = scenario_config.packet_loss_rate
+    
+    # Create FogSim environment
+    fogsim = FogSim(
+        handler, 
+        mode=mode, 
+        timestep=scenario_config.timestep,
+        network_config=network_config
+    )
+    
+    # Reset environment
+    obs, info = fogsim.reset()
+    
+    # Run episode
+    step_count = 0
+    total_latency = 0.0
+    latency_samples = 0
+    cloud_messages_sent = 0
+    cloud_messages_received = 0
+    
+    while not handler._episode_done and step_count < scenario_config.max_episode_steps:
+        # Step through FogSim
+        result = fogsim.step(obs)
+        
+        if isinstance(result, tuple) and len(result) >= 6:
+            obs, reward, success, terminated, truncated, info = result
+        else:
+            # Handle different return formats
+            obs, reward, success, terminated, truncated, info = result, 0, False, False, False, {}
+        
+        step_count += 1
+        
+        # Track cloud message statistics
+        if info.get('next_message_type'):
+            cloud_messages_sent += 1
+        if info.get('delayed_message_received'):
+            cloud_messages_received += 1
+        
+        # Check if episode should end
+        if truncated or terminated:
+            break
+            
+        # Progress reporting
+        if verbose and step_count % 50 == 0:
+            cloud_info = f"Cloud: {cloud_messages_sent} sent, {cloud_messages_received} recv"
+            if 'avg_latency_ms' in info:
+                avg_latency = info['avg_latency_ms']
+                total_latency += avg_latency
+                latency_samples += 1
+                print(f'    Step {step_count}: {cloud_info}, latency={avg_latency:.1f}ms')
+            else:
+                print(f'    Step {step_count}: {cloud_info}, no latency measured yet')
+    
+    # Get final results
+    final_iou = handler._last_iou
+    final_parking_time = handler._parking_time
+    
+    if verbose:
+        parking_time_str = f", Parking Time: {final_parking_time:.2f}s" if final_parking_time else ""
+        cloud_summary = f"Cloud msgs: {cloud_messages_sent}→{cloud_messages_received}"
+        
+        if latency_samples > 0:
+            avg_total_latency = total_latency / latency_samples
+            print(f'  Result: IOU={final_iou:.3f}{parking_time_str}, {cloud_summary}, Avg Latency={avg_total_latency:.1f}ms')
+        else:
+            print(f'  Result: IOU={final_iou:.3f}{parking_time_str}, {cloud_summary}')
+    
+    # Clean up
+    fogsim.close()
+    
+    return {
+        'mode': mode,
+        'cloud_config': cloud_config.name,
+        'destination': destination,
+        'parked_spots': parked_spots,
+        'iou': final_iou,
+        'parking_time': final_parking_time,
+        'steps': handler.frame_idx,
+        'cloud_messages_sent': cloud_messages_sent,
+        'cloud_messages_received': cloud_messages_received,
+        'avg_latency_ms': total_latency / latency_samples if latency_samples > 0 else 0,
+    }
+
+
+def run_cloud_scenario_experiments(mode: SimulationMode,
+                                  scenario_config: ExtensibleScenarioConfig,
+                                  cloud_configs: List[CloudArchitectureConfig],
+                                  scenarios: List[Tuple[int, List[int]]],
+                                  video_enabled: bool = False,
+                                  verbose: bool = True) -> Dict[str, Tuple[List[float], List[Optional[float]]]]:
+    """Run experiments for multiple cloud configurations."""
+    
+    results = {}
+    
+    for cloud_config in cloud_configs:
+        if verbose:
+            print(f'\n=== Testing {cloud_config.name}: {cloud_config.description} ===')
+        
+        ious = []
+        parking_times = []
+        
+        for idx, (destination, parked_spots) in enumerate(scenarios):
+            recording_file = None
+            
+            # Create unique video filename if video is enabled
+            if video_enabled:
+                video_filename = f'parking_{cloud_config.name}_latency{int(scenario_config.network_delay*1000)}ms_dest{destination}_run{idx+1}.mp4'
+                recording_file = iio.imopen(video_filename, 'w', plugin='pyav')
+                recording_file.init_video_stream('vp9', fps=scenario_config.video_fps)
+                if verbose:
+                    print(f'    Recording video to: {video_filename}')
+            
+            result = run_extensible_parking_scenario(
+                mode=mode,
+                scenario_config=scenario_config,
+                cloud_config=cloud_config,
+                destination=destination,
+                parked_spots=parked_spots,
+                recording_file=recording_file,
+                verbose=verbose
+            )
+            
+            ious.append(result['iou'])
+            parking_times.append(result.get('parking_time'))
+            
+            # Close recording file
+            if recording_file:
+                recording_file.close()
+        
+        results[cloud_config.name] = (ious, parking_times)
+        
+        # Print summary for this cloud configuration
+        if ious and verbose:
+            print(f'  Summary: mean IOU = {np.mean(ious):.3f}, std = {np.std(ious):.3f}')
+            valid_times = [t for t in parking_times if t is not None]
+            if valid_times:
+                print(f'           mean parking time = {np.mean(valid_times):.2f}s, std = {np.std(valid_times):.2f}s')
+    
+    return results
+
+
+def plot_cloud_comparison_results(cloud_results: Dict[str, Tuple[List[float], List[Optional[float]]]], 
+                                 scenario_name: str,
+                                 latency_ms: float,
+                                 save_path: str = None):
+    """Plot comparison results across different cloud architectures."""
+    
+    if save_path is None:
+        save_path = f'parking_cloud_comparison_{scenario_name}_latency{int(latency_ms)}ms.png'
+    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+    
+    # Colors for different cloud scenarios
+    colors = {
+        'baseline': 'blue',
+        'cloud_perception': 'orange', 
+        'cloud_planning': 'green',
+        'full_cloud': 'red'
+    }
+    
+    cloud_names = []
+    iou_means = []
+    iou_stds = []
+    time_means = []
+    time_stds = []
+    
+    # Plot 1: IOU comparison
+    for cloud_name, (ious, parking_times) in cloud_results.items():
+        if ious:
+            cloud_names.append(cloud_name.replace('_', '\n'))
+            iou_means.append(np.mean(ious))
+            iou_stds.append(np.std(ious))
+            
+            # Scatter plot of individual results
+            x_positions = np.random.normal(len(cloud_names)-1, 0.1, len(ious))
+            ax1.scatter(x_positions, ious, alpha=0.6, 
+                       color=colors.get(cloud_name, 'gray'), s=50)
+    
+    # Bar plot with error bars for IOU
+    bars1 = ax1.bar(range(len(cloud_names)), iou_means, yerr=iou_stds, 
+                    capsize=5, alpha=0.7, 
+                    color=[colors.get(name.replace('\n', '_'), 'gray') for name in cloud_names])
+    
+    ax1.set_xlabel('Cloud Architecture')
+    ax1.set_ylabel('Parking IOU')
+    ax1.set_title(f'Parking Performance by Cloud Architecture\n({scenario_name}, {latency_ms}ms latency)')
+    ax1.set_xticks(range(len(cloud_names)))
+    ax1.set_xticklabels(cloud_names)
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot 2: Parking time comparison
+    for i, (cloud_name, (ious, parking_times)) in enumerate(cloud_results.items()):
+        valid_times = [t for t in parking_times if t is not None]
+        if valid_times:
+            time_means.append(np.mean(valid_times))
+            time_stds.append(np.std(valid_times))
+            
+            # Scatter plot of individual results
+            x_positions = np.random.normal(i, 0.1, len(valid_times))
+            ax2.scatter(x_positions, valid_times, alpha=0.6,
+                       color=colors.get(cloud_name, 'gray'), s=50)
+        else:
+            time_means.append(0)
+            time_stds.append(0)
+    
+    # Bar plot with error bars for parking time
+    bars2 = ax2.bar(range(len(cloud_names)), time_means, yerr=time_stds,
+                    capsize=5, alpha=0.7,
+                    color=[colors.get(name.replace('\n', '_'), 'gray') for name in cloud_names])
+    
+    ax2.set_xlabel('Cloud Architecture')
+    ax2.set_ylabel('Parking Time (seconds)')
+    ax2.set_title(f'Parking Time by Cloud Architecture\n({scenario_name}, {latency_ms}ms latency)')
+    ax2.set_xticks(range(len(cloud_names)))
+    ax2.set_xticklabels(cloud_names)
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f'Cloud comparison results saved to {save_path}')
+
+
+def main():
+    """Main experiment runner for extensible cloud parking scenarios."""
+    parser = argparse.ArgumentParser(description="Extensible Cloud Parking Experiment")
+    parser.add_argument("--modes", nargs='+', choices=['virtual', 'simulated', 'real'],
+                       default=['virtual'], 
+                       help="FogSim modes to test")
+    parser.add_argument("--clouds", nargs='+', 
+                       choices=list(CLOUD_SCENARIOS.keys()),
+                       default=['baseline', 'cloud_perception', 'cloud_planning'],
+                       help="Cloud scenarios to test")
+    parser.add_argument("--network", type=str, default="low_latency",
+                       choices=list(NETWORK_SCENARIOS.keys()),
+                       help="Network scenario configuration")
+    parser.add_argument("--latency", type=float,
+                       help="Override network latency in ms")
+    parser.add_argument("--video", action="store_true", 
+                       help="Enable video recording")
+    parser.add_argument("--no-plot", action="store_true",
+                       help="Skip visualization plotting")
+    parser.add_argument("--config", type=str, 
+                       help="Path to custom network config JSON file")
+    parser.add_argument("--save-config", type=str, 
+                       help="Save current config to JSON file")
+    
+    args = parser.parse_args()
+    
+    # Load network configuration
+    if args.config:
+        with open(args.config, 'r') as f:
+            config_dict = json.load(f)
+        scenario_config = ExtensibleScenarioConfig.from_dict(config_dict)
+    else:
+        scenario_config = NETWORK_SCENARIOS[args.network]
+    
+    # Override latency if specified
+    if args.latency is not None:
+        scenario_config.network_delay = args.latency / 1000.0  # Convert ms to seconds
+        
+    # Save config if requested
+    if args.save_config:
+        with open(args.save_config, 'w') as f:
+            json.dump(scenario_config.to_dict(), f, indent=2)
+        print(f"Configuration saved to {args.save_config}")
+    
+    # Get cloud configurations to test
+    cloud_configs = [CLOUD_SCENARIOS[name] for name in args.clouds]
+    
+    # Define parking scenarios - test just one for now
+    SCENARIOS = [
+        (20, [19, 21]),
+    ]
+    
+    try:
+        # Map mode names to SimulationMode enum
+        mode_map = {
+            'virtual': SimulationMode.VIRTUAL,
+            'simulated': SimulationMode.SIMULATED_NET,
+            'real': SimulationMode.REAL_NET
+        }
+        
+        all_results = {}
+        
+        for mode_name in args.modes:
+            mode = mode_map[mode_name]
+            
+            print(f'\n{"="*80}')
+            print(f'TESTING MODE: {mode_name.upper()}')
+            print(f'Network: {scenario_config.name} ({scenario_config.network_delay*1000:.1f}ms)')
+            print(f'Cloud scenarios: {[cfg.name for cfg in cloud_configs]}')
+            print(f'{"="*80}')
+            
+            # Run experiments for all cloud scenarios
+            mode_results = run_cloud_scenario_experiments(
+                mode=mode,
+                scenario_config=scenario_config,
+                cloud_configs=cloud_configs,
+                scenarios=SCENARIOS,
+                video_enabled=args.video,
+                verbose=True
+            )
+            
+            all_results[mode_name] = mode_results
+            
+            # Generate visualization for this mode
+            if not args.no_plot:
+                plot_cloud_comparison_results(
+                    mode_results, 
+                    f"{mode_name}_{scenario_config.name}",
+                    scenario_config.network_delay * 1000,
+                    f'parking_cloud_{mode_name}_{scenario_config.name}.png'
+                )
+        
+        # Print final comparison summary
+        print(f"\n{'='*80}")
+        print("FINAL CLOUD ARCHITECTURE COMPARISON")
+        print(f"{'='*80}")
+        
+        for mode_name, mode_results in all_results.items():
+            print(f"\n{mode_name.upper()} MODE RESULTS:")
+            print("-" * 50)
+            
+            for cloud_name, (ious, parking_times) in mode_results.items():
+                cloud_config = CLOUD_SCENARIOS[cloud_name]
+                if ious:
+                    print(f"\n{cloud_config.name.upper()}: {cloud_config.description}")
+                    print(f"  IOU: {np.mean(ious):.3f} ± {np.std(ious):.3f} (range: {np.min(ious):.3f}-{np.max(ious):.3f})")
+                    
+                    valid_times = [t for t in parking_times if t is not None]
+                    if valid_times:
+                        print(f"  Time: {np.mean(valid_times):.2f}s ± {np.std(valid_times):.2f}s")
+        
+        # Compare cloud scenarios within each mode
+        for mode_name, mode_results in all_results.items():
+            if len(mode_results) > 1:
+                print(f"\n{mode_name.upper()} MODE - Cloud Architecture Impact:")
+                baseline_ious = mode_results.get('baseline', ([], []))[0]
+                if baseline_ious:
+                    baseline_mean = np.mean(baseline_ious)
+                    print(f"  Baseline (all local): {baseline_mean:.3f}")
+                    
+                    for cloud_name, (ious, _) in mode_results.items():
+                        if cloud_name != 'baseline' and ious:
+                            cloud_mean = np.mean(ious)
+                            impact = cloud_mean - baseline_mean
+                            print(f"  {cloud_name}: {cloud_mean:.3f} ({impact:+.3f} vs baseline)")
+        
+    except KeyboardInterrupt:
+        print('\nExperiment interrupted by user')
+    except Exception as e:
+        print(f'Error during experiment: {e}')
+        raise
+
+
+if __name__ == '__main__':
+    main()
