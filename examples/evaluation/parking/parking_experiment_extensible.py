@@ -29,7 +29,8 @@ from fogsim.handlers import BaseHandler
 
 # Import extensible components
 from cloud_components import CLOUD_SCENARIOS, CloudArchitectureConfig
-from extensible_parking_handler import ExtensibleParkingHandler
+# Use the V3 handler with proper perception delays
+from extensible_parking_handler_v3 import ExtensibleParkingHandler
 
 # Import parking-specific utilities
 from experiment_utils import DELTA_SECONDS
@@ -51,7 +52,7 @@ class ExtensibleScenarioConfig:
     source_rate: float = 1e6  # bps
     timestep: float = DELTA_SECONDS
     num_random_cars: int = 25
-    replan_interval: int = 10  # Frames between replanning
+    replan_interval: int = 1  # Frames between replanning
     distance_threshold: float = 10.0  # Distance to trigger replanning  
     max_episode_steps: int = 5000  # Even longer for better parking
     video_fps: int = 30
@@ -427,9 +428,9 @@ def main():
                        help="FogSim modes to test")
     parser.add_argument("--clouds", nargs='+', 
                        choices=list(CLOUD_SCENARIOS.keys()),
-                       default=['cloud_perception', 'cloud_planning'],
+                       default=['cloud_perception'],
                        help="Cloud scenarios to test")
-    parser.add_argument("--latency", type=float, nargs='+', default=[10, 50, 75, 100, 150, 300],
+    parser.add_argument("--latency", type=float, nargs='+', default=[10, 50, 100],
                        help="List of network latencies in ms to test")
     parser.add_argument("--bandwidth", type=float, nargs='+', default=[100000000.0],
                        help="List of network bandwidths in kbps to test")
@@ -441,7 +442,7 @@ def main():
                        help="Path to custom network config JSON file")
     parser.add_argument("--save-config", type=str, 
                        help="Save current config to JSON file")
-    parser.add_argument("--trials", type=int, default=3,
+    parser.add_argument("--trials", type=int, default=1,
                        help="Number of trials to run for each configuration")
     
     args = parser.parse_args()

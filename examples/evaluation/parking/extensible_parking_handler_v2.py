@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Extensible Parking Handler with Cloud Component Integration
+Extensible Parking Handler V2 - Properly Simulates Cloud Delays
 
-This handler supports all three cloud scenarios with proper FogSim network delay handling:
-1. Cloud Perception: Raw sensor data → Cloud (delayed) → Local planning → Local control
-2. Cloud Planning: Local perception → Cloud planning (delayed) → Local control  
-3. Full Cloud: Raw data → Cloud perception → Cloud planning → Cloud control (delayed)
+This version correctly simulates cloud component delays by:
+1. Tracking when planning requests are sent to cloud
+2. Waiting for the appropriate delay before executing planning
+3. Actually executing the car's planning and control methods
 """
 
 import numpy as np
@@ -18,12 +18,8 @@ from fogsim.handlers import BaseHandler
 from cloud_components import (
     CloudArchitectureConfig, 
     ComponentLocation,
-    PerceptionData, 
-    PlanningData, 
-    ControlData,
     CLOUD_SCENARIOS
 )
-import time
 
 # Import parking-specific utilities
 from experiment_utils import (
@@ -46,21 +42,13 @@ from experiment_utils import (
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class DelayedMessage:
-    """Wrapper for messages traveling through network delay."""
-    message_type: str  # 'perception', 'planning', 'control'
-    data: Union[PerceptionData, PlanningData, ControlData]
-    send_time: float
-    frame_id: int
-
-
 class ExtensibleParkingHandler(BaseHandler):
     """
-    Extensible parking handler supporting different cloud architectures.
+    Parking handler that properly simulates cloud component delays.
     
-    This handler uses FogSim to simulate network delays for cloud components
-    while maintaining local processing for on-vehicle components.
+    The key insight: We can't actually send the car object through the network,
+    so we simulate delays by tracking when requests are made and when they should
+    be processed.
     """
     
     def __init__(self, scenario_config, cloud_config: CloudArchitectureConfig):
@@ -88,21 +76,14 @@ class ExtensibleParkingHandler(BaseHandler):
         self._last_iou = 0.0
         self._episode_done = False
         self._parking_time = None
+        self._planning_active = False
         
-        # Cloud component instances
-        self.perception_component, self.planning_component, self.control_component = cloud_config.get_components()
+        # Delay simulation tracking
+        self._cloud_request_sent_frame = -1  # When we sent request to cloud
+        self._cloud_request_type = None  # What type of request
+        self._waiting_for_cloud = False  # Are we waiting for cloud response
         
-        # Network delay state tracking
-        self._last_perception_data = None
-        self._last_planning_data = None
-        self._last_control_data = None
-        
-        # Messages waiting for network delivery
-        self._pending_perception_requests = []
-        self._pending_planning_requests = []
-        self._pending_control_requests = []
-        
-        logger.info(f"ExtensibleParkingHandler initialized with cloud config: {cloud_config.name}")
+        logger.info(f"ExtensibleParkingHandler V2 initialized with cloud config: {cloud_config.name}")
         
     def launch(self) -> None:
         """Launch CARLA and initialize the parking scenario."""
@@ -110,7 +91,6 @@ class ExtensibleParkingHandler(BaseHandler):
             return
             
         try:
-            # Initialize CARLA (same as original)
             from parking_experiment_fogsim import ensure_carla_running
             if not ensure_carla_running():
                 raise RuntimeError("Failed to start CARLA server")
@@ -153,7 +133,6 @@ class ExtensibleParkingHandler(BaseHandler):
         
     def _spawn_actors(self):
         """Spawn all actors in the scenario."""
-        # Same spawning logic as original
         parked_cars, parked_cars_bbs = town04_spawn_parked_cars(
             self.world, self.parked_spots, 
             self.destination_parking_spot, self.scenario_config.num_random_cars
@@ -183,7 +162,6 @@ class ExtensibleParkingHandler(BaseHandler):
         for i, actor in enumerate(self.actors_to_cleanup):
             if actor is not None:
                 try:
-                    # Just try to destroy - CARLA handles already destroyed actors gracefully
                     actor.destroy()
                 except Exception as e:
                     logger.warning(f"Failed to destroy actor {i}: {e}")
@@ -197,7 +175,7 @@ class ExtensibleParkingHandler(BaseHandler):
             
     def _reset_scenario(self):
         """Reset the parking scenario."""
-        # Cleanup (same as original)
+        # Cleanup
         if self.recording_cam is not None:
             self.recording_cam.destroy()
             self.recording_cam = None
@@ -234,7 +212,6 @@ class ExtensibleParkingHandler(BaseHandler):
             
         except Exception as e:
             logger.error(f"Failed to reset scenario: {e}")
-            # Clean up any partially created resources
             self._cleanup_actors()
             if self.car is not None:
                 try:
@@ -251,143 +228,19 @@ class ExtensibleParkingHandler(BaseHandler):
         self._parking_time = None
         self._planning_active = False
         
-        # Reset cloud component states
-        self._last_perception_data = None
-        self._last_planning_data = None
-        self._last_control_data = None
-        self._pending_perception_requests.clear()
-        self._pending_planning_requests.clear()
-        self._pending_control_requests.clear()
+        # Reset delay simulation
+        self._cloud_request_sent_frame = -1
+        self._cloud_request_type = None
+        self._waiting_for_cloud = False
         
         # Create initial observation
         self._update_observation()
     
-    def _process_perception_pipeline(self) -> PerceptionData:
-        """Process the perception pipeline based on cloud configuration."""
-        # Update dynamic obstacles
-        if self.walkers:
-            self.dynamic_bbs = update_walkers(self.walkers)
-        else:
-            self.dynamic_bbs = []
-        
-        if self.perception_component.location == ComponentLocation.LOCAL:
-            # Local perception - process immediately
-            return self.perception_component.process(self.car, self.static_bbs, self.dynamic_bbs)
-        else:
-            # Cloud perception - this should be called when delayed data arrives
-            # For now, return the last known perception data if available
-            if self._last_perception_data is not None:
-                return self._last_perception_data
-            else:
-                # Fallback: create basic perception data
-                transform = self.car.actor.get_transform()
-                velocity = self.car.actor.get_velocity()
-                return PerceptionData(
-                    obstacle_map=np.zeros((100, 100)),  # Empty obstacle map
-                    vehicle_position=(transform.location.x, transform.location.y, transform.rotation.yaw),
-                    vehicle_velocity=(velocity.x, velocity.y),
-                    timestamp=time.time(),
-                    frame_id=self.frame_idx
-                )
-    
-    def _process_planning_pipeline(self, perception_data: Optional[PerceptionData]) -> PlanningData:
-        """Process the planning pipeline based on cloud configuration."""
-        if self.planning_component.location == ComponentLocation.LOCAL:
-            # Local planning - process immediately
-            if perception_data is not None:
-                return self.planning_component.process(perception_data, self.car)
-            else:
-                # No perception data available - create local perception first
-                local_perception = self._process_perception_pipeline()
-                return self.planning_component.process(local_perception, self.car)
-        else:
-            # Cloud planning - use last known planning data if available
-            if self._last_planning_data is not None:
-                return self._last_planning_data
-            else:
-                # Fallback: create no-plan data
-                return PlanningData(
-                    trajectory=[],
-                    target_speed=0.0,
-                    steering_angle=0.0,
-                    has_plan=False,
-                    timestamp=time.time(),
-                    frame_id=self.frame_idx
-                )
-    
-    def _process_control_pipeline(self, planning_data: PlanningData) -> ControlData:
-        """Process the control pipeline based on cloud configuration."""
-        if self.control_component.location == ComponentLocation.LOCAL:
-            # Local control - process immediately
-            return self.control_component.process(planning_data, self.car)
-        else:
-            # Cloud control - use last known control data if available
-            if self._last_control_data is not None:
-                # Apply the delayed control commands
-                try:
-                    import carla
-                    control = carla.VehicleControl(
-                        throttle=self._last_control_data.throttle,
-                        brake=self._last_control_data.brake,
-                        steer=self._last_control_data.steer
-                    )
-                    if self.car and self.car.actor:
-                        try:
-                            self.car.actor.apply_control(control)
-                        except RuntimeError:
-                            logger.error("Car actor is destroyed or None, cannot apply control")
-                            self._episode_done = True
-                    else:
-                        logger.error("Car actor is destroyed or None, cannot apply control")
-                        self._episode_done = True
-                except Exception as e:
-                    logger.warning(f"Failed to apply delayed control: {e}")
-                    # Set emergency stop if control fails
-                    try:
-                        if self.car and self.car.actor:
-                            try:
-                                emergency_control = carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0)
-                                self.car.actor.apply_control(emergency_control)
-                            except RuntimeError:
-                                pass
-                    except:
-                        pass
-                
-                return self._last_control_data
-            else:
-                # Fallback: create stop command
-                control_data = ControlData(
-                    throttle=0.0,
-                    brake=0.5,
-                    steer=0.0,
-                    timestamp=time.time(),
-                    frame_id=self.frame_idx
-                )
-                # Apply stop command with improved error handling
-                try:
-                    import carla
-                    control = carla.VehicleControl(throttle=0.0, brake=0.5, steer=0.0)
-                    if self.car and self.car.actor:
-                        try:
-                            self.car.actor.apply_control(control)
-                        except RuntimeError:
-                            logger.error("Car actor is destroyed or None, cannot apply stop control")
-                            self._episode_done = True
-                    else:
-                        logger.error("Car actor is destroyed or None, cannot apply stop control")
-                        self._episode_done = True
-                except Exception as e:
-                    logger.warning(f"Failed to apply stop control: {e}")
-                    self._episode_done = True
-                
-                return control_data
-    
     def _should_replan(self):
-        """Determine if replanning is needed with error handling."""
+        """Determine if replanning is needed."""
         try:
             if self.car is None or not hasattr(self.car, 'actor') or self.car.actor is None:
                 return False
-            # Try to access car data to check if it's still valid
             try:
                 self.car.actor.get_transform()
             except RuntimeError:
@@ -399,24 +252,20 @@ class ExtensibleParkingHandler(BaseHandler):
             return False
         
     def _update_observation(self):
-        """Update the observation vector with error handling."""
+        """Update the observation vector."""
         if self.car is None:
             self._observation = np.zeros(15)
             return
             
         try:
-            # Check if car actor is still valid
             if not hasattr(self.car, 'actor') or self.car.actor is None:
-                logger.error("Car actor is None, setting default observation")
                 self._observation = np.zeros(15)
                 self._episode_done = True
                 return
             
-            # Try to access car data to check if it's still valid
             try:
                 self.car.actor.get_transform()
             except RuntimeError:
-                logger.error("Car actor is destroyed, setting default observation")
                 self._observation = np.zeros(15)
                 self._episode_done = True
                 return
@@ -442,7 +291,7 @@ class ExtensibleParkingHandler(BaseHandler):
                 if self._parking_time is None:
                     self._parking_time = self.frame_idx * self.scenario_config.timestep
                 
-            # Create BASE observation vector (15 elements)
+            # Create observation vector
             self._observation = np.array([
                 transform.location.x,
                 transform.location.y, 
@@ -453,19 +302,16 @@ class ExtensibleParkingHandler(BaseHandler):
                 float(self._episode_done),
                 self._last_iou,
                 self.frame_idx / self.scenario_config.max_episode_steps,
-                # Obstacle map features
                 np.sum(self.car.car.obs.obs) / (self.car.car.obs.obs.size + 1e-6),
                 np.mean(self.car.car.obs.obs),
                 np.std(self.car.car.obs.obs),
-                # Parking spot location
                 self.car.car.destination.x,
                 self.car.car.destination.y,
                 self.car.car.destination.angle,
             ])
             
         except Exception as e:
-            logger.error(f"Failed to update observation at frame {self.frame_idx}: {e}")
-            # Provide a safe fallback observation
+            logger.error(f"Failed to update observation: {e}")
             self._observation = np.zeros(15)
             self._episode_done = True
         
@@ -495,44 +341,40 @@ class ExtensibleParkingHandler(BaseHandler):
         if self._episode_done:
             return
         
-        # Tick simulation with error handling
+        # Tick simulation
         try:
             self.world.tick()
         except Exception as e:
-            logger.error(f"World tick failed at frame {self.frame_idx}: {e}")
+            logger.error(f"World tick failed: {e}")
             self._episode_done = True
             return
             
         try:
             self.car.localize()
         except Exception as e:
-            logger.error(f"Car localization failed at frame {self.frame_idx}: {e}")
-            # Continue execution but log the error
+            logger.error(f"Car localization failed: {e}")
         
         # Process recording frames if video recording is enabled
         if self.recording_file:
             latency_ms = self.scenario_config.network_delay * 1000.0
             source_rate_kbps = self.scenario_config.source_rate / 1000.0
-            # Create concise cloud mode text for video overlay
             cloud_mode_short = {
                 "baseline": "Baseline (All Local)",
                 "cloud_perception": "Cloud Perception",
                 "cloud_planning": "Cloud Planning", 
                 "full_cloud": "Full Cloud"
             }.get(self.cloud_config.name, self.cloud_config.name)
-            cloud_mode = cloud_mode_short
-            self.car.process_recording_frames(latency_ms, source_rate_kbps, cloud_mode)
+            self.car.process_recording_frames(latency_ms, source_rate_kbps, cloud_mode_short)
         
         # Increment frame counter
         self.frame_idx += 1
                 
     def step_with_action(self, action: Optional[np.ndarray]) -> Tuple:
         """
-        Process simulation step with proper cloud message handling.
+        Process simulation step with proper cloud delay simulation.
         
-        For cloud scenarios:
-        - action contains delayed messages from cloud processing
-        - We need to send appropriate data through the network for cloud components
+        Key insight: We simulate delays by tracking when requests are sent
+        and only executing planning after the appropriate delay.
         """
         # Execute physics simulation step
         self.step()
@@ -554,92 +396,84 @@ class ExtensibleParkingHandler(BaseHandler):
             )
         )
         
-        # Track if we received a delayed response from cloud
-        received_cloud_response = action is not None and isinstance(action, np.ndarray)
-        
         # Check if it's time to plan
-        should_plan = (self.frame_idx % self.scenario_config.replan_interval == 0)
+        should_plan = self._should_replan()
         
-        # For cloud scenarios, if we receive a delayed response AND it's time to plan, execute planning
-        if received_cloud_response and self.cloud_config.name != 'baseline' and should_plan:
-            if self.frame_idx % 50 == 0:
-                print(f"Step {self.frame_idx}: Received cloud response, executing delayed planning")
-            
-            # Execute planning after delay (cloud has "processed" and sent back signal)
-            try:
-                if self.car and self.car.actor:
-                    # Check if actor is valid by accessing transform
-                    self.car.actor.get_transform()
-                    self.car.plan()
-                    has_plan = hasattr(self.car.car, 'trajectory') and self.car.car.trajectory is not None and len(self.car.car.trajectory) > 0
-                    self._planning_active = has_plan
-                    
-                    if self.frame_idx % 50 == 0:
-                        print(f"Cloud-delayed planning result: has_plan={has_plan}, path_length={len(self.car.car.trajectory) if has_plan else 0}")
-                else:
-                    logger.error("Car actor is None or destroyed")
-                    self._planning_active = False
-                    self._episode_done = True
-            except Exception as e:
-                logger.error(f"Planning failed: {e}")
-                self._planning_active = False
+        # Track if we received a cloud response (action is not None means network delivered something)
+        cloud_response_received = action is not None and isinstance(action, np.ndarray)
         
-        # For baseline: plan immediately when it's time
-        elif should_plan and self.cloud_config.name == 'baseline':
-            if self.frame_idx % 50 == 0:
-                print(f"Step {self.frame_idx}: Baseline planning (immediate)")
-                print(f"Planning: pos=({self.car.car.cur.x:.1f},{self.car.car.cur.y:.1f}) dest=({self.car.car.destination.x:.1f},{self.car.car.destination.y:.1f})")
-            
-            try:
-                if self.car and self.car.actor:
-                    try:
-                        # Check if actor is valid by accessing transform
+        # Handle planning based on cloud configuration
+        if self.cloud_config.name == 'baseline':
+            # Baseline: Plan immediately when needed
+            if should_plan:
+                if self.frame_idx % 50 == 0:
+                    logger.info(f"Step {self.frame_idx}: Baseline planning (immediate)")
+                
+                try:
+                    if self.car and self.car.actor:
                         self.car.actor.get_transform()
                         self.car.plan()
-                    except RuntimeError:
-                        logger.error("Car actor is destroyed, cannot plan")
-                        self._planning_active = False
-                        self._episode_done = True
-                        return
-                    has_plan = hasattr(self.car.car, 'trajectory') and self.car.car.trajectory is not None and len(self.car.car.trajectory) > 0
-                    self._planning_active = has_plan
-                    
-                    if self.frame_idx % 50 == 0:
-                        print(f"Baseline planning result: has_plan={has_plan}, path_length={len(self.car.car.trajectory) if has_plan else 0}")
-                else:
-                    logger.error("Car actor is destroyed, cannot plan")
+                        has_plan = hasattr(self.car.car, 'trajectory') and self.car.car.trajectory is not None and len(self.car.car.trajectory) > 0
+                        self._planning_active = has_plan
+                        
+                        if self.frame_idx % 50 == 0:
+                            logger.info(f"Baseline planning result: has_plan={has_plan}")
+                except Exception as e:
+                    logger.error(f"Planning failed: {e}")
                     self._planning_active = False
-                    self._episode_done = True
-            except Exception as e:
-                logger.error(f"Planning failed: {e}")
-                self._planning_active = False
+                    
+        else:
+            # Cloud scenarios: Simulate delay
+            if should_plan and not self._waiting_for_cloud:
+                # Send request to cloud (start waiting)
+                self._cloud_request_sent_frame = self.frame_idx
+                self._cloud_request_type = self.cloud_config.name
+                self._waiting_for_cloud = True
+                
+                if self.frame_idx % 50 == 0:
+                    logger.info(f"Step {self.frame_idx}: Sending {self.cloud_config.name} request to cloud")
+            
+            # Check if we've waited long enough for cloud response
+            if self._waiting_for_cloud and cloud_response_received:
+                # Cloud response received - execute planning
+                self._waiting_for_cloud = False
+                
+                if self.frame_idx % 50 == 0:
+                    frames_waited = self.frame_idx - self._cloud_request_sent_frame
+                    delay_ms = frames_waited * self.scenario_config.timestep * 1000
+                    logger.info(f"Step {self.frame_idx}: Cloud response received after {delay_ms:.1f}ms, executing planning")
+                
+                try:
+                    if self.car and self.car.actor:
+                        self.car.actor.get_transform()
+                        
+                        # For all cloud scenarios, we execute the actual planning now
+                        # (after the simulated delay)
+                        self.car.plan()
+                        
+                        has_plan = hasattr(self.car.car, 'trajectory') and self.car.car.trajectory is not None and len(self.car.car.trajectory) > 0
+                        self._planning_active = has_plan
+                        
+                        if self.frame_idx % 50 == 0:
+                            logger.info(f"Cloud-delayed planning result: has_plan={has_plan}")
+                except Exception as e:
+                    logger.error(f"Planning failed: {e}")
+                    self._planning_active = False
         
         # Execute control if we have an active plan
         if self._planning_active:
             try:
                 if self.car and self.car.actor:
-                    try:
-                        self.car.run_step()
-                    except RuntimeError:
-                        logger.error("Car actor is destroyed, stopping episode")
-                        self._episode_done = True
-                        self._planning_active = False
-                else:
-                    logger.error("Car actor is destroyed, stopping episode")
-                    self._episode_done = True
-                    self._planning_active = False
+                    self.car.run_step()
             except Exception as e:
-                logger.error(f"Car run_step failed at frame {self.frame_idx}: {e}")
+                logger.error(f"Car run_step failed: {e}")
                 self._planning_active = False
-                # Try emergency stop
+                # Emergency stop
                 try:
                     if self.car and self.car.actor:
-                        try:
-                            import carla
-                            emergency_control = carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0)
-                            self.car.actor.apply_control(emergency_control)
-                        except RuntimeError:
-                            pass
+                        import carla
+                        emergency_control = carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0)
+                        self.car.actor.apply_control(emergency_control)
                 except:
                     pass
         
@@ -658,17 +492,9 @@ class ExtensibleParkingHandler(BaseHandler):
         
         # Debug info
         if self.frame_idx % 100 == 0:
-            delayed_action_received = action is not None
-            print(f"FogSim Debug - Frame {self.frame_idx}: {self.cloud_config.name}, delayed_action={delayed_action_received}, planning_active={self._planning_active}")
-        
-        # Additional debug info every few frames
-        if self.frame_idx % 200 == 0:
-            print(f"\n=== DETAILED DEBUG Frame {self.frame_idx} ===")
-            print(f"Cloud config: {self.cloud_config.name}")
-            print(f"Delayed action received: {action is not None}")
-            print(f"Planning active: {self._planning_active}")
-            print(f"Vehicle position: ({self.car.car.cur.x:.1f}, {self.car.car.cur.y:.1f})")
-            print(f"==========================================\n")
+            logger.info(f"Frame {self.frame_idx}: {self.cloud_config.name}, "
+                       f"waiting_for_cloud={self._waiting_for_cloud}, "
+                       f"planning_active={self._planning_active}")
         
         return observation, reward, success, terminated, truncated, states
         
@@ -677,10 +503,9 @@ class ExtensibleParkingHandler(BaseHandler):
         return None
         
     def close(self) -> None:
-        """Clean up resources with comprehensive error handling."""
+        """Clean up resources."""
         logger.info("Cleaning up CARLA resources...")
         
-        # Clean up recording camera
         if self.recording_cam is not None:
             try:
                 self.recording_cam.destroy()
@@ -689,7 +514,6 @@ class ExtensibleParkingHandler(BaseHandler):
             finally:
                 self.recording_cam = None
         
-        # Clean up car
         if self.car is not None:
             try:
                 if hasattr(self.car, 'actor') and self.car.actor:
@@ -699,13 +523,11 @@ class ExtensibleParkingHandler(BaseHandler):
             finally:
                 self.car = None
         
-        # Clean up other actors
         try:
             self._cleanup_actors()
         except Exception as e:
             logger.warning(f"Failed to clean up actors: {e}")
         
-        # Final world tick
         if self.world is not None:
             try:
                 self.world.tick()

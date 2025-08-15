@@ -1,0 +1,24 @@
+{
+  "scenario_name": "virtual_custom_latency100ms_bw100000000kbps",
+  "latency_ms": 100.0,
+  "num_trials": 1,
+  "results": {
+    "cloud_perception": {
+      "ious": [
+        0.7798332040220838
+      ],
+      "parking_times": [
+        18.05
+      ],
+      "iou_mean": 0.7798332040220838,
+      "iou_std": 0.0,
+      "iou_min": 0.7798332040220838,
+      "iou_max": 0.7798332040220838,
+      "parking_time_mean": 18.05,
+      "parking_time_std": 0.0,
+      "parking_time_min": 18.05,
+      "parking_time_max": 18.05,
+      "valid_parking_times_count": 1
+    }
+  }
+}
