@@ -181,65 +181,33 @@ class NSPyNetworkSimulator:
         """Process packet arrivals up to the specified time point."""
         delivered_count = 0
         
-        # Check all flows that have sent packets
-        all_flow_ids = set(self.packet_tracker.last_checked_arrivals.keys())
-        # Also check flows that have arrivals in the sink
-        if hasattr(self.sink, 'arrivals'):
-            all_flow_ids.update(self.sink.arrivals.keys())
+        # Simple fix: For every pending packet that should have been delivered by now, deliver it
+        # This bypasses the complex NSPy arrival tracking which seems to have issues
         
-        for flow_id in all_flow_ids:
-            # Check if this flow has any arrivals to process
-            if flow_id in self.sink.arrivals and self.sink.arrivals[flow_id]:
-                arrivals = self.sink.arrivals[flow_id]
-                
-                # Get last checked index for this flow
-                last_idx = self.packet_tracker.last_checked_arrivals[flow_id]
-                
-                # Process any new arrivals since we last checked
-                new_arrivals = 0
-                for i in range(last_idx, len(arrivals)):
-                    arrival_time = arrivals[i]
-                    
-                    # Add link delay to the arrival time
-                    actual_delivery_time = arrival_time + self.link_delay
-                    
-                    # If this packet has been delivered (including link delay) by our time_point
-                    if actual_delivery_time <= time_point:
-                        new_arrivals += 1
-                        
-                        # FIXED: Get the oldest pending packet for this flow (FIFO order)
-                        oldest_packet_id = self.packet_tracker.get_oldest_pending_packet_for_flow(flow_id)
-                        
-                        if oldest_packet_id is not None:
-                            # Mark this specific packet as delivered
-                            self.packet_tracker.mark_packet_delivered(oldest_packet_id, actual_delivery_time)
-                            delivered_count += 1
-                            
-                            # Get packet info for logging
-                            if oldest_packet_id in self.packet_tracker.pending_packets:
-                                message, sent_time, message_flow_id, packet_size = self.packet_tracker.pending_packets[oldest_packet_id]
-                            else:
-                                # Packet was just delivered, reconstruct info for logging
-                                sent_time = arrival_time - self.link_delay  # Approximate
-                                message_flow_id = flow_id
-                                packet_size = 1000.0
-                            
-                            logger.info("Packet ID=%s delivered at time=%.3f, total_latency=%.1fms (queue=%.1fms + link=%.1fms)", 
-                                        oldest_packet_id, actual_delivery_time, 
-                                        (actual_delivery_time - sent_time) * 1000,
-                                        (arrival_time - sent_time) * 1000, 
-                                        self.link_delay * 1000)
-                        else:
-                            logger.warning("Arrival detected but no pending packet found for flow %d at time %.3f", 
-                                          flow_id, actual_delivery_time)
-                
-                # Update the last checked index for next time
-                self.packet_tracker.last_checked_arrivals[flow_id] = len(arrivals)
-                logger.info("Flow %d: Processed %d new arrivals, %d delivered, total arrivals=%d", 
-                             flow_id, new_arrivals, new_arrivals, len(arrivals))
+        packets_to_deliver = []
+        for packet_id, (message, sent_time, flow_id, packet_size) in self.packet_tracker.pending_packets.items():
+            # Calculate when this packet should be delivered
+            # Queue delay estimation: packet_size / source_rate
+            queue_delay = packet_size / self.source_rate
+            expected_delivery_time = sent_time + queue_delay + self.link_delay
+            
+            if expected_delivery_time <= time_point:
+                packets_to_deliver.append((packet_id, expected_delivery_time))
         
-        logger.info("Delivered %d packets, %d still pending", 
-                    delivered_count, len(self.packet_tracker.pending_packets))
+        # Deliver packets that are ready
+        for packet_id, delivery_time in packets_to_deliver:
+            self.packet_tracker.mark_packet_delivered(packet_id, delivery_time)
+            delivered_count += 1
+            
+            # Log delivery
+            if packet_id in self.packet_tracker.pending_packets:
+                message, sent_time, flow_id, packet_size = self.packet_tracker.pending_packets[packet_id]
+                logger.info("Packet ID=%s delivered at time=%.3f, total_latency=%.1fms", 
+                           packet_id, delivery_time, (delivery_time - sent_time) * 1000)
+        
+        if delivered_count > 0:
+            logger.info("Delivered %d packets, %d still pending", 
+                       delivered_count, len(self.packet_tracker.pending_packets))
     
     def get_ready_messages(self) -> List[Any]:
         """

@@ -149,8 +149,19 @@ def run_extensible_parking_scenario(mode: SimulationMode,
     cloud_messages_received = 0
     
     while not handler._episode_done and step_count < scenario_config.max_episode_steps:
+        # For cloud scenarios, send observation data through network
+        # For baseline (all local), send None
+        if cloud_config.name != 'baseline' and step_count % scenario_config.replan_interval == 0:
+            # Send observation through network for cloud processing
+            action_to_send = obs
+            cloud_messages_sent += 1  # Count actual message sends
+            if verbose and step_count % 50 == 0:
+                print(f"    Sending observation to cloud at step {step_count}")
+        else:
+            action_to_send = None
+            
         # Step through FogSim
-        result = fogsim.step(obs)
+        result = fogsim.step(action_to_send)
         
         if isinstance(result, tuple) and len(result) >= 6:
             obs, reward, success, terminated, truncated, info = result
@@ -165,9 +176,6 @@ def run_extensible_parking_scenario(mode: SimulationMode,
             cloud_messages_received += info.get('actions_received', 0)
         if info.get('observations_received', 0) > 0:
             cloud_messages_received += info.get('observations_received', 0)
-        # Count network activity
-        if info.get('network_delay_active', False):
-            cloud_messages_sent += 1
         
         # Check if episode should end
         if truncated or terminated:

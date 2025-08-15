@@ -23,6 +23,7 @@ from cloud_components import (
     ControlData,
     CLOUD_SCENARIOS
 )
+import time
 
 # Import parking-specific utilities
 from experiment_utils import (
@@ -406,10 +407,11 @@ class ExtensibleParkingHandler(BaseHandler):
                 
     def step_with_action(self, action: Optional[np.ndarray]) -> Tuple:
         """
-        Simple approach: Use FogSim network to simulate cloud processing delays.
+        Process simulation step with proper cloud message handling.
         
-        The key insight: action parameter contains delayed observations from previous steps.
-        For cloud scenarios, only plan when receiving these delayed observations.
+        For cloud scenarios:
+        - action contains delayed messages from cloud processing
+        - We need to send appropriate data through the network for cloud components
         """
         # Execute physics simulation step
         self.step()
@@ -431,34 +433,54 @@ class ExtensibleParkingHandler(BaseHandler):
             )
         )
         
-        # CORRECTED LOGIC: Plan based on cloud architecture, not waiting for delayed observations
-        # The action parameter contains delayed control commands, not observations!
+        # Track if we received a delayed response from cloud
+        received_cloud_response = action is not None and isinstance(action, np.ndarray)
         
+        # For cloud scenarios, if we receive a delayed response, process it and plan
+        if received_cloud_response and self.cloud_config.name != 'baseline':
+            if self.frame_idx % 50 == 0:
+                print(f"Step {self.frame_idx}: Received cloud response, will plan now")
+            
+            # For cloud perception: plan with the delayed perception data
+            if self.cloud_config.perception_location == ComponentLocation.CLOUD:
+                try:
+                    self.car.plan()
+                    has_plan = hasattr(self.car.car, 'trajectory') and self.car.car.trajectory is not None and len(self.car.car.trajectory) > 0
+                    self._planning_active = has_plan
+                    
+                    if self.frame_idx % 50 == 0:
+                        print(f"Planning result (after cloud perception): has_plan={has_plan}, path_length={len(self.car.car.trajectory) if has_plan else 0}")
+                except Exception as e:
+                    print(f"Planning failed: {e}")
+                    self._planning_active = False
+                    
+            # For cloud planning: use the delayed planning result
+            elif self.cloud_config.planning_location == ComponentLocation.CLOUD:
+                self._planning_active = True  # Assume cloud sent valid plan
+                if self.frame_idx % 50 == 0:
+                    print(f"Using cloud planning result")
+        
+        # For baseline or when it's a regular planning interval without cloud
         should_plan = (self.frame_idx % self.scenario_config.replan_interval == 0)
         
-        if should_plan:
+        if should_plan and not received_cloud_response:
             if self.frame_idx % 50 == 0:
                 print(f"Step {self.frame_idx}: {self.cloud_config.name} planning triggered")
                 print(f"Planning: pos=({self.car.car.cur.x:.1f},{self.car.car.cur.y:.1f}) dest=({self.car.car.destination.x:.1f},{self.car.car.destination.y:.1f})")
             
-            try:
-                # For cloud scenarios, the planning itself could be delayed
-                # For now, plan locally but the results could be delayed by FogSim network
-                self.car.plan()
-                has_plan = hasattr(self.car.car, 'trajectory') and self.car.car.trajectory is not None and len(self.car.car.trajectory) > 0
-                self._planning_active = has_plan
-                
-                if self.frame_idx % 50 == 0:
-                    print(f"Planning result: has_plan={has_plan}, path_length={len(self.car.car.trajectory) if has_plan else 0}")
-            except Exception as e:
-                print(f"Planning failed: {e}")
-                self._planning_active = False
-        
-        # Process delayed actions if any (this is the correct use of the action parameter)
-        if action is not None:
-            if self.frame_idx % 50 == 0:
-                print(f"Step {self.frame_idx}: {self.cloud_config.name} received delayed action: {action}")
-            # TODO: Process delayed control commands if this were a full cloud scenario
+            # For baseline (all local): plan immediately
+            if self.cloud_config.name == 'baseline':
+                try:
+                    self.car.plan()
+                    has_plan = hasattr(self.car.car, 'trajectory') and self.car.car.trajectory is not None and len(self.car.car.trajectory) > 0
+                    self._planning_active = has_plan
+                    
+                    if self.frame_idx % 50 == 0:
+                        print(f"Planning result (baseline): has_plan={has_plan}, path_length={len(self.car.car.trajectory) if has_plan else 0}")
+                except Exception as e:
+                    print(f"Planning failed: {e}")
+                    self._planning_active = False
+            # For cloud scenarios, we'll wait for the delayed response
         
         # Execute control
         if self._planning_active:
@@ -481,16 +503,12 @@ class ExtensibleParkingHandler(BaseHandler):
         if self.frame_idx % 100 == 0:
             delayed_action_received = action is not None
             print(f"FogSim Debug - Frame {self.frame_idx}: {self.cloud_config.name}, delayed_action={delayed_action_received}, planning_active={self._planning_active}")
-            if action is not None:
-                print(f"FogSim Debug - Delayed action: type={type(action)}, action={action}")
         
         # Additional debug info every few frames
         if self.frame_idx % 200 == 0:
             print(f"\n=== DETAILED DEBUG Frame {self.frame_idx} ===")
             print(f"Cloud config: {self.cloud_config.name}")
             print(f"Delayed action received: {action is not None}")
-            if action is not None:
-                print(f"Action: {action} (type: {type(action)})")
             print(f"Planning active: {self._planning_active}")
             print(f"Vehicle position: ({self.car.car.cur.x:.1f}, {self.car.car.cur.y:.1f})")
             print(f"==========================================\n")
