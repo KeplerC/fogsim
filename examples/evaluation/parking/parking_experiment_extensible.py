@@ -84,21 +84,21 @@ NETWORK_SCENARIOS = {
     "low_latency": ExtensibleScenarioConfig(
         name="low_latency",
         network_delay=0.005,  # 5ms
-        packet_loss_rate=0.001,  # 0.1% loss
+        packet_loss_rate=0,  # 0.1% loss
         source_rate=1e6,  # 1 Mbps
     ),
     
     "medium_latency": ExtensibleScenarioConfig(
         name="medium_latency", 
         network_delay=0.020,  # 20ms
-        packet_loss_rate=0.01,  # 1% loss
+        packet_loss_rate=0,  # 1% loss
         source_rate=500e3,  # 500 Kbps
     ),
     
     "high_latency": ExtensibleScenarioConfig(
         name="high_latency",
         network_delay=0.050,  # 50ms
-        packet_loss_rate=0.03,  # 3% loss
+        packet_loss_rate=0,  # 3% loss
         source_rate=200e3,  # 200 Kbps
     ),
 }
@@ -159,11 +159,14 @@ def run_extensible_parking_scenario(mode: SimulationMode,
         
         step_count += 1
         
-        # Track cloud message statistics
-        if info.get('next_message_type'):
+        # Track cloud message statistics  
+        if info.get('actions_received', 0) > 0:
+            cloud_messages_received += info.get('actions_received', 0)
+        if info.get('observations_received', 0) > 0:
+            cloud_messages_received += info.get('observations_received', 0)
+        # Count network activity
+        if info.get('network_delay_active', False):
             cloud_messages_sent += 1
-        if info.get('delayed_message_received'):
-            cloud_messages_received += 1
         
         # Check if episode should end
         if truncated or terminated:
@@ -358,7 +361,7 @@ def main():
                        help="FogSim modes to test")
     parser.add_argument("--clouds", nargs='+', 
                        choices=list(CLOUD_SCENARIOS.keys()),
-                       default=['baseline', 'cloud_perception', 'cloud_planning'],
+                       default=['cloud_perception', 'cloud_planning'],
                        help="Cloud scenarios to test")
     parser.add_argument("--network", type=str, default="low_latency",
                        choices=list(NETWORK_SCENARIOS.keys()),

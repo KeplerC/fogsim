@@ -244,11 +244,16 @@ class ExtensibleParkingHandler(BaseHandler):
                     frame_id=self.frame_idx
                 )
     
-    def _process_planning_pipeline(self, perception_data: PerceptionData) -> PlanningData:
+    def _process_planning_pipeline(self, perception_data: Optional[PerceptionData]) -> PlanningData:
         """Process the planning pipeline based on cloud configuration."""
         if self.planning_component.location == ComponentLocation.LOCAL:
             # Local planning - process immediately
-            return self.planning_component.process(perception_data, self.car)
+            if perception_data is not None:
+                return self.planning_component.process(perception_data, self.car)
+            else:
+                # No perception data available - create local perception first
+                local_perception = self._process_perception_pipeline()
+                return self.planning_component.process(local_perception, self.car)
         else:
             # Cloud planning - use last known planning data if available
             if self._last_planning_data is not None:
@@ -331,10 +336,10 @@ class ExtensibleParkingHandler(BaseHandler):
             if self._parking_time is None:
                 self._parking_time = self.frame_idx * self.scenario_config.timestep
             
-        # Create observation vector
+        # Create BASE observation vector (15 elements)
         self._observation = np.array([
             transform.location.x,
-            transform.location.y,
+            transform.location.y, 
             transform.rotation.yaw,
             velocity.x,
             velocity.y,
@@ -391,113 +396,117 @@ class ExtensibleParkingHandler(BaseHandler):
                 
     def step_with_action(self, action: Optional[np.ndarray]) -> Tuple:
         """
-        Step environment with FogSim network integration.
+        Simple approach: Use FogSim network to simulate cloud processing delays.
         
-        This method handles the complex flow of data through cloud components
-        with proper network delays managed by FogSim.
+        The key insight: action parameter contains delayed observations from previous steps.
+        For cloud scenarios, only plan when receiving these delayed observations.
         """
-        # Process delayed messages that arrived through network
-        delayed_message = action
-        
-        if delayed_message is not None:
-            # Parse the delayed message
-            if isinstance(delayed_message, dict):
-                msg_type = delayed_message.get('type')
-                msg_data = delayed_message.get('data')
-                
-                if msg_type == 'perception' and isinstance(msg_data, dict):
-                    self._last_perception_data = PerceptionData.from_dict(msg_data)
-                    logger.debug(f"Received delayed perception data for frame {self._last_perception_data.frame_id}")
-                    
-                elif msg_type == 'planning' and isinstance(msg_data, dict):
-                    self._last_planning_data = PlanningData.from_dict(msg_data)
-                    logger.debug(f"Received delayed planning data for frame {self._last_planning_data.frame_id}")
-                    
-                elif msg_type == 'control' and isinstance(msg_data, dict):
-                    self._last_control_data = ControlData.from_dict(msg_data)
-                    logger.debug(f"Received delayed control data for frame {self._last_control_data.frame_id}")
-        
-        # Execute physics simulation step FIRST to localize the car
+        # Execute physics simulation step
         self.step()
         
-        # PLANNING PHASE: Only plan when we receive delayed observations (matches original exactly)
-        if delayed_message is not None:
-            # We received a delayed observation - trigger planning
-            if self.frame_idx % 50 == 0:
-                print(f"Step {self.frame_idx}: Planning with delayed observation")
-                print(f"Planning: pos=({self.car.car.cur.x:.1f},{self.car.car.cur.y:.1f}) dest=({self.car.car.destination.x:.1f},{self.car.car.destination.y:.1f})")
-                
-            # Update perception before planning (like original _update_perception)
-            if self.walkers:
-                self.dynamic_bbs = update_walkers(self.walkers)
-            else:
-                self.dynamic_bbs = []
-            
-            all_bbs = self.static_bbs + self.dynamic_bbs
-            self.car.car.obs = union_obstacle_map(
-                self.car.car.obs,
-                mask_obstacle_map(
-                    obstacle_map_from_bbs(all_bbs),
-                    self.car.car.cur.x,
-                    self.car.car.cur.y
-                )
-            )
-            
-            # Run the planner to generate control commands (like original)
-            try:
-                if self.frame_idx % 50 == 0:
-                    print(f"Before planning: obstacle_map shape={self.car.car.obs.obs.shape}, non_zero={np.count_nonzero(self.car.car.obs.obs)}")
-                    print(f"Distance to destination: {self.car.car.cur.distance(self.car.car.destination):.2f}")
-                
-                self.car.plan()
-                self._planning_active = True
-                
-                if self.frame_idx % 50 == 0:
-                    has_plan = hasattr(self.car.car, 'path') and self.car.car.path is not None and len(self.car.car.path) > 0
-                    print(f"Planning result: has_plan={has_plan}, path_length={len(self.car.car.path) if has_plan else 0}")
-                    
-            except Exception as e:
-                print(f"Planning failed with exception: {e}")
-                import traceback
-                traceback.print_exc()
-                self._planning_active = False
-        
-        # EXECUTION PHASE: Execute the control commands generated by the planner (like original)
-        if self._planning_active:
-            # Execute the planned trajectory
-            self.car.run_step()
+        # Update dynamic obstacles
+        if self.walkers:
+            self.dynamic_bbs = update_walkers(self.walkers)
         else:
-            # No plan available - just coast (like original)
-            if self.car and self.car.actor:
+            self.dynamic_bbs = []
+        
+        # Update obstacle map every step
+        all_bbs = self.static_bbs + self.dynamic_bbs
+        self.car.car.obs = union_obstacle_map(
+            self.car.car.obs,
+            mask_obstacle_map(
+                obstacle_map_from_bbs(all_bbs),
+                self.car.car.cur.x,
+                self.car.car.cur.y
+            )
+        )
+        
+        if self.cloud_config.name == "baseline":
+            # BASELINE: Plan locally on regular schedule
+            should_plan = (self.frame_idx % self.scenario_config.replan_interval == 0)
+            
+            if should_plan:
+                if self.frame_idx % 50 == 0:
+                    print(f"Step {self.frame_idx}: Baseline local planning")
+                    print(f"Planning: pos=({self.car.car.cur.x:.1f},{self.car.car.cur.y:.1f}) dest=({self.car.car.destination.x:.1f},{self.car.car.destination.y:.1f})")
+                
                 try:
-                    import carla
-                    self.car.actor.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0, steer=0.0))
-                except:
-                    pass
+                    self.car.plan()
+                    has_plan = hasattr(self.car.car, 'trajectory') and self.car.car.trajectory is not None and len(self.car.car.trajectory) > 0
+                    self._planning_active = has_plan
+                    
+                    if self.frame_idx % 50 == 0:
+                        print(f"Planning result: has_plan={has_plan}, path_length={len(self.car.car.trajectory) if has_plan else 0}")
+                except Exception as e:
+                    print(f"Planning failed: {e}")
+                    self._planning_active = False
+        else:
+            # CLOUD SCENARIOS: Only plan when delayed observations arrive
+            # This simulates the effect of cloud processing delays
+            delayed_obs_received = (action is not None and isinstance(action, np.ndarray) and len(action) >= 15)
+             
+            if delayed_obs_received:
+                if self.frame_idx % 50 == 0:
+                    print(f"Step {self.frame_idx}: {self.cloud_config.name} planning with delayed observation")
+                    print(f"Planning: pos=({self.car.car.cur.x:.1f},{self.car.car.cur.y:.1f}) dest=({self.car.car.destination.x:.1f},{self.car.car.destination.y:.1f})")
+                
+                try:
+                    self.car.plan()
+                    has_plan = hasattr(self.car.car, 'trajectory') and self.car.car.trajectory is not None and len(self.car.car.trajectory) > 0
+                    self._planning_active = has_plan
+                    
+                    if self.frame_idx % 50 == 0:
+                        print(f"Planning result: has_plan={has_plan}, path_length={len(self.car.car.trajectory) if has_plan else 0}")
+                except Exception as e:
+                    print(f"Cloud planning failed: {e}")
+                    self._planning_active = False
+            else:
+                if self.frame_idx % 50 == 0:
+                    print(f"Step {self.frame_idx}: {self.cloud_config.name} waiting for delayed observation... NO MESSAGES RECEIVED")
+                    print(f"Action type: {type(action)}, Action: {action}")
+                    if action is not None:
+                        print(f"Action shape/length: {getattr(action, 'shape', len(action) if hasattr(action, '__len__') else 'no length')}")
         
-        # Get fresh observation (this will be sent through network by FogSim)
+        # Execute control
+        if self._planning_active:
+            self.car.run_step()
+        
+        # Get current state
         states = self.get_states()
-        fresh_observation = states['observation']
+        observation = states['observation']
         
-        # Calculate reward
+        # Calculate reward and termination
         reward = 0.0
         if states['done']:
             reward = states['iou'] * 100
             
-        # Determine termination
         terminated = states['done']
         truncated = self.frame_idx >= self.scenario_config.max_episode_steps
         success = states['iou'] >= 0.8 if states['done'] else False
         
-        # Add debugging info (like original)
-        states['delayed_obs_received'] = delayed_message is not None
-        states['planning_active'] = self._planning_active
-        states['frame'] = self.frame_idx
-        states['cloud_config'] = self.cloud_config.name
+        # Debug info
+        if self.frame_idx % 100 == 0:
+            if self.cloud_config.name != "baseline":
+                delayed_obs_received = (action is not None and isinstance(action, np.ndarray) and len(action) >= 15)
+                delayed_status = "received" if delayed_obs_received else "none"
+                print(f"FogSim Debug - Frame {self.frame_idx}: delayed_obs={delayed_status}, planning_active={self._planning_active}")
+                print(f"FogSim Debug - Action details: type={type(action)}, action={action}")
+            else:
+                print(f"FogSim Debug - Frame {self.frame_idx}: baseline mode, planning_active={self._planning_active}")
         
-        # Return the FRESH observation (FogSim core will handle sending it through network)
-        # This matches the original pattern exactly
-        return fresh_observation, reward, success, terminated, truncated, states
+        # Additional debug info every few frames
+        if self.frame_idx % 200 == 0 and self.cloud_config.name != "baseline":
+            print(f"\n=== DETAILED DEBUG Frame {self.frame_idx} ===")
+            print(f"Cloud config: {self.cloud_config.name}")
+            print(f"Expecting delayed observations: YES")
+            print(f"Action received: {action}")
+            print(f"Action type: {type(action)}")
+            if action is not None:
+                print(f"Action properties: {dir(action) if hasattr(action, '__dict__') else 'no __dict__'}")
+            print(f"Planning active: {self._planning_active}")
+            print(f"==========================================\n")
+        
+        return observation, reward, success, terminated, truncated, states
         
     def render(self) -> Optional[np.ndarray]:
         """Render is not implemented for this handler."""

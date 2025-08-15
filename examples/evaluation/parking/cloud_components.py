@@ -464,7 +464,7 @@ CLOUD_SCENARIOS = {
         perception_location=ComponentLocation.CLOUD,
         planning_location=ComponentLocation.CLOUD,
         control_location=ComponentLocation.LOCAL,
-        description="Perception local, planning on cloud (delayed), control local"
+        description="Perception and planning on cloud (delayed), control local"
     ),
     
     "full_cloud": CloudArchitectureConfig(

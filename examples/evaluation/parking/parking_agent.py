@@ -218,8 +218,6 @@ class CarlaCar():
     def localize(self): self.car.localize()
     def plan(self): self.car.plan()
     def perceive(self): self.car.perceive()
-    
-    def plan(self): self.car.plan()
     def run_step(self):
         self.actor.apply_control(self.car.control())
         if self.debug:
