@@ -109,16 +109,32 @@ class ExtensibleParkingHandler(BaseHandler):
         if self._launched:
             return
             
-        # Initialize CARLA (same as original)
-        from parking_experiment_fogsim import ensure_carla_running
-        if not ensure_carla_running():
-            raise RuntimeError("Failed to start CARLA server")
+        try:
+            # Initialize CARLA (same as original)
+            from parking_experiment_fogsim import ensure_carla_running
+            if not ensure_carla_running():
+                raise RuntimeError("Failed to start CARLA server")
+                
+            logger.info("Starting CARLA client connection...")
+            self.client = load_client()
+            if self.client is None:
+                raise RuntimeError("Failed to create CARLA client")
+                
+            logger.info("Loading Town04 world...")
+            self.world = town04_load(self.client)
+            if self.world is None:
+                raise RuntimeError("Failed to load Town04 world")
+                
+            logger.info("Setting spectator view...")
+            town04_spectator_bev(self.world)
             
-        self.client = load_client()
-        self.world = town04_load(self.client)
-        town04_spectator_bev(self.world)
-        
-        self._launched = True
+            logger.info("CARLA initialization successful")
+            self._launched = True
+            
+        except Exception as e:
+            logger.error(f"Failed to launch CARLA: {e}")
+            self._launched = False
+            raise RuntimeError(f"CARLA launch failed: {e}") from e
         
     def set_scenario(self, destination: int, parked_spots: List[int]):
         """Set the parking scenario parameters."""
@@ -156,13 +172,21 @@ class ExtensibleParkingHandler(BaseHandler):
         self.walkers = walkers
         
         self.static_bbs = parked_cars_bbs + traffic_cone_bbs
-        self.world.tick()
+        try:
+            self.world.tick()
+        except Exception as e:
+            logger.error(f"Failed to tick world during actor spawning: {e}")
+            raise RuntimeError(f"World tick failed: {e}") from e
         
     def _cleanup_actors(self):
-        """Clean up all spawned actors."""
-        for actor in self.actors_to_cleanup:
+        """Clean up all spawned actors with error handling."""
+        for i, actor in enumerate(self.actors_to_cleanup):
             if actor is not None:
-                actor.destroy()
+                try:
+                    # Just try to destroy - CARLA handles already destroyed actors gracefully
+                    actor.destroy()
+                except Exception as e:
+                    logger.warning(f"Failed to destroy actor {i}: {e}")
         self.actors_to_cleanup.clear()
         
     def set_states(self, states: Optional[Dict[str, Any]] = None,
@@ -182,22 +206,43 @@ class ExtensibleParkingHandler(BaseHandler):
             self.car = None
         self._cleanup_actors()
         
-        # Spawn new actors
-        self._spawn_actors()
-        
-        # Initialize ego vehicle
-        self.car = town04_spawn_ego_vehicle(
-            self.world, self.destination_parking_spot
-        )
-        
-        # Initialize video recording if configured
-        if self.recording_file is not None:
-            self.recording_cam = self.car.init_recording(self.recording_file)
-        
-        # Initialize perception with static obstacles
-        self.car.car.obs = clear_obstacle_map(
-            obstacle_map_from_bbs(self.static_bbs)
-        )
+        try:
+            # Spawn new actors
+            self._spawn_actors()
+            
+            # Initialize ego vehicle
+            logger.info(f"Spawning ego vehicle for destination spot {self.destination_parking_spot}")
+            self.car = town04_spawn_ego_vehicle(
+                self.world, self.destination_parking_spot
+            )
+            if self.car is None:
+                raise RuntimeError("Failed to spawn ego vehicle")
+            
+            # Initialize video recording if configured
+            if self.recording_file is not None:
+                try:
+                    logger.info("Initializing video recording...")
+                    self.recording_cam = self.car.init_recording(self.recording_file)
+                except Exception as e:
+                    logger.warning(f"Failed to initialize video recording: {e}")
+                    self.recording_cam = None
+            
+            # Initialize perception with static obstacles
+            self.car.car.obs = clear_obstacle_map(
+                obstacle_map_from_bbs(self.static_bbs)
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to reset scenario: {e}")
+            # Clean up any partially created resources
+            self._cleanup_actors()
+            if self.car is not None:
+                try:
+                    self.car.destroy()
+                except:
+                    pass
+                self.car = None
+            raise RuntimeError(f"Scenario reset failed: {e}") from e
         
         # Reset state variables
         self.frame_idx = 0
@@ -286,9 +331,27 @@ class ExtensibleParkingHandler(BaseHandler):
                         brake=self._last_control_data.brake,
                         steer=self._last_control_data.steer
                     )
-                    self.car.actor.apply_control(control)
+                    if self.car and self.car.actor:
+                        try:
+                            self.car.actor.apply_control(control)
+                        except RuntimeError:
+                            logger.error("Car actor is destroyed or None, cannot apply control")
+                            self._episode_done = True
+                    else:
+                        logger.error("Car actor is destroyed or None, cannot apply control")
+                        self._episode_done = True
                 except Exception as e:
                     logger.warning(f"Failed to apply delayed control: {e}")
+                    # Set emergency stop if control fails
+                    try:
+                        if self.car and self.car.actor:
+                            try:
+                                emergency_control = carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0)
+                                self.car.actor.apply_control(emergency_control)
+                            except RuntimeError:
+                                pass
+                    except:
+                        pass
                 
                 return self._last_control_data
             else:
@@ -300,63 +363,111 @@ class ExtensibleParkingHandler(BaseHandler):
                     timestamp=time.time(),
                     frame_id=self.frame_idx
                 )
-                # Apply stop command
+                # Apply stop command with improved error handling
                 try:
                     import carla
                     control = carla.VehicleControl(throttle=0.0, brake=0.5, steer=0.0)
-                    self.car.actor.apply_control(control)
-                except:
-                    pass
+                    if self.car and self.car.actor:
+                        try:
+                            self.car.actor.apply_control(control)
+                        except RuntimeError:
+                            logger.error("Car actor is destroyed or None, cannot apply stop control")
+                            self._episode_done = True
+                    else:
+                        logger.error("Car actor is destroyed or None, cannot apply stop control")
+                        self._episode_done = True
+                except Exception as e:
+                    logger.warning(f"Failed to apply stop control: {e}")
+                    self._episode_done = True
                 
                 return control_data
     
     def _should_replan(self):
-        """Determine if replanning is needed."""
-        return (self.frame_idx % self.scenario_config.replan_interval == 0 and 
-                self.car.car.cur.distance(self.car.car.destination) > self.scenario_config.distance_threshold)
+        """Determine if replanning is needed with error handling."""
+        try:
+            if self.car is None or not hasattr(self.car, 'actor') or self.car.actor is None:
+                return False
+            # Try to access car data to check if it's still valid
+            try:
+                self.car.actor.get_transform()
+            except RuntimeError:
+                return False
+            return (self.frame_idx % self.scenario_config.replan_interval == 0 and 
+                    self.car.car.cur.distance(self.car.car.destination) > self.scenario_config.distance_threshold)
+        except Exception as e:
+            logger.warning(f"Error checking replan condition: {e}")
+            return False
         
     def _update_observation(self):
-        """Update the observation vector."""
+        """Update the observation vector with error handling."""
         if self.car is None:
             self._observation = np.zeros(15)
             return
             
-        # Get car state
-        transform = self.car.actor.get_transform()
-        velocity = self.car.actor.get_velocity()
-        
-        # Calculate distance to destination
-        dist_to_dest = self.car.car.cur.distance(self.car.car.destination)
-        
-        # Check if done
-        self._episode_done = is_done(self.car)
-        
-        # Calculate IoU and parking time if parked
-        if self._episode_done:
-            self._last_iou = self.car.iou()
-            if self._parking_time is None:
-                self._parking_time = self.frame_idx * self.scenario_config.timestep
+        try:
+            # Check if car actor is still valid
+            if not hasattr(self.car, 'actor') or self.car.actor is None:
+                logger.error("Car actor is None, setting default observation")
+                self._observation = np.zeros(15)
+                self._episode_done = True
+                return
             
-        # Create BASE observation vector (15 elements)
-        self._observation = np.array([
-            transform.location.x,
-            transform.location.y, 
-            transform.rotation.yaw,
-            velocity.x,
-            velocity.y,
-            dist_to_dest,
-            float(self._episode_done),
-            self._last_iou,
-            self.frame_idx / self.scenario_config.max_episode_steps,
-            # Obstacle map features
-            np.sum(self.car.car.obs.obs) / (self.car.car.obs.obs.size + 1e-6),
-            np.mean(self.car.car.obs.obs),
-            np.std(self.car.car.obs.obs),
-            # Parking spot location
-            self.car.car.destination.x,
-            self.car.car.destination.y,
-            self.car.car.destination.angle,
-        ])
+            # Try to access car data to check if it's still valid
+            try:
+                self.car.actor.get_transform()
+            except RuntimeError:
+                logger.error("Car actor is destroyed, setting default observation")
+                self._observation = np.zeros(15)
+                self._episode_done = True
+                return
+            
+            # Get car state
+            transform = self.car.actor.get_transform()
+            velocity = self.car.actor.get_velocity()
+            
+            # Calculate distance to destination
+            dist_to_dest = self.car.car.cur.distance(self.car.car.destination)
+            
+            # Check if done
+            self._episode_done = is_done(self.car)
+            
+            # Calculate IoU and parking time if parked
+            if self._episode_done:
+                try:
+                    self._last_iou = self.car.iou()
+                except Exception as e:
+                    logger.warning(f"Failed to calculate IoU: {e}")
+                    self._last_iou = 0.0
+                    
+                if self._parking_time is None:
+                    self._parking_time = self.frame_idx * self.scenario_config.timestep
+                
+            # Create BASE observation vector (15 elements)
+            self._observation = np.array([
+                transform.location.x,
+                transform.location.y, 
+                transform.rotation.yaw,
+                velocity.x,
+                velocity.y,
+                dist_to_dest,
+                float(self._episode_done),
+                self._last_iou,
+                self.frame_idx / self.scenario_config.max_episode_steps,
+                # Obstacle map features
+                np.sum(self.car.car.obs.obs) / (self.car.car.obs.obs.size + 1e-6),
+                np.mean(self.car.car.obs.obs),
+                np.std(self.car.car.obs.obs),
+                # Parking spot location
+                self.car.car.destination.x,
+                self.car.car.destination.y,
+                self.car.car.destination.angle,
+            ])
+            
+        except Exception as e:
+            logger.error(f"Failed to update observation at frame {self.frame_idx}: {e}")
+            # Provide a safe fallback observation
+            self._observation = np.zeros(15)
+            self._episode_done = True
         
     def get_states(self) -> Dict[str, Any]:
         """Get current simulator states."""
@@ -384,9 +495,19 @@ class ExtensibleParkingHandler(BaseHandler):
         if self._episode_done:
             return
         
-        # Tick simulation
-        self.world.tick()
-        self.car.localize()
+        # Tick simulation with error handling
+        try:
+            self.world.tick()
+        except Exception as e:
+            logger.error(f"World tick failed at frame {self.frame_idx}: {e}")
+            self._episode_done = True
+            return
+            
+        try:
+            self.car.localize()
+        except Exception as e:
+            logger.error(f"Car localization failed at frame {self.frame_idx}: {e}")
+            # Continue execution but log the error
         
         # Process recording frames if video recording is enabled
         if self.recording_file:
@@ -444,14 +565,21 @@ class ExtensibleParkingHandler(BaseHandler):
             # For cloud perception: plan with the delayed perception data
             if self.cloud_config.perception_location == ComponentLocation.CLOUD:
                 try:
-                    self.car.plan()
-                    has_plan = hasattr(self.car.car, 'trajectory') and self.car.car.trajectory is not None and len(self.car.car.trajectory) > 0
-                    self._planning_active = has_plan
-                    
-                    if self.frame_idx % 50 == 0:
-                        print(f"Planning result (after cloud perception): has_plan={has_plan}, path_length={len(self.car.car.trajectory) if has_plan else 0}")
+                    if self.car and self.car.actor:
+                        # Check if actor is valid by accessing transform
+                        self.car.actor.get_transform()
+                        self.car.plan()
+                        has_plan = hasattr(self.car.car, 'trajectory') and self.car.car.trajectory is not None and len(self.car.car.trajectory) > 0
+                        self._planning_active = has_plan
+                        
+                        if self.frame_idx % 50 == 0:
+                            print(f"Planning result (after cloud perception): has_plan={has_plan}, path_length={len(self.car.car.trajectory) if has_plan else 0}")
+                    else:
+                        logger.error("Car actor is None or destroyed, cannot plan after cloud perception")
+                        self._planning_active = False
+                        self._episode_done = True
                 except Exception as e:
-                    print(f"Planning failed: {e}")
+                    logger.error(f"Planning failed: {e}")
                     self._planning_active = False
                     
             # For cloud planning: use the delayed planning result
@@ -471,20 +599,58 @@ class ExtensibleParkingHandler(BaseHandler):
             # For baseline (all local): plan immediately
             if self.cloud_config.name == 'baseline':
                 try:
-                    self.car.plan()
-                    has_plan = hasattr(self.car.car, 'trajectory') and self.car.car.trajectory is not None and len(self.car.car.trajectory) > 0
-                    self._planning_active = has_plan
-                    
-                    if self.frame_idx % 50 == 0:
-                        print(f"Planning result (baseline): has_plan={has_plan}, path_length={len(self.car.car.trajectory) if has_plan else 0}")
+                    if self.car and self.car.actor:
+                        try:
+                            # Check if actor is valid by accessing transform
+                            self.car.actor.get_transform()
+                            self.car.plan()
+                        except RuntimeError:
+                            logger.error("Car actor is destroyed, cannot plan")
+                            self._planning_active = False
+                            self._episode_done = True
+                            return
+                        has_plan = hasattr(self.car.car, 'trajectory') and self.car.car.trajectory is not None and len(self.car.car.trajectory) > 0
+                        self._planning_active = has_plan
+                        
+                        if self.frame_idx % 50 == 0:
+                            print(f"Planning result (baseline): has_plan={has_plan}, path_length={len(self.car.car.trajectory) if has_plan else 0}")
+                    else:
+                        logger.error("Car actor is destroyed, cannot plan")
+                        self._planning_active = False
+                        self._episode_done = True
                 except Exception as e:
-                    print(f"Planning failed: {e}")
+                    logger.error(f"Planning failed: {e}")
                     self._planning_active = False
             # For cloud scenarios, we'll wait for the delayed response
         
-        # Execute control
+        # Execute control with error handling
         if self._planning_active:
-            self.car.run_step()
+            try:
+                if self.car and self.car.actor:
+                    try:
+                        self.car.run_step()
+                    except RuntimeError:
+                        logger.error("Car actor is destroyed, stopping episode")
+                        self._episode_done = True
+                        self._planning_active = False
+                else:
+                    logger.error("Car actor is destroyed, stopping episode")
+                    self._episode_done = True
+                    self._planning_active = False
+            except Exception as e:
+                logger.error(f"Car run_step failed at frame {self.frame_idx}: {e}")
+                self._planning_active = False
+                # Try emergency stop
+                try:
+                    if self.car and self.car.actor:
+                        try:
+                            import carla
+                            emergency_control = carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0)
+                            self.car.actor.apply_control(emergency_control)
+                        except RuntimeError:
+                            pass
+                except:
+                    pass
         
         # Get current state
         states = self.get_states()
@@ -520,17 +686,43 @@ class ExtensibleParkingHandler(BaseHandler):
         return None
         
     def close(self) -> None:
-        """Clean up resources."""
+        """Clean up resources with comprehensive error handling."""
+        logger.info("Cleaning up CARLA resources...")
+        
+        # Clean up recording camera
         if self.recording_cam is not None:
-            self.recording_cam.destroy()
-            self.recording_cam = None
+            try:
+                self.recording_cam.destroy()
+            except Exception as e:
+                logger.warning(f"Failed to destroy recording camera: {e}")
+            finally:
+                self.recording_cam = None
+        
+        # Clean up car
         if self.car is not None:
-            self.car.destroy()
-            self.car = None
-        self._cleanup_actors()
+            try:
+                if hasattr(self.car, 'actor') and self.car.actor:
+                    self.car.destroy()
+            except Exception as e:
+                logger.warning(f"Failed to destroy car: {e}")
+            finally:
+                self.car = None
+        
+        # Clean up other actors
+        try:
+            self._cleanup_actors()
+        except Exception as e:
+            logger.warning(f"Failed to clean up actors: {e}")
+        
+        # Final world tick
         if self.world is not None:
-            self.world.tick()
+            try:
+                self.world.tick()
+            except Exception as e:
+                logger.warning(f"Failed to tick world during cleanup: {e}")
+        
         self._launched = False
+        logger.info("CARLA cleanup completed")
         
     def get_extra(self) -> Dict[str, Any]:
         """Get extra metadata."""

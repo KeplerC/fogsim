@@ -227,6 +227,7 @@ def run_cloud_scenario_experiments(mode: SimulationMode,
                                   scenario_config: ExtensibleScenarioConfig,
                                   cloud_configs: List[CloudArchitectureConfig],
                                   scenarios: List[Tuple[int, List[int]]],
+                                  num_trials: int = 3,
                                   video_enabled: bool = False,
                                   verbose: bool = True) -> Dict[str, Tuple[List[float], List[Optional[float]]]]:
     """Run experiments for multiple cloud configurations."""
@@ -241,38 +242,58 @@ def run_cloud_scenario_experiments(mode: SimulationMode,
         parking_times = []
         
         for idx, (destination, parked_spots) in enumerate(scenarios):
-            recording_file = None
+            if verbose:
+                print(f'    Scenario {idx+1}: Destination {destination}, Occupied spots {parked_spots}')
             
-            # Create unique video filename if video is enabled
-            if video_enabled:
-                video_filename = f'parking_{cloud_config.name}_latency{int(scenario_config.network_delay*1000)}ms_rate{int(scenario_config.source_rate/1000)}kbps_dest{destination}_run{idx+1}.mp4'
-                recording_file = iio.imopen(video_filename, 'w', plugin='pyav')
-                recording_file.init_video_stream('vp9', fps=scenario_config.video_fps)
+            # Run multiple trials for this scenario
+            scenario_ious = []
+            scenario_times = []
+            
+            for trial_num in range(num_trials):
                 if verbose:
-                    print(f'    Recording video to: {video_filename}')
+                    print(f'      Trial {trial_num+1}/{num_trials}')
+                
+                recording_file = None
+                
+                # Create unique video filename if video is enabled
+                if video_enabled:
+                    video_filename = f'parking_{cloud_config.name}_latency{int(scenario_config.network_delay*1000)}ms_rate{int(scenario_config.source_rate/1000)}kbps_dest{destination}_scenario{idx+1}_trial{trial_num+1}.mp4'
+                    recording_file = iio.imopen(video_filename, 'w', plugin='pyav')
+                    recording_file.init_video_stream('vp9', fps=scenario_config.video_fps)
+                    if verbose:
+                        print(f'        Recording video to: {video_filename}')
+                
+                result = run_extensible_parking_scenario(
+                    mode=mode,
+                    scenario_config=scenario_config,
+                    cloud_config=cloud_config,
+                    destination=destination,
+                    parked_spots=parked_spots,
+                    recording_file=recording_file,
+                    verbose=verbose
+                )
+                
+                scenario_ious.append(result['iou'])
+                scenario_times.append(result.get('parking_time'))
+                
+                # Close recording file
+                if recording_file:
+                    recording_file.close()
             
-            result = run_extensible_parking_scenario(
-                mode=mode,
-                scenario_config=scenario_config,
-                cloud_config=cloud_config,
-                destination=destination,
-                parked_spots=parked_spots,
-                recording_file=recording_file,
-                verbose=verbose
-            )
+            # Add all trial results to the overall lists
+            ious.extend(scenario_ious)
+            parking_times.extend(scenario_times)
             
-            ious.append(result['iou'])
-            parking_times.append(result.get('parking_time'))
-            
-            # Close recording file
-            if recording_file:
-                recording_file.close()
+            # Print trial summary for this scenario
+            if verbose and scenario_ious:
+                print(f'      Scenario summary: IOU = {np.mean(scenario_ious):.3f} ± {np.std(scenario_ious):.3f}')
         
         results[cloud_config.name] = (ious, parking_times)
         
         # Print summary for this cloud configuration
         if ious and verbose:
-            print(f'  Summary: mean IOU = {np.mean(ious):.3f}, std = {np.std(ious):.3f}')
+            total_trials = len(ious)
+            print(f'  Summary ({total_trials} trials): mean IOU = {np.mean(ious):.3f}, std = {np.std(ious):.3f}')
             valid_times = [t for t in parking_times if t is not None]
             if valid_times:
                 print(f'           mean parking time = {np.mean(valid_times):.2f}s, std = {np.std(valid_times):.2f}s')
@@ -283,11 +304,20 @@ def run_cloud_scenario_experiments(mode: SimulationMode,
 def plot_cloud_comparison_results(cloud_results: Dict[str, Tuple[List[float], List[Optional[float]]]], 
                                  scenario_name: str,
                                  latency_ms: float,
-                                 save_path: str = None):
+                                 save_path: str = None,
+                                 num_trials: int = 1):
     """Plot comparison results across different cloud architectures."""
     
     if save_path is None:
         save_path = f'parking_cloud_comparison_{scenario_name}_latency{int(latency_ms)}ms.png'
+    
+    # Prepare JSON data to save alongside the plot
+    json_data = {
+        'scenario_name': scenario_name,
+        'latency_ms': latency_ms,
+        'num_trials': num_trials,
+        'results': {}
+    }
     
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
     
@@ -312,6 +342,27 @@ def plot_cloud_comparison_results(cloud_results: Dict[str, Tuple[List[float], Li
             iou_means.append(np.mean(ious))
             iou_stds.append(np.std(ious))
             
+            # Store data for JSON export
+            json_data['results'][cloud_name] = {
+                'ious': ious,
+                'parking_times': parking_times,
+                'iou_mean': float(np.mean(ious)),
+                'iou_std': float(np.std(ious)),
+                'iou_min': float(np.min(ious)),
+                'iou_max': float(np.max(ious))
+            }
+            
+            # Add parking time statistics if available
+            valid_times = [t for t in parking_times if t is not None]
+            if valid_times:
+                json_data['results'][cloud_name].update({
+                    'parking_time_mean': float(np.mean(valid_times)),
+                    'parking_time_std': float(np.std(valid_times)),
+                    'parking_time_min': float(np.min(valid_times)),
+                    'parking_time_max': float(np.max(valid_times)),
+                    'valid_parking_times_count': len(valid_times)
+                })
+            
             # Scatter plot of individual results
             x_positions = np.random.normal(len(cloud_names)-1, 0.1, len(ious))
             ax1.scatter(x_positions, ious, alpha=0.6, 
@@ -324,7 +375,7 @@ def plot_cloud_comparison_results(cloud_results: Dict[str, Tuple[List[float], Li
     
     ax1.set_xlabel('Cloud Architecture')
     ax1.set_ylabel('Parking IOU')
-    ax1.set_title(f'Parking Performance by Cloud Architecture\n({scenario_name}, {latency_ms}ms latency)')
+    ax1.set_title(f'Parking Performance by Cloud Architecture\n({scenario_name}, {latency_ms}ms latency, {num_trials} trials)')
     ax1.set_xticks(range(len(cloud_names)))
     ax1.set_xticklabels(cloud_names)
     ax1.grid(True, alpha=0.3)
@@ -351,7 +402,7 @@ def plot_cloud_comparison_results(cloud_results: Dict[str, Tuple[List[float], Li
     
     ax2.set_xlabel('Cloud Architecture')
     ax2.set_ylabel('Parking Time (seconds)')
-    ax2.set_title(f'Parking Time by Cloud Architecture\n({scenario_name}, {latency_ms}ms latency)')
+    ax2.set_title(f'Parking Time by Cloud Architecture\n({scenario_name}, {latency_ms}ms latency, {num_trials} trials)')
     ax2.set_xticks(range(len(cloud_names)))
     ax2.set_xticklabels(cloud_names)
     ax2.grid(True, alpha=0.3)
@@ -360,6 +411,12 @@ def plot_cloud_comparison_results(cloud_results: Dict[str, Tuple[List[float], Li
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f'Cloud comparison results saved to {save_path}')
+    
+    # Save JSON data alongside the plot
+    json_save_path = save_path.replace('.png', '_data.json')
+    with open(json_save_path, 'w') as f:
+        json.dump(json_data, f, indent=2)
+    print(f'Raw data saved to {json_save_path}')
 
 
 def main():
@@ -372,7 +429,7 @@ def main():
                        choices=list(CLOUD_SCENARIOS.keys()),
                        default=['cloud_perception', 'cloud_planning'],
                        help="Cloud scenarios to test")
-    parser.add_argument("--latency", type=float, nargs='+', default=[10, 50, 100],
+    parser.add_argument("--latency", type=float, nargs='+', default=[10, 50, 75, 100, 150, 300],
                        help="List of network latencies in ms to test")
     parser.add_argument("--bandwidth", type=float, nargs='+', default=[100000000.0],
                        help="List of network bandwidths in kbps to test")
@@ -384,6 +441,8 @@ def main():
                        help="Path to custom network config JSON file")
     parser.add_argument("--save-config", type=str, 
                        help="Save current config to JSON file")
+    parser.add_argument("--trials", type=int, default=3,
+                       help="Number of trials to run for each configuration")
     
     args = parser.parse_args()
     
@@ -482,6 +541,7 @@ def main():
                         scenario_config=current_scenario_config,
                         cloud_configs=cloud_configs,
                         scenarios=SCENARIOS,
+                        num_trials=args.trials,
                         video_enabled=args.video,
                         verbose=True
                     )
@@ -497,14 +557,15 @@ def main():
                             network_results, 
                             f"{mode_name}_{current_scenario_config.name}",
                             current_scenario_config.network_delay * 1000,
-                            f'parking_cloud_{mode_name}_latency{int(latency_ms)}ms_bw{int(bandwidth_kbps)}kbps.png'
+                            f'parking_cloud_{mode_name}_latency{int(latency_ms)}ms_bw{int(bandwidth_kbps)}kbps.png',
+                            num_trials=args.trials
                         )
             
             all_results[mode_name] = mode_results
         
         # Print final comparison summary
         print(f"\n{'='*80}")
-        print("FINAL CLOUD ARCHITECTURE COMPARISON")
+        print(f"FINAL CLOUD ARCHITECTURE COMPARISON ({args.trials} trials per scenario)")
         print(f"{'='*80}")
         
         for mode_name, mode_results in all_results.items():
@@ -516,12 +577,13 @@ def main():
                 base_cloud_name = result_key.split('_latency')[0]
                 cloud_config = CLOUD_SCENARIOS[base_cloud_name]
                 if ious:
+                    total_trials = len(ious)
                     print(f"\n{result_key.upper()}: {cloud_config.description}")
-                    print(f"  IOU: {np.mean(ious):.3f} ± {np.std(ious):.3f} (range: {np.min(ious):.3f}-{np.max(ious):.3f})")
+                    print(f"  IOU ({total_trials} trials): {np.mean(ious):.3f} ± {np.std(ious):.3f} (range: {np.min(ious):.3f}-{np.max(ious):.3f})")
                     
                     valid_times = [t for t in parking_times if t is not None]
                     if valid_times:
-                        print(f"  Time: {np.mean(valid_times):.2f}s ± {np.std(valid_times):.2f}s")
+                        print(f"  Time ({len(valid_times)} trials): {np.mean(valid_times):.2f}s ± {np.std(valid_times):.2f}s")
         
         # Compare cloud scenarios within each mode
         for mode_name, mode_results in all_results.items():
@@ -542,6 +604,60 @@ def main():
                             cloud_mean = np.mean(ious)
                             impact = cloud_mean - baseline_mean
                             print(f"  {result_key}: {cloud_mean:.3f} ({impact:+.3f} vs baseline)")
+        
+        # Save all results to JSON file
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        json_filename = f'parking_experiment_results_{timestamp}.json'
+        
+        # Convert all_results to JSON-serializable format
+        json_results = {}
+        for mode_name, mode_results in all_results.items():
+            json_results[mode_name] = {}
+            for result_key, (ious, parking_times) in mode_results.items():
+                # Convert None values to null for JSON compatibility
+                clean_parking_times = [t if t is not None else None for t in parking_times]
+                
+                json_results[mode_name][result_key] = {
+                    'ious': ious,
+                    'parking_times': clean_parking_times,
+                    'statistics': {
+                        'iou_mean': float(np.mean(ious)) if ious else None,
+                        'iou_std': float(np.std(ious)) if ious else None,
+                        'iou_min': float(np.min(ious)) if ious else None,
+                        'iou_max': float(np.max(ious)) if ious else None,
+                        'trial_count': len(ious)
+                    }
+                }
+                
+                # Add parking time statistics
+                valid_times = [t for t in parking_times if t is not None]
+                if valid_times:
+                    json_results[mode_name][result_key]['statistics'].update({
+                        'parking_time_mean': float(np.mean(valid_times)),
+                        'parking_time_std': float(np.std(valid_times)),
+                        'parking_time_min': float(np.min(valid_times)),
+                        'parking_time_max': float(np.max(valid_times)),
+                        'valid_parking_times_count': len(valid_times)
+                    })
+        
+        # Add experiment metadata
+        experiment_metadata = {
+            'timestamp': timestamp,
+            'experiment_config': {
+                'modes': args.modes,
+                'clouds': args.clouds,
+                'latency_values': latency_values,
+                'bandwidth_values': bandwidth_values,
+                'trials': args.trials,
+                'video_enabled': args.video,
+                'scenarios': SCENARIOS
+            },
+            'results': json_results
+        }
+        
+        with open(json_filename, 'w') as f:
+            json.dump(experiment_metadata, f, indent=2)
+        print(f"\nAll experiment results saved to {json_filename}")
         
     except KeyboardInterrupt:
         print('\nExperiment interrupted by user')
