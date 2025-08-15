@@ -1,24 +1,28 @@
 {
   "scenario_name": "virtual_custom_latency100ms_bw100000000kbps",
   "latency_ms": 100.0,
-  "num_trials": 1,
+  "num_trials": 3,
   "results": {
     "cloud_perception": {
       "ious": [
-        0.7798332040220838
+        0.0,
+        0.8653335683251627,
+        0.8556090781994993
       ],
       "parking_times": [
-        18.05
+        3.93,
+        12.05,
+        12.030000000000001
       ],
-      "iou_mean": 0.7798332040220838,
-      "iou_std": 0.0,
-      "iou_min": 0.7798332040220838,
-      "iou_max": 0.7798332040220838,
-      "parking_time_mean": 18.05,
-      "parking_time_std": 0.0,
-      "parking_time_min": 18.05,
-      "parking_time_max": 18.05,
-      "valid_parking_times_count": 1
+      "iou_mean": 0.573647548841554,
+      "iou_std": 0.4056494990719561,
+      "iou_min": 0.0,
+      "iou_max": 0.8653335683251627,
+      "parking_time_mean": 9.336666666666668,
+      "parking_time_std": 3.8230993825545387,
+      "parking_time_min": 3.93,
+      "parking_time_max": 12.05,
+      "valid_parking_times_count": 3
     }
   }
 }

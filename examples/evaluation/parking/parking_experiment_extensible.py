@@ -29,8 +29,7 @@ from fogsim.handlers import BaseHandler
 
 # Import extensible components
 from cloud_components import CLOUD_SCENARIOS, CloudArchitectureConfig
-# Use the V3 handler with proper perception delays
-from extensible_parking_handler_v3 import ExtensibleParkingHandler
+from extensible_parking_handler import ExtensibleParkingHandler
 
 # Import parking-specific utilities
 from experiment_utils import DELTA_SECONDS
@@ -112,35 +111,55 @@ def run_extensible_parking_scenario(mode: SimulationMode,
                                    destination: int,
                                    parked_spots: List[int],
                                    recording_file=None,
-                                   verbose: bool = True) -> Dict:
+                                   verbose: bool = True,
+                                   max_retries: int = 3) -> Dict:
     """Run a single parking scenario with extensible cloud architecture."""
     
     if verbose:
         print(f'  Scenario: {cloud_config.name} - parking spot {destination}, occupied: {parked_spots}')
-        
-    # Create extensible parking handler
-    handler = ExtensibleParkingHandler(scenario_config, cloud_config)
-    handler.set_scenario(destination, parked_spots)
-    if recording_file:
-        handler.set_recording(recording_file)
     
-    # Configure network for cloud delays
-    network_config = NetworkConfig()
-    network_config.topology.link_delay = scenario_config.network_delay
-    network_config.topology.link_bandwidth = scenario_config.source_rate * 8.0  # Convert to bits/sec
-    network_config.source_rate = scenario_config.source_rate
-    network_config.packet_loss_rate = scenario_config.packet_loss_rate
-    
-    # Create FogSim environment
-    fogsim = FogSim(
-        handler, 
-        mode=mode, 
-        timestep=scenario_config.timestep,
-        network_config=network_config
-    )
-    
-    # Reset environment
-    obs, info = fogsim.reset()
+    # Retry logic for CARLA connection issues
+    for retry_num in range(max_retries):
+        try:
+            # Create extensible parking handler
+            handler = ExtensibleParkingHandler(scenario_config, cloud_config)
+            handler.set_scenario(destination, parked_spots)
+            if recording_file:
+                handler.set_recording(recording_file)
+            
+            # Configure network for cloud delays
+            network_config = NetworkConfig()
+            network_config.topology.link_delay = scenario_config.network_delay
+            network_config.topology.link_bandwidth = scenario_config.source_rate * 8.0  # Convert to bits/sec
+            network_config.source_rate = scenario_config.source_rate
+            network_config.packet_loss_rate = scenario_config.packet_loss_rate
+            
+            # Create FogSim environment
+            fogsim = FogSim(
+                handler, 
+                mode=mode, 
+                timestep=scenario_config.timestep,
+                network_config=network_config
+            )
+            
+            # Reset environment
+            obs, info = fogsim.reset()
+            
+            # If we get here, connection succeeded
+            break
+            
+        except RuntimeError as e:
+            if "time-out" in str(e) and retry_num < max_retries - 1:
+                if verbose:
+                    print(f"    CARLA connection timeout, retrying ({retry_num + 1}/{max_retries})...")
+                time.sleep(2)  # Wait before retry
+                continue
+            else:
+                # Either not a timeout error or max retries reached
+                raise
+    else:
+        # If we exit the loop without breaking, all retries failed
+        raise RuntimeError(f"Failed to connect to CARLA after {max_retries} attempts")
     
     # Run episode
     step_count = 0
@@ -255,31 +274,57 @@ def run_cloud_scenario_experiments(mode: SimulationMode,
                     print(f'      Trial {trial_num+1}/{num_trials}')
                 
                 recording_file = None
+                trial_success = False
+                max_trial_retries = 2  # Allow up to 2 retries per trial
                 
-                # Create unique video filename if video is enabled
-                if video_enabled:
-                    video_filename = f'parking_{cloud_config.name}_latency{int(scenario_config.network_delay*1000)}ms_rate{int(scenario_config.source_rate/1000)}kbps_dest{destination}_scenario{idx+1}_trial{trial_num+1}.mp4'
-                    recording_file = iio.imopen(video_filename, 'w', plugin='pyav')
-                    recording_file.init_video_stream('vp9', fps=scenario_config.video_fps)
-                    if verbose:
-                        print(f'        Recording video to: {video_filename}')
+                for trial_retry in range(max_trial_retries):
+                    try:
+                        # Create unique video filename if video is enabled
+                        if video_enabled:
+                            video_filename = f'parking_{cloud_config.name}_latency{int(scenario_config.network_delay*1000)}ms_rate{int(scenario_config.source_rate/1000)}kbps_dest{destination}_scenario{idx+1}_trial{trial_num+1}.mp4'
+                            recording_file = iio.imopen(video_filename, 'w', plugin='pyav')
+                            recording_file.init_video_stream('vp9', fps=scenario_config.video_fps)
+                            if verbose:
+                                print(f'        Recording video to: {video_filename}')
+                        
+                        result = run_extensible_parking_scenario(
+                            mode=mode,
+                            scenario_config=scenario_config,
+                            cloud_config=cloud_config,
+                            destination=destination,
+                            parked_spots=parked_spots,
+                            recording_file=recording_file,
+                            verbose=verbose
+                        )
+                        
+                        scenario_ious.append(result['iou'])
+                        scenario_times.append(result.get('parking_time'))
+                        trial_success = True
+                        
+                        # Close recording file
+                        if recording_file:
+                            recording_file.close()
+                        
+                        break  # Trial succeeded, exit retry loop
+                        
+                    except RuntimeError as e:
+                        # Close recording file if it was opened
+                        if recording_file:
+                            recording_file.close()
+                            recording_file = None
+                        
+                        if trial_retry < max_trial_retries - 1:
+                            if verbose:
+                                print(f"        Trial failed with error: {e}")
+                                print(f"        Retrying trial {trial_num+1} (retry {trial_retry+1}/{max_trial_retries})...")
+                            time.sleep(3)  # Wait longer between trial retries
+                        else:
+                            if verbose:
+                                print(f"        Trial {trial_num+1} failed after {max_trial_retries} attempts, skipping...")
+                            # Don't raise, just skip this trial
                 
-                result = run_extensible_parking_scenario(
-                    mode=mode,
-                    scenario_config=scenario_config,
-                    cloud_config=cloud_config,
-                    destination=destination,
-                    parked_spots=parked_spots,
-                    recording_file=recording_file,
-                    verbose=verbose
-                )
-                
-                scenario_ious.append(result['iou'])
-                scenario_times.append(result.get('parking_time'))
-                
-                # Close recording file
-                if recording_file:
-                    recording_file.close()
+                if not trial_success and verbose:
+                    print(f"        Warning: Trial {trial_num+1} could not be completed")
             
             # Add all trial results to the overall lists
             ious.extend(scenario_ious)
@@ -430,7 +475,7 @@ def main():
                        choices=list(CLOUD_SCENARIOS.keys()),
                        default=['cloud_perception'],
                        help="Cloud scenarios to test")
-    parser.add_argument("--latency", type=float, nargs='+', default=[10, 50, 100],
+    parser.add_argument("--latency", type=float, nargs='+', default=[10, 50, 100, 150, 200],
                        help="List of network latencies in ms to test")
     parser.add_argument("--bandwidth", type=float, nargs='+', default=[100000000.0],
                        help="List of network bandwidths in kbps to test")
@@ -442,7 +487,7 @@ def main():
                        help="Path to custom network config JSON file")
     parser.add_argument("--save-config", type=str, 
                        help="Save current config to JSON file")
-    parser.add_argument("--trials", type=int, default=1,
+    parser.add_argument("--trials", type=int, default=3,
                        help="Number of trials to run for each configuration")
     
     args = parser.parse_args()
