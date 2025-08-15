@@ -38,6 +38,14 @@ class TimeAwareNetworkSimulator(NSPyNetworkSimulator, TimeSubscriber):
         self.time_manager = time_manager
         self.mode = time_manager.mode
         
+        # Initialize network configuration defaults
+        self.link_config = {
+            'delay': 0.001,  # Default 1ms - will be overridden by configure_link
+            'bandwidth': source_rate * 8.0,  # Convert bytes/sec to bits/sec
+            'loss': 0.0,
+            'jitter': 0.0
+        }
+        
         # For virtual mode, create a custom SimPy environment
         if self.mode == SimulationMode.VIRTUAL:
             # Virtual mode: SimPy env time directly controlled
@@ -87,20 +95,19 @@ class TimeAwareNetworkSimulator(NSPyNetworkSimulator, TimeSubscriber):
         Returns:
             Calculated delay in seconds
         """
-        # Basic calculation based on virtual clock scheduler
-        # This is a simplified model - could be extended
-        base_delay = 0.001  # 1ms base propagation delay
+        # Use configured propagation delay (respects user configuration)
+        base_delay = self.link_config.get('delay', 0.0)
         
         # Bandwidth-based delay (assuming source_rate is in bytes/sec)
-        bandwidth_delay = message_size / self.source_rate
+        bandwidth_delay = message_size / self.source_rate if self.source_rate > 0 else 0.0
         
-        # Add queueing delay estimate
+        # For now, we use minimal queueing delay in virtual mode
         # In real implementation, this would consider current queue state
-        queueing_delay = 0.001  # 1ms estimated queueing
+        queueing_delay = 0.0  # No additional queueing delay
         
         total_delay = base_delay + bandwidth_delay + queueing_delay
         
-        logger.debug(f"Calculated delay: {total_delay}s for {message_size} bytes")
+        logger.debug(f"Calculated delay: {total_delay}s for {message_size} bytes (base={base_delay}s, bw={bandwidth_delay}s)")
         return total_delay
     
     def configure_link(self, config: dict) -> None:

@@ -69,20 +69,24 @@ class FogSim:
             from .network.nspy_simulator import NSPyNetworkSimulator
             # Use network config if provided
             if self.network_config:
-                source_rate = getattr(self.network_config, 'source_rate', 4600.0)
+                source_rate = getattr(self.network_config, 'source_rate', 1e9)  # Default to high bandwidth
                 link_delay = getattr(self.network_config.topology, 'link_delay', 0.0) if hasattr(self.network_config, 'topology') else 0.0
-                return NSPyNetworkSimulator(source_rate=source_rate, link_delay=link_delay)
+                flow_weights = getattr(self.network_config, 'flow_weights', [1, 1])
+                debug = getattr(self.network_config, 'debug', False)
+                return NSPyNetworkSimulator(source_rate=source_rate, weights=flow_weights, debug=debug, link_delay=link_delay)
             else:
-                return NSPyNetworkSimulator()
+                return NSPyNetworkSimulator(source_rate=1e9)
         elif self.mode == SimulationMode.SIMULATED_NET:
             from .network.wallclock_simulator import WallclockNetworkSimulator
             # Use network config if provided
             if self.network_config:
-                source_rate = getattr(self.network_config, 'source_rate', 4600.0)
+                source_rate = getattr(self.network_config, 'source_rate', 1e9)  # Default to high bandwidth
                 link_delay = getattr(self.network_config.topology, 'link_delay', 0.0) if hasattr(self.network_config, 'topology') else 0.0
-                return WallclockNetworkSimulator(source_rate=source_rate, link_delay=link_delay)
+                flow_weights = getattr(self.network_config, 'flow_weights', [1, 1])
+                debug = getattr(self.network_config, 'debug', False)
+                return WallclockNetworkSimulator(source_rate=source_rate, weights=flow_weights, debug=debug, link_delay=link_delay)
             else:
-                return WallclockNetworkSimulator()
+                return WallclockNetworkSimulator(source_rate=1e9)
         else:  # REAL_NET
             from .network.real_network import RealNetworkTransport
             if self.network_config:

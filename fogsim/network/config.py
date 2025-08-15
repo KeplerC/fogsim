@@ -85,7 +85,7 @@ class TopologyConfig:
     num_hosts: int = 4
     num_switches: int = 1
     link_bandwidth: float = 1e6  # 1 Mbps
-    link_delay: float = 0.001  # 1ms
+    link_delay: float = 0.0  # 0ms - user configurable
     topology_file: Optional[str] = None
     custom_topology: Optional[Dict[str, Any]] = None
 
@@ -120,7 +120,7 @@ class NetworkConfig:
     
     # Scheduling configuration
     scheduler: SchedulerType = SchedulerType.VIRTUAL_CLOCK
-    source_rate: float = 4600.0  # bytes/second
+    source_rate: float = 1e9  # 1GB/s - High bandwidth to minimize bandwidth delay
     flow_weights: List[int] = field(default_factory=lambda: [1, 1])
     
     # Per-flow configurations

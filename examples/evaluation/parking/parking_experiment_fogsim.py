@@ -17,6 +17,9 @@ import matplotlib.pyplot as plt
 import imageio.v3 as iio
 from contextlib import contextmanager
 import time
+import subprocess
+import socket
+import logging
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass, asdict
 import argparse
@@ -44,6 +47,144 @@ from experiment_utils import (
     DELTA_SECONDS
 )
 
+# Configure logging for CARLA management
+carla_logger = logging.getLogger('carla_manager')
+carla_logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+carla_logger.addHandler(handler)
+
+
+def check_carla_alive(host: str = '127.0.0.1', port: int = 2000, timeout: float = 5.0) -> bool:
+    """
+    Check if CARLA server is alive and responding.
+    
+    Args:
+        host: CARLA server host
+        port: CARLA server port
+        timeout: Connection timeout in seconds
+        
+    Returns:
+        True if CARLA is responsive, False otherwise
+    """
+    try:
+        # Try to create a socket connection
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((host, port))
+        sock.close()
+        
+        if result == 0:
+            # Port is open, now try to create a CARLA client
+            try:
+                import carla
+                client = carla.Client(host, port)
+                client.set_timeout(timeout)
+                # Try to get the world (this will fail if CARLA is not responding properly)
+                world = client.get_world()
+                carla_logger.info(f"CARLA is alive and responding on {host}:{port}")
+                return True
+            except Exception as e:
+                carla_logger.warning(f"CARLA port is open but not responding properly: {e}")
+                return False
+        else:
+            carla_logger.warning(f"CARLA port {host}:{port} is not accessible")
+            return False
+            
+    except Exception as e:
+        carla_logger.warning(f"Failed to check CARLA status: {e}")
+        return False
+
+
+def start_carla_docker(max_retries: int = 3, startup_wait: float = 30.0) -> bool:
+    """
+    Start CARLA using Docker with the specified command.
+    
+    Args:
+        max_retries: Maximum number of restart attempts
+        startup_wait: Time to wait for CARLA to start up (seconds)
+        
+    Returns:
+        True if CARLA started successfully, False otherwise
+    """
+    docker_cmd = [
+        'docker', 'run', '--privileged', '--gpus', 'all', '--net=host',
+        '-v', '/tmp/.X11-unix:/tmp/.X11-unix:rw',
+        'carlasim/carla:0.9.15',
+        '/bin/bash', './CarlaUE4.sh', '-RenderOffScreen'
+    ]
+    
+    for attempt in range(max_retries):
+        try:
+            carla_logger.info(f"Starting CARLA Docker (attempt {attempt + 1}/{max_retries})...")
+            carla_logger.info(f"Command: {' '.join(docker_cmd)}")
+            
+            # Start CARLA in background
+            process = subprocess.Popen(
+                docker_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                preexec_fn=None
+            )
+            
+            carla_logger.info(f"CARLA Docker started with PID {process.pid}")
+            carla_logger.info(f"Waiting {startup_wait} seconds for CARLA to initialize...")
+            
+            # Wait for CARLA to start up
+            time.sleep(startup_wait)
+            
+            # Check if CARLA is responding
+            if check_carla_alive():
+                carla_logger.info("CARLA started successfully!")
+                return True
+            else:
+                carla_logger.error(f"CARLA failed to start properly on attempt {attempt + 1}")
+                # Terminate the process if it's still running
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait()
+                    
+        except Exception as e:
+            carla_logger.error(f"Failed to start CARLA on attempt {attempt + 1}: {e}")
+            
+        if attempt < max_retries - 1:
+            carla_logger.info("Retrying CARLA startup...")
+            time.sleep(5)  # Wait before retry
+    
+    carla_logger.error(f"Failed to start CARLA after {max_retries} attempts")
+    return False
+
+
+def ensure_carla_running(host: str = '127.0.0.1', port: int = 2000) -> bool:
+    """
+    Ensure CARLA is running, restart if necessary.
+    
+    Args:
+        host: CARLA server host
+        port: CARLA server port
+        
+    Returns:
+        True if CARLA is running, False if failed to start
+    """
+    if check_carla_alive(host, port):
+        return True
+        
+    carla_logger.warning("CARLA is not responding, attempting to restart...")
+    
+    # Try to kill any existing CARLA docker containers
+    try:
+        carla_logger.info("Stopping existing CARLA containers...")
+        subprocess.run(['docker', 'stop', '$(docker ps -q --filter ancestor=carlasim/carla:0.9.15)'], 
+                      shell=True, capture_output=True)
+        subprocess.run(['docker', 'rm', '$(docker ps -aq --filter ancestor=carlasim/carla:0.9.15)'], 
+                      shell=True, capture_output=True)
+        time.sleep(2)
+    except Exception as e:
+        carla_logger.warning(f"Error cleaning up existing containers: {e}")
+    
+    # Start CARLA
+    return start_carla_docker()
+
 
 @dataclass
 class ParkingScenarioConfig:
@@ -56,7 +197,7 @@ class ParkingScenarioConfig:
     num_random_cars: int = 25
     replan_interval: int = 10  # Frames between replanning
     distance_threshold: float = 10.0  # Distance to trigger replanning  
-    max_episode_steps: int = 10000  # Reasonable limit to prevent infinite loops
+    max_episode_steps: int = 5000  # Reasonable limit to prevent infinite loops
     video_fps: int = 30
     traffic_cone_positions: List[Tuple[int, int]] = None
     walker_positions: List[Tuple[int, int]] = None
@@ -81,6 +222,7 @@ PREDEFINED_SCENARIOS = {
         name="no_latency",
         network_delay=0.0,  # 0ms (like original)
         packet_loss_rate=0.0,  # 0% loss
+        source_rate=1e9,  # High bandwidth to ensure 0ms network delay
     ),
     
     "low_latency": ParkingScenarioConfig(
@@ -142,6 +284,10 @@ class ParkingHandler(BaseHandler):
         """Launch CARLA and initialize the parking scenario."""
         if self._launched:
             return
+            
+        # Ensure CARLA is running before attempting to connect
+        if not ensure_carla_running():
+            raise RuntimeError("Failed to start CARLA server")
             
         # Initialize CARLA
         self.client = load_client()
@@ -511,9 +657,10 @@ def run_parking_scenario(mode: SimulationMode,
     if recording_file:
         handler.set_recording(recording_file)
     
-    # Configure network
+    # Configure network - ensure consistent configuration across all parameters
     network_config = NetworkConfig()
     network_config.topology.link_delay = config.network_delay
+    network_config.topology.link_bandwidth = config.source_rate * 8.0  # Convert bytes/sec to bits/sec
     network_config.source_rate = config.source_rate
     network_config.packet_loss_rate = config.packet_loss_rate
     
@@ -664,7 +811,7 @@ def main():
                        default=['virtual'], 
                        help="Modes to compare")
     parser.add_argument("--latencies", nargs='+', type=float,
-                       default=[0.03, 0.05, 0.1], 
+                       default=[10, 7], 
                        help="Network latencies in ms (default: [0])")
     parser.add_argument("--video", action="store_true", 
                        help="Enable video recording (disabled by default for speed)")
