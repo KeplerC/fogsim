@@ -28,7 +28,7 @@ PARKED_VEHICLES = [
     'vehicle.mini.cooper_s',
     'vehicle.toyota.prius'
 ]
-DELTA_SECONDS = 0.02  # Increased to 20ms for network delay simulation while keeping reasonable speed
+DELTA_SECONDS = 0.1
 
 def load_client():
     print(f"starting simulation on {HOST}:{PORT}")

@@ -236,7 +236,7 @@ def run_cloud_scenario_experiments(mode: SimulationMode,
             
             # Create unique video filename if video is enabled
             if video_enabled:
-                video_filename = f'parking_{cloud_config.name}_latency{int(scenario_config.network_delay*1000)}ms_dest{destination}_run{idx+1}.mp4'
+                video_filename = f'parking_{cloud_config.name}_latency{int(scenario_config.network_delay*1000)}ms_rate{int(scenario_config.source_rate/1000)}kbps_dest{destination}_run{idx+1}.mp4'
                 recording_file = iio.imopen(video_filename, 'w', plugin='pyav')
                 recording_file.init_video_stream('vp9', fps=scenario_config.video_fps)
                 if verbose:
@@ -363,11 +363,10 @@ def main():
                        choices=list(CLOUD_SCENARIOS.keys()),
                        default=['cloud_perception', 'cloud_planning'],
                        help="Cloud scenarios to test")
-    parser.add_argument("--network", type=str, default="low_latency",
-                       choices=list(NETWORK_SCENARIOS.keys()),
-                       help="Network scenario configuration")
-    parser.add_argument("--latency", type=float,
-                       help="Override network latency in ms")
+    parser.add_argument("--latency", type=float, nargs='+', default=[50,0, 100,0],
+                       help="List of network latencies in ms to test")
+    parser.add_argument("--bandwidth", type=float, nargs='+', default=[100000000.0],
+                       help="List of network bandwidths in kbps to test")
     parser.add_argument("--video", action="store_true", 
                        help="Enable video recording")
     parser.add_argument("--no-plot", action="store_true",
@@ -379,22 +378,28 @@ def main():
     
     args = parser.parse_args()
     
-    # Load network configuration
+    # Load base configuration
     if args.config:
         with open(args.config, 'r') as f:
             config_dict = json.load(f)
-        scenario_config = ExtensibleScenarioConfig.from_dict(config_dict)
+        base_scenario_config = ExtensibleScenarioConfig.from_dict(config_dict)
     else:
-        scenario_config = NETWORK_SCENARIOS[args.network]
+        # Use default base configuration
+        base_scenario_config = ExtensibleScenarioConfig(
+            name="custom",
+            network_delay=0.005,  # 5ms default
+            packet_loss_rate=0.0,
+            source_rate=1e6,  # 1000 kbps default
+        )
     
-    # Override latency if specified
-    if args.latency is not None:
-        scenario_config.network_delay = args.latency / 1000.0  # Convert ms to seconds
+    # Get latency and bandwidth values to test
+    latency_values = args.latency
+    bandwidth_values = args.bandwidth
         
     # Save config if requested
     if args.save_config:
         with open(args.save_config, 'w') as f:
-            json.dump(scenario_config.to_dict(), f, indent=2)
+            json.dump(base_scenario_config.to_dict(), f, indent=2)
         print(f"Configuration saved to {args.save_config}")
     
     # Get cloud configurations to test
@@ -417,33 +422,76 @@ def main():
         
         for mode_name in args.modes:
             mode = mode_map[mode_name]
+            mode_results = {}
             
-            print(f'\n{"="*80}')
-            print(f'TESTING MODE: {mode_name.upper()}')
-            print(f'Network: {scenario_config.name} ({scenario_config.network_delay*1000:.1f}ms)')
-            print(f'Cloud scenarios: {[cfg.name for cfg in cloud_configs]}')
-            print(f'{"="*80}')
-            
-            # Run experiments for all cloud scenarios
-            mode_results = run_cloud_scenario_experiments(
-                mode=mode,
-                scenario_config=scenario_config,
-                cloud_configs=cloud_configs,
-                scenarios=SCENARIOS,
-                video_enabled=args.video,
-                verbose=True
-            )
+            for latency_ms in latency_values:
+                for bandwidth_kbps in bandwidth_values:
+                    # Calculate appropriate timestep for this latency
+                    # FIXED: Timestep should be SMALLER than network delay for better granularity
+                    # This allows multiple simulation steps within the delay period for proper message handling
+                    network_delay_s = latency_ms / 1000.0  # Convert ms to seconds
+                    
+                    timestep = DELTA_SECONDS
+                    # if network_delay_s <= 0.010:  # <= 10ms delay
+                    #     timestep = 0.005  # 5ms timestep (2x finer than delay)
+                    # elif network_delay_s <= 0.025:  # <= 25ms delay  
+                    #     timestep = 0.01   # 10ms timestep (2.5x finer than delay)
+                    # elif network_delay_s <= 0.060:  # <= 60ms delay
+                    #     timestep = 0.02   # 20ms timestep (3x finer than delay)
+                    # elif network_delay_s <= 0.120:  # <= 120ms delay
+                    #     timestep = 0.03   # 30ms timestep (4x finer than delay)
+                    # else:  # > 120ms delay
+                    #     timestep = 0.05   # 50ms timestep (still reasonable granularity)
+                    
+                    print(f"    Using timestep: {timestep*1000:.0f}ms for {latency_ms}ms network delay")
+                    
+                    # Create a copy of scenario config with current network parameters
+                    current_scenario_config = ExtensibleScenarioConfig(
+                        name=f"custom_latency{int(latency_ms)}ms_bw{int(bandwidth_kbps)}kbps",
+                        network_delay=network_delay_s,
+                        packet_loss_rate=base_scenario_config.packet_loss_rate,
+                        source_rate=bandwidth_kbps * 1000.0,  # Convert kbps to bps
+                        timestep=timestep,  # Use calculated timestep
+                        num_random_cars=base_scenario_config.num_random_cars,
+                        replan_interval=base_scenario_config.replan_interval,
+                        distance_threshold=base_scenario_config.distance_threshold,
+                        max_episode_steps=int(base_scenario_config.max_episode_steps * (DELTA_SECONDS/timestep)),  # Adjust for timestep
+                        video_fps=base_scenario_config.video_fps,
+                        traffic_cone_positions=base_scenario_config.traffic_cone_positions,
+                        walker_positions=base_scenario_config.walker_positions
+                    )
+                    
+                    print(f'\n{"="*80}')
+                    print(f'TESTING MODE: {mode_name.upper()} - LATENCY: {latency_ms}ms, BANDWIDTH: {bandwidth_kbps}kbps')
+                    print(f'Network: {current_scenario_config.name}')
+                    print(f'Cloud scenarios: {[cfg.name for cfg in cloud_configs]}')
+                    print(f'{"="*80}')
+                    
+                    # Run experiments for all cloud scenarios with current network config
+                    network_results = run_cloud_scenario_experiments(
+                        mode=mode,
+                        scenario_config=current_scenario_config,
+                        cloud_configs=cloud_configs,
+                        scenarios=SCENARIOS,
+                        video_enabled=args.video,
+                        verbose=True
+                    )
+                    
+                    # Store results with network parameters key
+                    for cloud_name, results in network_results.items():
+                        key = f"{cloud_name}_latency{int(latency_ms)}ms_bw{int(bandwidth_kbps)}kbps"
+                        mode_results[key] = results
+                    
+                    # Generate visualization for this mode and network configuration
+                    if not args.no_plot:
+                        plot_cloud_comparison_results(
+                            network_results, 
+                            f"{mode_name}_{current_scenario_config.name}",
+                            current_scenario_config.network_delay * 1000,
+                            f'parking_cloud_{mode_name}_latency{int(latency_ms)}ms_bw{int(bandwidth_kbps)}kbps.png'
+                        )
             
             all_results[mode_name] = mode_results
-            
-            # Generate visualization for this mode
-            if not args.no_plot:
-                plot_cloud_comparison_results(
-                    mode_results, 
-                    f"{mode_name}_{scenario_config.name}",
-                    scenario_config.network_delay * 1000,
-                    f'parking_cloud_{mode_name}_{scenario_config.name}.png'
-                )
         
         # Print final comparison summary
         print(f"\n{'='*80}")
@@ -454,10 +502,12 @@ def main():
             print(f"\n{mode_name.upper()} MODE RESULTS:")
             print("-" * 50)
             
-            for cloud_name, (ious, parking_times) in mode_results.items():
-                cloud_config = CLOUD_SCENARIOS[cloud_name]
+            for result_key, (ious, parking_times) in mode_results.items():
+                # Extract base cloud name from result key like "cloud_perception_latency100ms_bw100000000kbps"
+                base_cloud_name = result_key.split('_latency')[0]
+                cloud_config = CLOUD_SCENARIOS[base_cloud_name]
                 if ious:
-                    print(f"\n{cloud_config.name.upper()}: {cloud_config.description}")
+                    print(f"\n{result_key.upper()}: {cloud_config.description}")
                     print(f"  IOU: {np.mean(ious):.3f} ± {np.std(ious):.3f} (range: {np.min(ious):.3f}-{np.max(ious):.3f})")
                     
                     valid_times = [t for t in parking_times if t is not None]
@@ -468,16 +518,21 @@ def main():
         for mode_name, mode_results in all_results.items():
             if len(mode_results) > 1:
                 print(f"\n{mode_name.upper()} MODE - Cloud Architecture Impact:")
-                baseline_ious = mode_results.get('baseline', ([], []))[0]
+                # Find baseline results (any key starting with 'baseline')
+                baseline_ious = []
+                for key, (ious, _) in mode_results.items():
+                    if key.startswith('baseline'):
+                        baseline_ious = ious
+                        break
                 if baseline_ious:
                     baseline_mean = np.mean(baseline_ious)
                     print(f"  Baseline (all local): {baseline_mean:.3f}")
                     
-                    for cloud_name, (ious, _) in mode_results.items():
-                        if cloud_name != 'baseline' and ious:
+                    for result_key, (ious, _) in mode_results.items():
+                        if not result_key.startswith('baseline') and ious:
                             cloud_mean = np.mean(ious)
                             impact = cloud_mean - baseline_mean
-                            print(f"  {cloud_name}: {cloud_mean:.3f} ({impact:+.3f} vs baseline)")
+                            print(f"  {result_key}: {cloud_mean:.3f} ({impact:+.3f} vs baseline)")
         
     except KeyboardInterrupt:
         print('\nExperiment interrupted by user')

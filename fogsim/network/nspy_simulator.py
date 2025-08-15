@@ -15,22 +15,40 @@ class PacketTracker:
     """Manages packet tracking and message delivery."""
     
     def __init__(self):
-        self.pending_packets: Dict[str, Tuple[Any, float, int]] = {}  # msg_id -> (message, sent_time, flow_id)
+        self.pending_packets: Dict[str, Tuple[Any, float, int, float]] = {}  # msg_id -> (message, sent_time, flow_id, packet_size)
         self.ready_messages: Dict[str, Any] = {}  # msg_id -> message
         self.last_checked_arrivals: Dict[int, int] = {}  # flow_id -> last checked arrival index
+        # New: Track packet order and expected delivery times
+        self.packet_send_order: Dict[int, List[Tuple[str, float, float]]] = {}  # flow_id -> [(packet_id, sent_time, expected_delivery)]
+        self.delivered_packet_ids: Set[str] = set()  # Track which packets have been delivered
     
-    def add_pending_packet(self, msg_id: str, message: Any, sent_time: float, flow_id: int) -> None:
+    def add_pending_packet(self, msg_id: str, message: Any, sent_time: float, flow_id: int, packet_size: float = 1000.0) -> None:
         """Add a packet to pending tracking."""
-        self.pending_packets[msg_id] = (message, sent_time, flow_id)
+        self.pending_packets[msg_id] = (message, sent_time, flow_id, packet_size)
         if flow_id not in self.last_checked_arrivals:
             self.last_checked_arrivals[flow_id] = 0
+        if flow_id not in self.packet_send_order:
+            self.packet_send_order[flow_id] = []
+        
+        # Track send order for proper delivery mapping
+        # Expected delivery is sent_time + estimated delay (will be updated when actual delivery happens)
+        self.packet_send_order[flow_id].append((msg_id, sent_time, sent_time))
     
-    def mark_packet_delivered(self, msg_id: str) -> None:
+    def mark_packet_delivered(self, msg_id: str, actual_delivery_time: float = None) -> None:
         """Mark a packet as delivered and ready."""
-        if msg_id in self.pending_packets:
-            message, _, _ = self.pending_packets[msg_id]
+        if msg_id in self.pending_packets and msg_id not in self.delivered_packet_ids:
+            message, sent_time, flow_id, packet_size = self.pending_packets[msg_id]
+            
+            # Add delivery time info to message if it's a dict
+            if isinstance(message, dict) and actual_delivery_time is not None:
+                message['delivery_time'] = actual_delivery_time
+                message['latency'] = (actual_delivery_time - sent_time) * 1000  # Convert to ms
+            
             self.ready_messages[msg_id] = message
+            self.delivered_packet_ids.add(msg_id)
             del self.pending_packets[msg_id]
+            
+            logger.debug(f"Packet {msg_id} delivered at {actual_delivery_time}, latency={((actual_delivery_time - sent_time) * 1000) if actual_delivery_time else 'unknown'}ms")
     
     def get_ready_messages(self) -> List[Any]:
         """Get and clear ready messages."""
@@ -43,6 +61,19 @@ class PacketTracker:
         self.pending_packets.clear()
         self.ready_messages.clear()
         self.last_checked_arrivals.clear()
+        self.packet_send_order.clear()
+        self.delivered_packet_ids.clear()
+        
+    def get_oldest_pending_packet_for_flow(self, flow_id: int) -> Optional[str]:
+        """Get the oldest pending packet ID for a specific flow."""
+        if flow_id not in self.packet_send_order:
+            return None
+        
+        # Find the oldest packet that hasn't been delivered yet
+        for packet_id, sent_time, _ in self.packet_send_order[flow_id]:
+            if packet_id in self.pending_packets and packet_id not in self.delivered_packet_ids:
+                return packet_id
+        return None
 
 
 class NSPyNetworkSimulator:
@@ -97,14 +128,16 @@ class NSPyNetworkSimulator:
         # Create and send packet through virtual clock server
         packet = Packet(self.env.now, size, flow_id=flow_id, packet_id=msg_id)
         
-        # Store original message with the packet ID, sent time, and flow_id
-        self.packet_tracker.add_pending_packet(msg_id, message, self.env.now, flow_id)
+        # Store original message with the packet ID, sent time, flow_id, and size
+        self.packet_tracker.add_pending_packet(msg_id, message, self.env.now, flow_id, size)
         
         # Send packet to server
         self.vc_server.put(packet)
         
-        logger.info("Registered packet with ID=%s, flow_id=%d, size=%f, time=%f", 
-                    msg_id, flow_id, size, self.env.now)
+        # Enhanced logging
+        msg_type = message.get('type', 'unknown') if isinstance(message, dict) else 'unknown'
+        logger.info("Registered packet ID=%s, flow_id=%d, type=%s, size=%.0f, time=%.3f", 
+                    msg_id, flow_id, msg_type, size, self.env.now)
         
         return msg_id
     
@@ -117,11 +150,15 @@ class NSPyNetworkSimulator:
         """
         # Skip running if time_point is not greater than current time
         if time_point <= self.env.now:
-            logger.info("Skipping run_until as time_point=%f <= current_time=%f", 
+            logger.debug("Skipping run_until as time_point=%.3f <= current_time=%.3f", 
                         time_point, self.env.now)
+            # Still process arrivals even if we don't advance time
+            self._process_arrivals(time_point)
             return
             
-        logger.debug("Running simulation from %f to %f", self.env.now, time_point)
+        pending_before = len(self.packet_tracker.pending_packets)
+        logger.debug("Running simulation from %.3f to %.3f (pending packets: %d)", 
+                    self.env.now, time_point, pending_before)
             
         # Run the simulation
         try:
@@ -132,10 +169,17 @@ class NSPyNetworkSimulator:
             
         # Check for new packet arrivals
         self._process_arrivals(time_point)
+        
+        # Debug: Log packet status after processing
+        pending_after = len(self.packet_tracker.pending_packets)
+        ready_messages = len(self.packet_tracker.ready_messages)
+        if pending_before != pending_after or ready_messages > 0:
+            logger.info("Packet status: pending %d→%d, ready messages: %d", 
+                       pending_before, pending_after, ready_messages)
     
     def _process_arrivals(self, time_point: float) -> None:
         """Process packet arrivals up to the specified time point."""
-        delivered_packet_ids = set()
+        delivered_count = 0
         
         # Check all flows that have sent packets
         all_flow_ids = set(self.packet_tracker.last_checked_arrivals.keys())
@@ -162,29 +206,40 @@ class NSPyNetworkSimulator:
                     # If this packet has been delivered (including link delay) by our time_point
                     if actual_delivery_time <= time_point:
                         new_arrivals += 1
-                        # In a real implementation, we would need a way to map arrival positions to
-                        # specific packet IDs. Since we don't have access to the actual packet objects,
-                        # we'll use a simplified approach: mark the first pending packet for this flow
-                        # as delivered.
-                        for packet_id, (message, sent_time, message_flow_id) in self.packet_tracker.pending_packets.items():
-                            if message_flow_id == flow_id and packet_id not in delivered_packet_ids:
-                                # Add latency information to the message (in milliseconds)
-                                if isinstance(message, dict):
-                                    message['latency'] = (actual_delivery_time - sent_time) * 1000  # Convert to ms
-                                self.packet_tracker.mark_packet_delivered(packet_id)
-                                delivered_packet_ids.add(packet_id)
-                                logger.info("Packet ID=%s delivered at time=%f, total_latency=%fms (queue=%fms + link=%fms)", 
-                                            packet_id, actual_delivery_time, (actual_delivery_time - sent_time) * 1000,
-                                            (arrival_time - sent_time) * 1000, self.link_delay * 1000)
-                                break
+                        
+                        # FIXED: Get the oldest pending packet for this flow (FIFO order)
+                        oldest_packet_id = self.packet_tracker.get_oldest_pending_packet_for_flow(flow_id)
+                        
+                        if oldest_packet_id is not None:
+                            # Mark this specific packet as delivered
+                            self.packet_tracker.mark_packet_delivered(oldest_packet_id, actual_delivery_time)
+                            delivered_count += 1
+                            
+                            # Get packet info for logging
+                            if oldest_packet_id in self.packet_tracker.pending_packets:
+                                message, sent_time, message_flow_id, packet_size = self.packet_tracker.pending_packets[oldest_packet_id]
+                            else:
+                                # Packet was just delivered, reconstruct info for logging
+                                sent_time = arrival_time - self.link_delay  # Approximate
+                                message_flow_id = flow_id
+                                packet_size = 1000.0
+                            
+                            logger.info("Packet ID=%s delivered at time=%.3f, total_latency=%.1fms (queue=%.1fms + link=%.1fms)", 
+                                        oldest_packet_id, actual_delivery_time, 
+                                        (actual_delivery_time - sent_time) * 1000,
+                                        (arrival_time - sent_time) * 1000, 
+                                        self.link_delay * 1000)
+                        else:
+                            logger.warning("Arrival detected but no pending packet found for flow %d at time %.3f", 
+                                          flow_id, actual_delivery_time)
                 
                 # Update the last checked index for next time
                 self.packet_tracker.last_checked_arrivals[flow_id] = len(arrivals)
-                logger.info("Flow %d: Processed %d new arrivals, total arrivals=%d", 
-                             flow_id, new_arrivals, len(arrivals))
+                logger.info("Flow %d: Processed %d new arrivals, %d delivered, total arrivals=%d", 
+                             flow_id, new_arrivals, new_arrivals, len(arrivals))
         
         logger.info("Delivered %d packets, %d still pending", 
-                    len(delivered_packet_ids), len(self.packet_tracker.pending_packets))
+                    delivered_count, len(self.packet_tracker.pending_packets))
     
     def get_ready_messages(self) -> List[Any]:
         """
@@ -194,7 +249,12 @@ class NSPyNetworkSimulator:
             List of ready messages
         """
         messages = self.packet_tracker.get_ready_messages()
-        logger.info("Retrieved %d ready messages", len(messages))
+        if messages:
+            logger.info("Retrieved %d ready messages", len(messages))
+            for i, msg in enumerate(messages):
+                if isinstance(msg, dict) and 'latency' in msg:
+                    logger.debug("Message %d: type=%s, latency=%.1fms", 
+                               i, msg.get('type', 'unknown'), msg['latency'])
         return messages
     
     def reset(self) -> None:

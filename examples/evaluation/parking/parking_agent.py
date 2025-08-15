@@ -239,7 +239,7 @@ class CarlaCar():
         cam.listen(lambda image: self.frames.put(image))
         return cam
     
-    def process_recording_frames(self, latency=None):
+    def process_recording_frames(self, latency=None, source_rate_kbps=None):
         while not self.frames.empty():
             if self.has_recorded_segment and self.car.mode == Mode.PARKED:
                 return
@@ -266,16 +266,27 @@ class CarlaCar():
                 color=(255, 255, 255),
                 thickness=2
             )
-            if latency:
-                data = cv2.putText(
-                    data,
-                    "latency: {}ms".format(latency) if latency else "",
-                    (image.width - 275, image.height - 80),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    fontScale=1,
-                    color=(255, 255, 255),
-                    thickness=2
-                )
+            # Always show network information (latency and source rate)
+            latency_text = "Latency: {:.1f}ms".format(latency if latency is not None else 0.0)
+            rate_text = "Rate: {:.0f}kbps".format(source_rate_kbps if source_rate_kbps is not None else 0.0)
+            data = cv2.putText(
+                data,
+                latency_text,
+                (20, image.height - 80),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                fontScale=1,
+                color=(255, 255, 255),
+                thickness=2
+            )
+            data = cv2.putText(
+                data,
+                rate_text,
+                (20, image.height - 120),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                fontScale=1,
+                color=(255, 255, 255),
+                thickness=2
+            )
             recording_file.write_frame(data, pixel_format='bgr24')
             if self.car.mode == Mode.PARKED:
                 self.has_recorded_segment = True
