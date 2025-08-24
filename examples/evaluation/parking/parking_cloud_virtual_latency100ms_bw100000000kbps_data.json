@@ -3,25 +3,25 @@
   "latency_ms": 100.0,
   "num_trials": 3,
   "results": {
-    "cloud_perception": {
+    "cloud_planning": {
       "ious": [
         0.0,
-        0.8653335683251627,
-        0.8556090781994993
+        0.0,
+        0.0
       ],
       "parking_times": [
-        3.93,
-        12.05,
-        12.030000000000001
+        22.5,
+        21.97,
+        22.68
       ],
-      "iou_mean": 0.573647548841554,
-      "iou_std": 0.4056494990719561,
+      "iou_mean": 0.0,
+      "iou_std": 0.0,
       "iou_min": 0.0,
-      "iou_max": 0.8653335683251627,
-      "parking_time_mean": 9.336666666666668,
-      "parking_time_std": 3.8230993825545387,
-      "parking_time_min": 3.93,
-      "parking_time_max": 12.05,
+      "iou_max": 0.0,
+      "parking_time_mean": 22.383333333333336,
+      "parking_time_std": 0.3013672547278859,
+      "parking_time_min": 21.97,
+      "parking_time_max": 22.68,
       "valid_parking_times_count": 3
     }
   }

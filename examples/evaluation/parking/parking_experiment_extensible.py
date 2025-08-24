@@ -473,9 +473,9 @@ def main():
                        help="FogSim modes to test")
     parser.add_argument("--clouds", nargs='+', 
                        choices=list(CLOUD_SCENARIOS.keys()),
-                       default=['cloud_perception'],
+                       default=['cloud_planning'],
                        help="Cloud scenarios to test")
-    parser.add_argument("--latency", type=float, nargs='+', default=[10, 50, 100, 150, 200],
+    parser.add_argument("--latency", type=float, nargs='+', default=[1],
                        help="List of network latencies in ms to test")
     parser.add_argument("--bandwidth", type=float, nargs='+', default=[100000000.0],
                        help="List of network bandwidths in kbps to test")
@@ -487,7 +487,7 @@ def main():
                        help="Path to custom network config JSON file")
     parser.add_argument("--save-config", type=str, 
                        help="Save current config to JSON file")
-    parser.add_argument("--trials", type=int, default=3,
+    parser.add_argument("--trials", type=int, default=1,
                        help="Number of trials to run for each configuration")
     
     args = parser.parse_args()

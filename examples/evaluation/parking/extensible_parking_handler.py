@@ -541,7 +541,8 @@ class ExtensibleParkingHandler(BaseHandler):
             # BASELINE: Everything immediate
             self._update_perception_immediate()
             
-            if should_plan:
+            # Initial planning or replanning
+            if should_plan or (not self._planning_active and self.frame_idx < 10):
                 if self.frame_idx % 50 == 0:
                     logger.info(f"Step {self.frame_idx}: Baseline - immediate perception and planning")
                 
@@ -551,6 +552,8 @@ class ExtensibleParkingHandler(BaseHandler):
                         self.car.plan()
                         has_plan = hasattr(self.car.car, 'trajectory') and self.car.car.trajectory is not None
                         self._planning_active = has_plan
+                        if self.frame_idx < 10:
+                            logger.info(f"Initial planning result: has_plan={has_plan}")
                 except Exception as e:
                     logger.error(f"Planning failed: {e}")
                     self._planning_active = False
@@ -611,7 +614,23 @@ class ExtensibleParkingHandler(BaseHandler):
             # Update perception immediately
             self._update_perception_immediate()
             
-            # Start planning request if needed
+            # Special case: Create initial plan immediately on first frame
+            # This simulates having a pre-computed plan before cloud delays kick in
+            if self.frame_idx == 0 and not self._planning_active:
+                logger.info("Creating initial plan immediately for cloud planning scenario")
+                try:
+                    if self.car and self.car.actor:
+                        self.car.actor.get_transform()
+                        self.car.plan()
+                        has_plan = hasattr(self.car.car, 'trajectory') and self.car.car.trajectory is not None
+                        self._planning_active = has_plan
+                        logger.info(f"Initial plan created: {has_plan}")
+                except Exception as e:
+                    logger.error(f"Initial planning failed: {e}")
+                    self._planning_active = False
+            
+            # For replanning
+            # Start planning request if needed (but not if we're already waiting)
             if should_plan and not self._waiting_for_planning:
                 self._planning_request_sent_frame = self.frame_idx
                 self._waiting_for_planning = True
@@ -622,7 +641,9 @@ class ExtensibleParkingHandler(BaseHandler):
                     car_destination=(self.car.car.destination.x, self.car.car.destination.y)
                 )
                 if self.frame_idx % 50 == 0:
-                    logger.info(f"Step {self.frame_idx}: Sending planning request to cloud")
+                    logger.info(f"Step {self.frame_idx}: Sending planning request to cloud (planning_active={self._planning_active})")
+                # IMPORTANT: Keep following existing trajectory while waiting for new plan
+                # The car should continue with its current plan until new one arrives
             
             # Check if planning response arrived
             if self._waiting_for_planning and cloud_response_received:
@@ -630,16 +651,21 @@ class ExtensibleParkingHandler(BaseHandler):
                     delay_ms = (self.frame_idx - self._planning_request_sent_frame) * self.scenario_config.timestep * 1000
                     logger.info(f"Step {self.frame_idx}: Cloud planning received after {delay_ms:.1f}ms")
                 
-                # Execute planning now
+                # Execute planning now - this creates a new trajectory
                 try:
                     if self.car and self.car.actor:
                         self.car.actor.get_transform()
+                        # Plan creates a new trajectory
                         self.car.plan()
                         has_plan = hasattr(self.car.car, 'trajectory') and self.car.car.trajectory is not None
                         self._planning_active = has_plan
+                        if self.frame_idx % 50 == 0 or has_plan:
+                            logger.info(f"Step {self.frame_idx}: New plan created: {has_plan}, trajectory exists: {has_plan}")
                 except Exception as e:
                     logger.error(f"Planning failed: {e}")
-                    self._planning_active = False
+                    # Don't disable planning if we still have a trajectory
+                    if not (hasattr(self.car.car, 'trajectory') and self.car.car.trajectory is not None):
+                        self._planning_active = False
                 
                 self._waiting_for_planning = False
                 
@@ -709,6 +735,8 @@ class ExtensibleParkingHandler(BaseHandler):
             try:
                 if self.car and self.car.actor:
                     self.car.run_step()
+                    if self.frame_idx % 50 == 0:
+                        logger.info(f"Step {self.frame_idx}: Executing control (planning_active=True)")
             except Exception as e:
                 logger.error(f"Car run_step failed: {e}")
                 self._planning_active = False
@@ -720,6 +748,9 @@ class ExtensibleParkingHandler(BaseHandler):
                         self.car.actor.apply_control(emergency_control)
                 except:
                     pass
+        else:
+            if self.frame_idx % 50 == 0:
+                logger.info(f"Step {self.frame_idx}: No control executed (planning_active=False, waiting_for_planning={self._waiting_for_planning})")
         
         # Get current state
         states = self.get_states()

@@ -3,21 +3,26 @@
   "latency_ms": 50.0,
   "num_trials": 3,
   "results": {
-    "cloud_perception": {
+    "cloud_planning": {
       "ious": [
         0.0,
         0.0,
         0.0
       ],
       "parking_times": [
-        null,
-        null,
-        null
+        34.45,
+        22.94,
+        22.09
       ],
       "iou_mean": 0.0,
       "iou_std": 0.0,
       "iou_min": 0.0,
-      "iou_max": 0.0
+      "iou_max": 0.0,
+      "parking_time_mean": 26.493333333333336,
+      "parking_time_std": 5.636904193694346,
+      "parking_time_min": 22.09,
+      "parking_time_max": 34.45,
+      "valid_parking_times_count": 3
     }
   }
 }
