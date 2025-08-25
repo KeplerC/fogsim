@@ -95,7 +95,7 @@ class WallclockNetworkSimulator(NSPyNetworkSimulator):
                 
                 if actual_delivery_time <= time_point:
                     # Find the corresponding packet
-                    for packet_id, (message, sent_time, message_flow_id) in list(self.packet_tracker.pending_packets.items()):
+                    for packet_id, (message, sent_time, message_flow_id, packet_size) in list(self.packet_tracker.pending_packets.items()):
                         if message_flow_id == flow_id and packet_id not in delivered_packet_ids:
                             # Calculate the delay we need to simulate
                             simulated_delay = actual_delivery_time - sent_time

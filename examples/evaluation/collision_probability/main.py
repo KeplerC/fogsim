@@ -12,6 +12,10 @@ from filterpy.kalman import KalmanFilter
 import numpy as np
 from scipy.stats import norm
 
+# FogSim imports
+from fogsim import Env, NetworkConfig
+from fogsim.handlers import BaseHandler
+
 unprotected_right_turn_config = {
     'simulation': {
         'host': 'localhost',
@@ -246,6 +250,320 @@ opposite_direction_merge_config = {
     }
 }
 
+
+class CollisionHandler(BaseHandler):
+    """
+    FogSim handler for collision avoidance scenario.
+    
+    Observation: Obstacle vehicle position (x, y, yaw in degrees)
+    Action: Binary brake decision (0 = no brake, 1 = brake)
+    """
+    
+    def __init__(self, config, output_dir):
+        self.config = config
+        self.output_dir = output_dir
+        self.client = None
+        self.world = None
+        self.ego_vehicle = None
+        self.obstacle_vehicle = None
+        self.camera = None
+        self.collision_sensor = None
+        
+        # Trackers
+        self.obstacle_tracker = None
+        self.ground_truth_tracker = None
+        
+        # State tracking
+        self.tick = 0
+        self.has_collided = False
+        self.ego_trajectory = None
+        self.current_delta_k = config['simulation']['delta_k']
+        
+        # Video/image capture
+        self.video_writer = None
+        self.frame_queue = []
+        
+        # Collision probability logging
+        self.collision_prob_file = os.path.join(output_dir, 
+            f'collision_probabilities_{config["simulation"]["l_max"]}_fogsim.csv')
+        
+        # Phase control for obstacle vehicle
+        self.obstacle_phase = 'straight'
+        
+    def launch(self):
+        """Initialize CARLA and spawn vehicles."""
+        # Connect to CARLA
+        self.client = carla.Client(self.config['simulation']['host'],
+                                  self.config['simulation']['port'])
+        self.client.set_timeout(10.0)
+        self.world = self.client.load_world("Town03")
+        
+        # Set synchronous mode
+        self.original_settings = self.world.get_settings()
+        settings = self.world.get_settings()
+        settings.fixed_delta_seconds = self.config['simulation']['delta_seconds']
+        settings.synchronous_mode = True
+        settings.no_rendering_mode = False
+        self.world.apply_settings(settings)
+        
+        blueprint_library = self.world.get_blueprint_library()
+        spawn_points = self.world.get_map().get_spawn_points()
+        
+        # Setup spawn points
+        ego_spawn_point = spawn_points[0]
+        ego_spawn_point.location.x += self.config['ego_vehicle']['spawn_offset']['x']
+        ego_spawn_point.location.y += self.config['ego_vehicle']['spawn_offset']['y']
+        ego_spawn_point.rotation.yaw += self.config['ego_vehicle']['spawn_offset']['yaw']
+        
+        obstacle_spawn_point = spawn_points[1]
+        obstacle_spawn_point.location.x = ego_spawn_point.location.x + \
+            self.config['obstacle_vehicle']['spawn_offset']['x']
+        obstacle_spawn_point.location.y = ego_spawn_point.location.y + \
+            self.config['obstacle_vehicle']['spawn_offset']['y']
+        obstacle_spawn_point.rotation.yaw = ego_spawn_point.rotation.yaw + \
+            self.config['obstacle_vehicle']['spawn_offset']['yaw']
+        
+        # Spawn vehicles
+        ego_bp = blueprint_library.find(self.config['ego_vehicle']['model'])
+        ego_bp.set_attribute('role_name', 'ego')
+        self.ego_vehicle = self.world.try_spawn_actor(ego_bp, ego_spawn_point)
+        
+        obstacle_bp = blueprint_library.find(self.config['obstacle_vehicle']['model'])
+        obstacle_bp.set_attribute('role_name', 'obstacle')
+        self.obstacle_vehicle = self.world.try_spawn_actor(obstacle_bp, obstacle_spawn_point)
+        
+        # Setup camera
+        camera_bp = blueprint_library.find('sensor.camera.rgb')
+        camera_bp.set_attribute('image_size_x', str(self.config['video']['width']))
+        camera_bp.set_attribute('image_size_y', str(self.config['video']['height']))
+        camera_bp.set_attribute('fov', self.config['camera']['fov'])
+        
+        camera_transform = carla.Transform(
+            carla.Location(
+                x=ego_spawn_point.location.x + self.config['camera']['offset']['x'],
+                y=ego_spawn_point.location.y + self.config['camera']['offset']['y'],
+                z=self.config['camera']['height']),
+            carla.Rotation(pitch=-90))
+        self.camera = self.world.spawn_actor(camera_bp, camera_transform, attach_to=None)
+        
+        # Setup collision sensor
+        collision_bp = blueprint_library.find('sensor.other.collision')
+        self.collision_sensor = self.world.spawn_actor(
+            collision_bp, carla.Transform(), attach_to=self.ego_vehicle)
+        self.collision_sensor.listen(self._collision_callback)
+        
+        # Setup camera callback
+        self.camera.listen(self._camera_callback)
+        
+        # Load ego trajectory if it exists
+        if os.path.exists(self.config['trajectories']['ego']):
+            self.ego_trajectory = load_trajectory(self.config['trajectories']['ego'])
+        else:
+            # Create empty trajectory that will be filled later
+            self.ego_trajectory = []
+        
+        # Initialize trackers
+        if self.config['simulation']['tracker_type'] == 'ekf':
+            self.obstacle_tracker = EKFObstacleTracker(
+                self.ego_vehicle, self.obstacle_vehicle,
+                dt=self.config['simulation']['delta_seconds'])
+            self.ground_truth_tracker = EKFObstacleTracker(
+                self.ego_vehicle, self.obstacle_vehicle,
+                dt=self.config['simulation']['delta_seconds'])
+        else:
+            self.obstacle_tracker = KFObstacleTracker(
+                self.ego_vehicle, self.obstacle_vehicle,
+                dt=self.config['simulation']['delta_seconds'])
+            self.ground_truth_tracker = KFObstacleTracker(
+                self.ego_vehicle, self.obstacle_vehicle,
+                dt=self.config['simulation']['delta_seconds'])
+        
+        # Setup video writer if needed
+        if self.config['save_options']['save_video']:
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            self.video_writer = cv2.VideoWriter(
+                self.config['video']['filename'], fourcc, 
+                self.config['video']['fps'],
+                (self.config['video']['width'], self.config['video']['height']))
+        
+        # Initialize CSV file
+        os.makedirs(self.output_dir, exist_ok=True)
+        if not os.path.exists(self.collision_prob_file):
+            with open(self.collision_prob_file, 'w') as f:
+                f.write('timestamp,tick,delta_k,collision_probability,ground_truth_probability\n')
+    
+    def _collision_callback(self, event):
+        """Handle collision events."""
+        self.has_collided = True
+    
+    def _camera_callback(self, image):
+        """Handle camera frames."""
+        image.convert(carla.ColorConverter.Raw)
+        img_array = np.frombuffer(image.raw_data, dtype=np.uint8)
+        img_array = img_array.reshape((image.height, image.width, 4))
+        frame_bgr = img_array[:, :, :3].copy()
+        self.frame_queue.append(frame_bgr)
+    
+    def set_states(self, states=None, action=None):
+        """Apply action (brake decision) to ego vehicle."""
+        if action is not None:
+            # Action is binary: 0 = no brake, 1 = brake
+            brake = int(action) if not isinstance(action, (list, np.ndarray)) else int(action[0])
+            
+            if brake:
+                ego_control = carla.VehicleControl(throttle=0.0, brake=1.0)
+            else:
+                # Normal driving based on tick phase
+                ego_control = carla.VehicleControl()
+                if self.tick < self.config['ego_vehicle']['go_straight_ticks']:
+                    ego_control.throttle = self.config['ego_vehicle']['throttle']['straight']
+                elif self.tick < (self.config['ego_vehicle']['go_straight_ticks'] + 
+                                self.config['ego_vehicle']['turn_ticks']):
+                    ego_control.throttle = self.config['ego_vehicle']['throttle']['turn']
+                    ego_control.steer = self.config['ego_vehicle']['steer']['turn']
+                else:
+                    ego_control.throttle = self.config['ego_vehicle']['throttle']['after_turn']
+            
+            self.ego_vehicle.apply_control(ego_control)
+        
+        # Apply obstacle vehicle control (independent of action)
+        obstacle_control = carla.VehicleControl()
+        if self.tick < self.config['obstacle_vehicle']['go_straight_ticks']:
+            obstacle_control.throttle = self.config['obstacle_vehicle']['throttle']['straight']
+            obstacle_control.steer = self.config['obstacle_vehicle']['steer']['straight']
+        elif self.tick < (self.config['obstacle_vehicle']['go_straight_ticks'] + 
+                         self.config['obstacle_vehicle']['turn_ticks']):
+            obstacle_control.throttle = self.config['obstacle_vehicle']['throttle']['turn']
+            obstacle_control.steer = self.config['obstacle_vehicle']['steer']['turn']
+        else:
+            obstacle_control.throttle = self.config['obstacle_vehicle']['throttle']['after_turn']
+            obstacle_control.steer = self.config['obstacle_vehicle']['steer']['after_turn']
+        
+        self.obstacle_vehicle.apply_control(obstacle_control)
+    
+    def get_states(self):
+        """Get current obstacle position as observation."""
+        obs_transform = self.obstacle_vehicle.get_transform()
+        
+        # Return obstacle position as observation
+        observation = np.array([
+            obs_transform.location.x,
+            obs_transform.location.y,
+            obs_transform.rotation.yaw  # in degrees
+        ])
+        
+        return {
+            'observation': observation,
+            'tick': self.tick,
+            'has_collided': self.has_collided
+        }
+    
+    def step(self):
+        """Step CARLA simulation forward."""
+        self.world.tick()
+        self.tick += 1
+    
+    def render(self):
+        """Process and return camera frames."""
+        if self.frame_queue:
+            return self.frame_queue[-1]
+        return None
+    
+    def close(self):
+        """Clean up CARLA resources."""
+        if self.collision_sensor:
+            self.collision_sensor.stop()
+            self.collision_sensor.destroy()
+        
+        if self.camera:
+            self.camera.stop()
+            self.camera.destroy()
+        
+        if self.video_writer:
+            self.video_writer.release()
+        
+        if self.ego_vehicle:
+            self.ego_vehicle.destroy()
+        
+        if self.obstacle_vehicle:
+            self.obstacle_vehicle.destroy()
+        
+        if self.world and self.original_settings:
+            self.world.apply_settings(self.original_settings)
+        
+        if self.client:
+            self.client.reload_world()
+    
+    def get_extra(self):
+        """Get extra metadata for collision probability calculation."""
+        return {
+            'obstacle_tracker': self.obstacle_tracker,
+            'ground_truth_tracker': self.ground_truth_tracker,
+            'ego_trajectory': self.ego_trajectory,
+            'current_delta_k': self.current_delta_k,
+            'collision_prob_file': self.collision_prob_file,
+            'frame_queue': self.frame_queue,
+            'video_writer': self.video_writer
+        }
+    
+    def reset(self):
+        """Reset the simulation and return initial observation."""
+        # Reset state
+        self.tick = 0
+        self.has_collided = False
+        self.frame_queue = []
+        
+        # Get initial observation
+        if self.obstacle_vehicle:
+            obs_transform = self.obstacle_vehicle.get_transform()
+            observation = np.array([
+                obs_transform.location.x,
+                obs_transform.location.y,
+                obs_transform.rotation.yaw
+            ])
+        else:
+            observation = np.array([0.0, 0.0, 0.0])
+        
+        info = {
+            'tick': 0,
+            'has_collided': False
+        }
+        
+        return observation, info
+    
+    def step_with_action(self, action):
+        """
+        Step the simulation with an action and return results.
+        
+        Returns:
+            observation, reward, success, termination, timeout, info
+        """
+        # Apply action (brake decision)
+        self.set_states(action=action)
+        
+        # Step the simulation
+        self.step()
+        
+        # Get new state
+        states = self.get_states()
+        observation = states['observation']
+        
+        # Calculate reward (negative if collision, 0 otherwise)
+        reward = -100.0 if self.has_collided else 0.0
+        
+        # Check termination conditions
+        termination = self.has_collided
+        timeout = self.tick >= (self.config['ego_vehicle']['go_straight_ticks'] +
+                               self.config['ego_vehicle']['turn_ticks'] +
+                               self.config['ego_vehicle']['after_turn_ticks'])
+        success = not termination and timeout  # Success if completed without collision
+        
+        info = {
+            'tick': self.tick,
+            'has_collided': self.has_collided
+        }
+        
+        return observation, reward, success, termination, timeout, info
 
 class BaseTracker(ABC):
 
@@ -1426,6 +1744,408 @@ def run_adaptive_simulation(config, output_dir):
         return has_collided, current_delta_k
 
 
+def run_adaptive_simulation_fogsim(config, output_dir):
+    """
+    Run simulation with FogSim handling network delays.
+    
+    This version uses FogSim to simulate latency between observation and action,
+    replacing the manual buffering approach with proper network simulation.
+    """
+    # Initialize return variables
+    has_collided = False
+    current_delta_k = config['simulation']['delta_k']
+    
+    try:
+        # Create network configuration based on delta_k
+        network_delay = config['simulation']['delta_k'] * config['simulation']['delta_seconds']
+        network_config = NetworkConfig(
+            source_rate=1e6,  # 1 Mbps
+            topology={'link_delay': network_delay}
+        )
+        
+        # Create handler
+        handler = CollisionHandler(config, output_dir)
+        
+        # Create FogSim environment
+        print(f"Creating FogSim with network delay: {network_delay}s")
+        env = Env(
+            handler=handler,
+            network_config=network_config,
+            enable_network=True,
+            timestep=config['simulation']['delta_seconds']
+        )
+        print(f"FogSim mode: {env.fogsim.mode}")
+        print(f"FogSim network initialized: {env.fogsim.network is not None}")
+        
+        # Initialize environment
+        print("Initializing FogSim environment...")
+        obs, info = env.reset()
+        print(f"Initial observation: {obs}")
+        
+        # Run first simulation to generate ego trajectory if it doesn't exist
+        if not os.path.exists(config['trajectories']['ego']):
+            print("Generating ego trajectory...")
+            run_first_simulation(config)
+        
+        # Reload ego trajectory in handler
+        if os.path.exists(config['trajectories']['ego']):
+            handler.ego_trajectory = load_trajectory(config['trajectories']['ego'])
+        
+        # Initialize variables for tracking
+        max_collision_prob = 0.0
+        ground_truth_collision_prob = 0.0
+        tick = 0
+        
+        # Observation buffer for delayed tracking
+        observation_buffer = []
+        
+        # Total simulation steps
+        total_steps = (config['ego_vehicle']['go_straight_ticks'] +
+                      config['ego_vehicle']['turn_ticks'] +
+                      config['ego_vehicle']['after_turn_ticks'])
+        
+        print(f"Starting simulation with {total_steps} steps...")
+        for step in range(total_steps):
+            if step % 100 == 0:
+                print(f"Step {step}/{total_steps}")
+            
+            # Get current observation (delayed by network)
+            current_obs = obs  # This is already delayed by FogSim
+            
+            # Buffer observations
+            observation_buffer.append(current_obs)
+            if len(observation_buffer) > config['simulation']['l_max']:
+                observation_buffer.pop(0)
+            
+            # Update trackers with current and historical observations
+            if len(observation_buffer) >= config['simulation']['l_max']:
+                # Update with delayed observation (l_max steps ago)
+                historical_obs = observation_buffer[0]
+                handler.obstacle_tracker.update(
+                    (historical_obs[0], historical_obs[1], historical_obs[2]), tick)
+                
+                # Update ground truth with current observation
+                handler.ground_truth_tracker.update(
+                    (current_obs[0], current_obs[1], current_obs[2]), tick)
+                
+                # Calculate collision probabilities
+                predicted_positions = handler.obstacle_tracker.predict_future_position(
+                    int(config['simulation']['prediction_steps'] / current_delta_k))
+                
+                max_collision_prob, collision_time, collision_probabilities = \
+                    calculate_collision_probabilities(
+                        handler.obstacle_tracker, predicted_positions,
+                        handler.ego_trajectory, tick)
+                
+                # Ground truth predictions
+                ground_truth_predictions = handler.ground_truth_tracker.predict_future_position(
+                    int(config['simulation']['prediction_steps'] / current_delta_k))
+                
+                ground_truth_max_prob, _, _ = calculate_collision_probabilities(
+                    handler.ground_truth_tracker, ground_truth_predictions,
+                    handler.ego_trajectory, tick)
+                
+                ground_truth_collision_prob = ground_truth_max_prob
+                
+                # Adaptive behavior based on collision probability
+                if max_collision_prob > config['simulation']['emergency_brake_threshold']:
+                    # Emergency brake
+                    action = 1  # Brake
+                    print(f"Emergency brake activated! Collision probability: {max_collision_prob:.4f}")
+                    
+                elif max_collision_prob > config['simulation']['cautious_threshold']:
+                    # Increase tracking frequency (decrease delta_k)
+                    new_delta_k = config['simulation']['cautious_delta_k']
+                    if new_delta_k != current_delta_k:
+                        print(f"Adjusting delta_k from {current_delta_k} to {new_delta_k}")
+                        current_delta_k = new_delta_k
+                        # Update network delay
+                        new_delay = new_delta_k * config['simulation']['delta_seconds']
+                        env.fogsim.network.link_delay = new_delay
+                        # Adjust buffer
+                        while len(observation_buffer) > new_delta_k:
+                            observation_buffer.pop(0)
+                    action = 0  # No brake
+                else:
+                    action = 0  # No brake
+            else:
+                action = 0  # No brake during initial buffering
+            
+            # Step environment with action
+            obs, reward, success, termination, timeout, info = env.step(action)
+            
+            # Log network delay info periodically
+            if step % 50 == 0 and 'network_delay_active' in info:
+                print(f"  Network active: {info.get('network_delay_active', False)}, "
+                      f"Sim time: {info.get('simulation_time', 0):.3f}s")
+            
+            # Check for collision
+            if handler.has_collided:
+                has_collided = True
+                print("Collision detected! Stopping simulation.")
+                break
+            
+            # Process frames for video
+            while handler.frame_queue:
+                frame_bgr = handler.frame_queue.pop(0)
+                
+                # Add text overlays
+                collision_text = f"Predicted Collision Probability: {max_collision_prob:.4f}"
+                cv2.putText(frame_bgr, collision_text, (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+                
+                ground_truth_text = f"Groundtruth Collision Probability: {ground_truth_collision_prob:.4f}"
+                cv2.putText(frame_bgr, ground_truth_text, (10, 60),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
+                
+                latency_text = f"Current Latency: {current_delta_k * 10} ms"
+                cv2.putText(frame_bgr, latency_text, (10, 90),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
+                
+                if handler.video_writer:
+                    handler.video_writer.write(frame_bgr)
+                
+                if config['save_options']['save_images']:
+                    cv2.imwrite(
+                        os.path.join(output_dir, f'bev_images/frame_{tick}.png'),
+                        frame_bgr)
+            
+            # Log collision probabilities
+            timestamp = tick * config['simulation']['delta_seconds']
+            with open(handler.collision_prob_file, 'a') as f:
+                f.write(f'{timestamp:.2f},{tick},{current_delta_k},'
+                       f'{max_collision_prob:.4f},{ground_truth_collision_prob:.4f}\n')
+            
+            tick += 1
+    
+    except Exception as e:
+        print(f"Error in FogSim simulation: {e}")
+        import traceback
+        traceback.print_exc()
+        
+    finally:
+        if 'env' in locals():
+            env.close()
+    
+    return has_collided, current_delta_k
+
+
+def run_adaptive_simulation_fogsim_async(config, output_dir):
+    """
+    Run simulation with FogSim in async CARLA mode.
+    
+    This version uses:
+    - CARLA in asynchronous mode (runs at its own pace)
+    - FogSim with REAL_NET or SIMULATED_NET mode (real clock)
+    - Network delays to simulate latency
+    
+    This tests correctness when CARLA timing is not synchronized.
+    """
+    # Initialize return variables
+    has_collided = False
+    current_delta_k = config['simulation']['delta_k']
+    
+    try:
+        # Create network configuration based on delta_k
+        network_delay = config['simulation']['delta_k'] * config['simulation']['delta_seconds']
+        network_config = NetworkConfig(
+            source_rate=1e6,  # 1 Mbps
+            topology={'link_delay': network_delay}
+        )
+        
+        # Create async handler
+        print("Creating AsyncCollisionHandler for async CARLA mode...")
+        handler = AsyncCollisionHandler(config, output_dir)
+        
+        # Import SimulationMode for virtual timeline mode
+        from fogsim import SimulationMode
+        
+        # Create FogSim environment with VIRTUAL mode for async CARLA
+        # Virtual timeline ensures correct network simulation without blocking
+        print(f"Creating FogSim with network delay: {network_delay}s (async CARLA mode)")
+        env = Env(
+            handler=handler,
+            network_config=network_config,
+            enable_network=True,
+            timestep=config['simulation']['delta_seconds'],
+            mode=SimulationMode.VIRTUAL  # Use virtual timeline with async CARLA
+        )
+        print(f"FogSim mode: {env.fogsim.mode}")
+        print(f"FogSim network initialized: {env.fogsim.network is not None}")
+        print(f"CARLA running in ASYNC mode")
+        
+        # Initialize environment
+        print("Initializing FogSim environment (async)...")
+        obs, info = env.reset()
+        print(f"Initial observation: {obs}")
+        
+        # Run first simulation to generate ego trajectory if it doesn't exist
+        if not os.path.exists(config['trajectories']['ego']):
+            print("Generating ego trajectory...")
+            run_first_simulation(config)
+        
+        # Reload ego trajectory in handler
+        if os.path.exists(config['trajectories']['ego']):
+            handler.ego_trajectory = load_trajectory(config['trajectories']['ego'])
+        
+        # Initialize variables for tracking
+        max_collision_prob = 0.0
+        ground_truth_collision_prob = 0.0
+        tick = 0
+        start_time = time.time()
+        
+        # Observation buffer for delayed tracking
+        observation_buffer = []
+        
+        # Calculate total simulation time based on ticks and timestep
+        total_ticks = (config['ego_vehicle']['go_straight_ticks'] +
+                      config['ego_vehicle']['turn_ticks'] +
+                      config['ego_vehicle']['after_turn_ticks'])
+        total_sim_time = total_ticks * config['simulation']['delta_seconds']
+        
+        print(f"Starting async simulation for {total_sim_time:.1f} seconds...")
+        step = 0
+        while (time.time() - start_time) < total_sim_time:
+            elapsed = time.time() - start_time
+            if step % 100 == 0:
+                progress = (elapsed / total_sim_time) * 100
+                print(f"Progress: {progress:.1f}%, Elapsed: {elapsed:.1f}s/{total_sim_time:.1f}s, Real FPS: {handler.real_fps:.1f}")
+            
+            # Get current observation (delayed by network)
+            current_obs = obs  # This is already delayed by FogSim
+            
+            # Buffer observations
+            observation_buffer.append(current_obs)
+            if len(observation_buffer) > config['simulation']['l_max']:
+                observation_buffer.pop(0)
+            
+            # Update trackers with current and historical observations
+            if len(observation_buffer) >= config['simulation']['l_max']:
+                # Update with delayed observation (l_max steps ago)
+                historical_obs = observation_buffer[0]
+                handler.obstacle_tracker.update(
+                    (historical_obs[0], historical_obs[1], historical_obs[2]), tick)
+                
+                # Update ground truth with current observation
+                handler.ground_truth_tracker.update(
+                    (current_obs[0], current_obs[1], current_obs[2]), tick)
+                
+                # Calculate collision probabilities
+                predicted_positions = handler.obstacle_tracker.predict_future_position(
+                    int(config['simulation']['prediction_steps'] / current_delta_k))
+                
+                max_collision_prob, collision_time, collision_probabilities = \
+                    calculate_collision_probabilities(
+                        handler.obstacle_tracker, predicted_positions,
+                        handler.ego_trajectory, tick)
+                
+                # Ground truth predictions
+                ground_truth_predictions = handler.ground_truth_tracker.predict_future_position(
+                    int(config['simulation']['prediction_steps'] / current_delta_k))
+                
+                ground_truth_max_prob, _, _ = calculate_collision_probabilities(
+                    handler.ground_truth_tracker, ground_truth_predictions,
+                    handler.ego_trajectory, tick)
+                
+                ground_truth_collision_prob = ground_truth_max_prob
+                
+                # Adaptive behavior based on collision probability
+                if max_collision_prob > config['simulation']['emergency_brake_threshold']:
+                    # Emergency brake
+                    action = 1  # Brake
+                    print(f"Emergency brake activated! Collision probability: {max_collision_prob:.4f}")
+                    
+                elif max_collision_prob > config['simulation']['cautious_threshold']:
+                    # Increase tracking frequency (decrease delta_k)
+                    new_delta_k = config['simulation']['cautious_delta_k']
+                    if new_delta_k != current_delta_k:
+                        print(f"Adjusting delta_k from {current_delta_k} to {new_delta_k}")
+                        current_delta_k = new_delta_k
+                        # Update network delay
+                        new_delay = new_delta_k * config['simulation']['delta_seconds']
+                        env.fogsim.network.link_delay = new_delay
+                        # Adjust buffer
+                        while len(observation_buffer) > new_delta_k:
+                            observation_buffer.pop(0)
+                    action = 0  # No brake
+                else:
+                    action = 0  # No brake
+            else:
+                action = 0  # No brake during initial buffering
+            
+            # Step environment with action
+            obs, reward, success, termination, timeout, info = env.step(action)
+            
+            # Log network delay info periodically
+            if step % 50 == 0 and 'network_delay_active' in info:
+                print(f"  Network active: {info.get('network_delay_active', False)}, "
+                      f"Real time elapsed: {time.time() - start_time:.2f}s")
+            
+            # Check for collision
+            if handler.has_collided:
+                has_collided = True
+                print("Collision detected! Stopping simulation.")
+                break
+            
+            # Process frames for video
+            while handler.frame_queue:
+                frame_bgr = handler.frame_queue.pop(0)
+                
+                # Add text overlays
+                collision_text = f"Predicted Collision Probability: {max_collision_prob:.4f}"
+                cv2.putText(frame_bgr, collision_text, (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+                
+                ground_truth_text = f"Groundtruth Collision Probability: {ground_truth_collision_prob:.4f}"
+                cv2.putText(frame_bgr, ground_truth_text, (10, 60),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
+                
+                latency_text = f"Current Latency: {current_delta_k * 10} ms"
+                cv2.putText(frame_bgr, latency_text, (10, 90),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
+                
+                fps_text = f"Real FPS: {handler.real_fps:.1f}"
+                cv2.putText(frame_bgr, fps_text, (10, 120),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2, cv2.LINE_AA)
+                
+                if handler.video_writer:
+                    handler.video_writer.write(frame_bgr)
+                
+                if config['save_options']['save_images']:
+                    cv2.imwrite(
+                        os.path.join(output_dir, f'bev_images/frame_{tick}.png'),
+                        frame_bgr)
+            
+            # Log collision probabilities with real FPS
+            timestamp = tick * config['simulation']['delta_seconds']
+            with open(handler.collision_prob_file, 'a') as f:
+                f.write(f'{timestamp:.2f},{tick},{current_delta_k},'
+                       f'{max_collision_prob:.4f},{ground_truth_collision_prob:.4f},'
+                       f'{handler.real_fps:.2f}\n')
+            
+            tick += 1
+            step += 1
+            
+            # Small delay to prevent CPU spinning in async mode
+            time.sleep(0.001)  # 1ms delay
+        
+        total_time = time.time() - start_time
+        print(f"\nAsync simulation completed in {total_time:.2f}s")
+        print(f"Total steps processed: {step}")
+        print(f"Average processing rate: {step / total_time:.1f} steps/sec")
+    
+    except Exception as e:
+        print(f"Error in async FogSim simulation: {e}")
+        import traceback
+        traceback.print_exc()
+        
+    finally:
+        if 'env' in locals():
+            env.close()
+    
+    return has_collided, current_delta_k
+
+
 def run_obstacle_only_simulation(config, trajectory_file=None):
     """Run a simulation with only the obstacle vehicle to record its trajectory"""
     # Use trajectory file from config if none provided
@@ -1589,13 +2309,14 @@ def get_monte_carlo_spawn_point(config, ego_spawn_point, std_dev=0):
     return spawn_point
 
 
-def run_monte_carlo_simulation(config, num_samples=10, output_dir='./results'):
+def run_monte_carlo_simulation(config, num_samples=10, output_dir='./results', use_fogsim=False):
     """
     Run multiple simulations with Monte Carlo sampling of obstacle spawn points.
     
     Args:
         config: Configuration dictionary
         num_samples: Number of Monte Carlo samples to run
+        use_fogsim: Whether to use FogSim version with network simulation
     
     Returns:
         dict: Statistics about collisions and spawn points
@@ -1653,8 +2374,12 @@ def run_monte_carlo_simulation(config, num_samples=10, output_dir='./results'):
             run_first_simulation(sample_config)
 
             # Run simulation and check for collision
-            has_collided, current_delta_k = run_adaptive_simulation(
-                sample_config, output_dir)
+            if use_fogsim:
+                has_collided, current_delta_k = run_adaptive_simulation_fogsim(
+                        sample_config, output_dir)
+            else:
+                has_collided, current_delta_k = run_adaptive_simulation(
+                    sample_config, output_dir)
 
             # Check if collision occurred
             if has_collided:
@@ -1772,6 +2497,9 @@ def main():
                         type=str,
                         default='./results',
                         help='Directory to store results')
+    parser.add_argument('--use_fogsim',
+                        action='store_true',
+                        help='Use FogSim for network delay simulation')
     args = parser.parse_args()
 
     # Select configuration based on argument
@@ -1827,7 +2555,7 @@ def main():
         try:
             # Run Monte Carlo simulation
             stats = run_monte_carlo_simulation(base_config, num_samples,
-                                               args.output_dir)
+                                               args.output_dir, use_fogsim=args.use_fogsim)
 
             # Calculate and save statistics
             collision_rate = stats['num_collisions'] / num_samples
@@ -1839,6 +2567,7 @@ def main():
                 f.write(f"Monte Carlo Simulation Results\n")
                 f.write(f"Configuration:\n")
                 f.write(f"  Config Type: {args.config_type}\n")
+                f.write(f"  Using FogSim: {args.use_fogsim}\n")
                 f.write(
                     f"  Cautious Delta K: {base_config['simulation']['cautious_delta_k']}\n"
                 )

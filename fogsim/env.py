@@ -34,8 +34,8 @@ class Env:
         
         logger.info("Using legacy Env interface - consider migrating to FogSim")
         
-        # Create FogSim instance
-        self.fogsim = FogSim(handler, mode, timestep)
+        # Create FogSim instance with network config
+        self.fogsim = FogSim(handler, mode, timestep, network_config)
         
         # Store configuration for compatibility
         self.handler = handler
