@@ -37,8 +37,8 @@ unprotected_right_turn_config = {
     'video': {
         'filename': './bev_images/unprotected_right_turn_collision.mp4',
         'fps': 100,
-        'width': 1920,
-        'height': 1080,
+        'width': 640,
+        'height': 480,
     },
     'ego_vehicle': {
         'model': 'vehicle.tesla.model3',
@@ -115,8 +115,8 @@ unprotected_left_turn_config = {
     'video': {
         'filename': './bev_images/unprotected_left_turn_collision.mp4',
         'fps': 100,
-        'width': 1920,
-        'height': 1080,
+        'width': 640,
+        'height': 480,
     },
     'ego_vehicle': {
         'model': 'vehicle.tesla.model3',
@@ -193,8 +193,8 @@ opposite_direction_merge_config = {
     'video': {
         'filename': './bev_images/opposite_direction_merge_collision.mp4',
         'fps': 100,
-        'width': 1920,
-        'height': 1080,
+        'width': 640,
+        'height': 480,
     },
     'ego_vehicle': {
         'model': 'vehicle.tesla.model3',
@@ -335,27 +335,25 @@ class CollisionHandler(BaseHandler):
         obstacle_bp.set_attribute('role_name', 'obstacle')
         self.obstacle_vehicle = self.world.try_spawn_actor(obstacle_bp, obstacle_spawn_point)
         
-        # Setup 4 cameras on the ego vehicle
-        camera_positions = {
-            'front': {'x': 2.0, 'y': 0.0, 'z': 1.5, 'pitch': 0, 'yaw': 0},
-            'rear': {'x': -2.0, 'y': 0.0, 'z': 1.5, 'pitch': 0, 'yaw': 180},
-            'left': {'x': 0.0, 'y': -1.0, 'z': 1.5, 'pitch': 0, 'yaw': -90},
-            'right': {'x': 0.0, 'y': 1.0, 'z': 1.5, 'pitch': 0, 'yaw': 90}
-        }
+        # Setup single BEV camera above the intersection
+        camera_bp = blueprint_library.find('sensor.camera.rgb')
+        camera_bp.set_attribute('image_size_x', str(self.config['video']['width']))
+        camera_bp.set_attribute('image_size_y', str(self.config['video']['height']))
+        camera_bp.set_attribute('fov', self.config['camera']['fov'])
         
-        for camera_name, pos in camera_positions.items():
-            camera_bp = blueprint_library.find('sensor.camera.rgb')
-            camera_bp.set_attribute('image_size_x', str(self.config['video']['width']))
-            camera_bp.set_attribute('image_size_y', str(self.config['video']['height']))
-            camera_bp.set_attribute('fov', self.config['camera']['fov'])
-            
-            camera_transform = carla.Transform(
-                carla.Location(x=pos['x'], y=pos['y'], z=pos['z']),
-                carla.Rotation(pitch=pos['pitch'], yaw=pos['yaw']))
-            
-            camera = self.world.spawn_actor(camera_bp, camera_transform, attach_to=self.ego_vehicle)
-            self.cameras[camera_name] = camera
-            self.frame_queues[camera_name] = []
+        # BEV camera positioned above the scene, looking down
+        bev_transform = carla.Transform(
+            carla.Location(
+                x=self.ego_vehicle.get_transform().location.x + self.config['camera']['offset']['x'],
+                y=self.ego_vehicle.get_transform().location.y + self.config['camera']['offset']['y'],
+                z=self.config['camera']['height']
+            ),
+            carla.Rotation(pitch=-90)  # Looking straight down
+        )
+        
+        camera = self.world.spawn_actor(camera_bp, bev_transform, attach_to=None)
+        self.cameras['bev'] = camera
+        self.frame_queues['bev'] = []
         
         # Setup collision sensor
         collision_bp = blueprint_library.find('sensor.other.collision')
@@ -363,9 +361,8 @@ class CollisionHandler(BaseHandler):
             collision_bp, carla.Transform(), attach_to=self.ego_vehicle)
         self.collision_sensor.listen(self._collision_callback)
         
-        # Setup camera callbacks
-        for camera_name, camera in self.cameras.items():
-            camera.listen(lambda image, name=camera_name: self._camera_callback(image, name))
+        # Setup camera callback for BEV camera
+        self.cameras['bev'].listen(lambda image: self._camera_callback(image, 'bev'))
         
         # Load ego trajectory if it exists
         if os.path.exists(self.config['trajectories']['ego']):
@@ -479,27 +476,25 @@ class CollisionHandler(BaseHandler):
         self.world.tick()
         self.tick += 1
     
-    def render(self, camera_name='front'):
+    def render(self, camera_name='bev'):
         """Process and return camera frames."""
         if camera_name in self.frame_queues and self.frame_queues[camera_name]:
             return self.frame_queues[camera_name][-1]
         return None
     
     def save_all_camera_frames(self, tick, output_dir):
-        """Save frames from all cameras."""
-        for camera_name, frame_queue in self.frame_queues.items():
-            if frame_queue:
-                frame_bgr = frame_queue[-1]
-                camera_output_dir = os.path.join(output_dir, f'camera_{camera_name}')
-                os.makedirs(camera_output_dir, exist_ok=True)
-                cv2.imwrite(os.path.join(camera_output_dir, f'frame_{tick}.png'), frame_bgr)
+        """Save BEV camera frame."""
+        if 'bev' in self.frame_queues and self.frame_queues['bev']:
+            frame_bgr = self.frame_queues['bev'][-1]
+            bev_output_dir = os.path.join(output_dir, 'bev_images')
+            os.makedirs(bev_output_dir, exist_ok=True)
+            cv2.imwrite(os.path.join(bev_output_dir, f'frame_{tick}.png'), frame_bgr)
     
     def get_latest_frames(self):
-        """Get the latest frame from each camera."""
+        """Get the latest BEV frame."""
         latest_frames = {}
-        for camera_name, frame_queue in self.frame_queues.items():
-            if frame_queue:
-                latest_frames[camera_name] = frame_queue[-1]
+        if 'bev' in self.frame_queues and self.frame_queues['bev']:
+            latest_frames['bev'] = self.frame_queues['bev'][-1]
         return latest_frames
     
     def close(self):
@@ -545,8 +540,8 @@ class CollisionHandler(BaseHandler):
         # Reset state
         self.tick = 0
         self.has_collided = False
-        for camera_name in self.frame_queues:
-            self.frame_queues[camera_name] = []
+        if 'bev' in self.frame_queues:
+            self.frame_queues['bev'] = []
         
         # Get initial observation
         if self.obstacle_vehicle:
@@ -1266,7 +1261,8 @@ def run_simulation(config, output_dir):
 
         # Only save individual frames if save_images is True
         if config['save_options']['save_images']:
-            cv2.imwrite(f"./bev_images/frame_{tick}.png", frame_bgr)
+            os.makedirs(os.path.join(output_dir, 'bev_images'), exist_ok=True)
+            cv2.imwrite(os.path.join(output_dir, f'bev_images/frame_{tick}.png'), frame_bgr)
 
     camera.listen(camera_callback)
 
@@ -1393,7 +1389,8 @@ def run_simulation(config, output_dir):
                 if config['save_options']['save_video']:
                     video_writer.write(frame_bgr)
                 if config['save_options']['save_images']:
-                    cv2.imwrite(f"./bev_images/frame_{tick}.png", frame_bgr)
+                    os.makedirs(os.path.join(output_dir, 'bev_images'), exist_ok=True)
+                    cv2.imwrite(os.path.join(output_dir, f'bev_images/frame_{tick}.png'), frame_bgr)
 
             # After calculating collision_prob and collision_time
             timestamp = tick * config['simulation']['delta_seconds']
@@ -1501,7 +1498,8 @@ def run_adaptive_simulation(config, output_dir, no_risk_eval=False):
         frame_queue.append(frame_bgr)
 
         if config['save_options']['save_images']:
-            cv2.imwrite(f"./bev_images/frame_{tick}.png", frame_bgr)
+            os.makedirs(os.path.join(output_dir, 'bev_images'), exist_ok=True)
+            cv2.imwrite(os.path.join(output_dir, f'bev_images/frame_{tick}.png'), frame_bgr)
 
     camera.listen(camera_callback)
 
@@ -1925,12 +1923,12 @@ def run_adaptive_simulation_fogsim(config, output_dir, no_risk_eval=False):
                 break
             
             # Process frames for video (async-safe version)
-            if 'front' in handler.frame_queues and handler.frame_queues['front'] and (config['save_options']['save_video'] or config['save_options']['save_images']):
+            if 'bev' in handler.frame_queues and handler.frame_queues['bev'] and (config['save_options']['save_video'] or config['save_options']['save_images']):
                 try:
                     # Process only the most recent frame to avoid blocking in async mode
-                    if len(handler.frame_queues['front']) > 0:
-                        frame_bgr = handler.frame_queues['front'][-1].copy()  # Get latest frame and copy it
-                        handler.frame_queues['front'].clear()  # Clear queue to prevent buildup in async mode
+                    if len(handler.frame_queues['bev']) > 0:
+                        frame_bgr = handler.frame_queues['bev'][-1].copy()  # Get latest frame and copy it
+                        handler.frame_queues['bev'].clear()  # Clear queue to prevent buildup in async mode
                         
                         # Add text overlays
                         collision_text = f"Predicted Collision Probability: {max_collision_prob:.4f}"
@@ -1949,13 +1947,13 @@ def run_adaptive_simulation_fogsim(config, output_dir, no_risk_eval=False):
                             handler.video_writer.write(frame_bgr)
                         
                         if config['save_options']['save_images']:
-                            # Save front camera with overlays
+                            # Save BEV camera with overlays
                             os.makedirs(os.path.join(output_dir, 'bev_images'), exist_ok=True)
                             cv2.imwrite(
                                 os.path.join(output_dir, f'bev_images/frame_{tick}.png'),
                                 frame_bgr)
                             
-                            # Save all camera views without overlays
+                            # Save BEV view without overlays
                             handler.save_all_camera_frames(tick, output_dir)
                 except Exception as e:
                     # Silently handle frame processing errors in async mode
@@ -2341,6 +2339,10 @@ def main():
     parser.add_argument('--sync_mode',
                         action='store_true',
                         help='Use synchronous mode for CARLA simulation (default: asynchronous)')
+    parser.add_argument('--carla_port',
+                        type=int,
+                        default=2000,
+                        help='CARLA server port (default: 2000)')
     args = parser.parse_args()
 
     # Select configuration based on argument
@@ -2364,6 +2366,9 @@ def main():
     
     # Add sync_mode to configuration
     base_config['simulation']['sync_mode'] = args.sync_mode
+    
+    # Update CARLA port
+    base_config['simulation']['port'] = args.carla_port
 
     # Update output paths based on output directory
     base_config['video']['filename'] = os.path.join(args.output_dir,
