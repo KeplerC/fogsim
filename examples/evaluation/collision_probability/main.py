@@ -5,16 +5,484 @@ import math
 import os
 import shutil
 import time
+from collections import deque
 
 import carla
 import cv2
 from filterpy.kalman import KalmanFilter
+import matplotlib.pyplot as plt
 import numpy as np
+import seaborn as sns
 from scipy.stats import norm
 
 # FogSim imports
 from fogsim import Env, NetworkConfig
 from fogsim.handlers import BaseHandler
+
+# Import PID controllers from separate module
+from controller import VehiclePIDController, PIDLongitudinalController, PIDLateralController
+
+def get_speed(vel):
+    """
+    Compute speed of a vehicle in Km/h.
+    :param vel: velocity
+    :return: speed as a float in Km/h
+    """
+    return 3.6 * math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
+
+def generate_descriptive_filename(base_name, extension, sync_mode=False, scenario_type=None, unique_id=None, run_number=None):
+    """
+    Generate descriptive filename with mode, scenario type, and unique identifier.
+    
+    :param base_name: Base name for the file (e.g., 'trajectory', 'collision_prob')
+    :param extension: File extension (e.g., 'png', 'pdf', 'csv')
+    :param sync_mode: True for synchronous mode, False for async
+    :param scenario_type: Type of scenario ('right_turn', 'left_turn', 'merge')
+    :param unique_id: Unique identifier (timestamp or custom ID)
+    :param run_number: Optional run number for multiple runs
+    :return: Formatted filename string
+    """
+    mode_str = "sync" if sync_mode else "async"
+    
+    # Generate unique ID if not provided
+    if unique_id is None:
+        unique_id = int(time.time() * 1000) % 1000000  # Last 6 digits of timestamp
+    
+    # Build filename parts
+    parts = [base_name]
+    
+    if scenario_type:
+        parts.append(scenario_type)
+    
+    parts.append(mode_str)
+    
+    if run_number is not None:
+        parts.append(f"run{run_number}")
+    
+    parts.append(str(unique_id))
+    
+    filename = "_".join(parts) + "." + extension.lstrip('.')
+    return filename
+
+# class CarlaWaypoint:
+#     """Simple waypoint wrapper for controller.py compatibility"""
+#     def __init__(self, x, y, angle):
+#         self.transform = carla.Transform(
+#             carla.Location(x=x, y=y, z=0),
+#             carla.Rotation(yaw=math.degrees(angle))
+#         )
+
+
+
+
+# ========================= Waypoint Classes =========================
+
+class Waypoint:
+    """Simple waypoint representation"""
+    def __init__(self, x, y, angle, speed=30.0):
+        self.x = x
+        self.y = y
+        self.angle = angle  # in radians
+        self.speed = speed  # target speed in km/h
+
+# class PathManager:
+#     """Manages waypoints and path following logic"""
+#     def __init__(self, waypoints, lookahead_distance=3.0):
+#         self.waypoints = waypoints
+#         self.lookahead_distance = lookahead_distance
+#         self.current_index = 0
+#         self.completed = False
+    
+#     def get_target_waypoint(self, current_pos, sync_mode=False):
+#         """
+#         Get target waypoint based on current position and lookahead
+#         :param current_pos: (x, y) tuple of current position
+#         :param sync_mode: whether running in synchronous mode (affects lookahead)
+#         :return: target Waypoint or None if path completed
+#         """
+#         print(f"[get_target_waypoint] Current pos: ({current_pos[0]:.2f}, {current_pos[1]:.2f}), sync_mode: {sync_mode}")
+#         print(f"[get_target_waypoint] Path completed: {self.completed}, current_index: {self.current_index}/{len(self.waypoints)}")
+#         if self.completed or self.current_index >= len(self.waypoints):
+#             print(f"[get_target_waypoint] Early exit - completed: {self.completed}, index >= waypoints: {self.current_index >= len(self.waypoints)}")
+#             return None
+        
+#         # Find the closest waypoint to current position within a reasonable search range
+#         # But ensure forward progress by not going backwards
+#         search_range = min(20, len(self.waypoints) - self.current_index)
+#         min_dist = float('inf')
+#         closest_idx = self.current_index
+        
+#         print(f"[get_target_waypoint] Searching for closest waypoint in range [{self.current_index}, {self.current_index + search_range})")
+        
+#         # Check if we should advance past current waypoint first
+#         if self.current_index < len(self.waypoints) - 1:
+#             current_wp = self.waypoints[self.current_index]
+#             current_dist = math.sqrt((current_wp.x - current_pos[0])**2 + (current_wp.y - current_pos[1])**2)
+            
+#             # If we're close enough to current waypoint (within 2 meters), advance to next
+#             if current_dist < 2.0 and self.current_index < len(self.waypoints) - 1:
+#                 closest_idx = self.current_index + 1
+#                 print(f"[get_target_waypoint] Close to current waypoint ({current_dist:.2f}m), advancing to {closest_idx}")
+#             else:
+#                 # Search for closest waypoint, but prefer forward waypoints
+#                 for i in range(self.current_index, self.current_index + search_range):
+#                     wp = self.waypoints[i]
+#                     dist = math.sqrt((wp.x - current_pos[0])**2 + (wp.y - current_pos[1])**2)
+#                     # Add a small bias toward forward waypoints to prevent getting stuck
+#                     if i > self.current_index:
+#                         dist -= 0.5  # Slight preference for forward waypoints
+#                     if dist < min_dist:
+#                         min_dist = dist
+#                         closest_idx = i
+        
+#         print(f"[get_target_waypoint] Closest waypoint: idx={closest_idx}, distance={min_dist:.2f}")
+        
+#         # Update current index to the closest waypoint we found
+#         old_current_index = self.current_index
+#         self.current_index = closest_idx
+#         print(f"[get_target_waypoint] Updated current_index: {old_current_index} -> {self.current_index}")
+        
+#         # Calculate lookahead based on sync mode
+#         # Key insight: sync mode generates dense waypoints (100Hz), async mode has sparse waypoints
+#         if sync_mode:
+#             # Dense waypoints: look further ahead (more waypoints for same distance)
+#             # For 100Hz sync mode, roughly 10 waypoints per meter at typical speeds
+#             lookahead_waypoints = max(5, min(50, int(self.lookahead_distance * 8)))  # 8 waypoints per meter, capped at 50
+#             print(f"[get_target_waypoint] Sync mode: lookahead_distance={self.lookahead_distance}m -> {lookahead_waypoints} waypoints")
+#         else:
+#             # Sparse waypoints: look closer ahead (fewer waypoints for same distance)
+#             # For async mode, roughly 1-2 waypoints per meter
+#             lookahead_waypoints = max(2, int(self.lookahead_distance * 1.5))         # 1.5 waypoints per meter
+#             print(f"[get_target_waypoint] Async mode: lookahead_distance={self.lookahead_distance}m -> {lookahead_waypoints} waypoints")
+        
+#         target_idx = min(self.current_index + lookahead_waypoints, len(self.waypoints) - 1)
+#         print(f"[get_target_waypoint] Initial target_idx: {self.current_index} + {lookahead_waypoints} = {target_idx} (clamped to {len(self.waypoints) - 1})")
+        
+#         # Ensure we actually move forward, not stay at the same point
+#         if target_idx == self.current_index and target_idx < len(self.waypoints) - 1:
+#             target_idx = self.current_index + 1
+#             print(f"[get_target_waypoint] Forced forward progress: target_idx -> {target_idx}")
+        
+#         # Check if path is completed
+#         if self.current_index >= len(self.waypoints) - 5:  # Near end of path
+#             final_wp = self.waypoints[-1]
+#             final_dist = math.sqrt((final_wp.x - current_pos[0])**2 + (final_wp.y - current_pos[1])**2)
+#             print(f"[get_target_waypoint] Near end check: final_dist={final_dist:.2f}, threshold=3.0")
+#             if final_dist < 3.0:  # Close enough to final waypoint
+#                 self.completed = True
+#                 print(f"[get_target_waypoint] Path completed! Distance to final waypoint: {final_dist:.2f}")
+#                 return None
+        
+#         target_wp = self.waypoints[target_idx]
+#         print(f"[get_target_waypoint] Target waypoint: idx={target_idx}, pos=({target_wp.x:.2f}, {target_wp.y:.2f}), speed={target_wp.speed}")
+#         return target_wp
+    
+#     def is_completed(self):
+#         return self.completed
+
+#worked for 100hz sync mode, not for 10hz async mode
+class PathManager:
+    """Manages waypoints and path following logic (metric lookahead)."""
+    def __init__(self, waypoints, lookahead_distance=3.0):
+        self.waypoints = waypoints            # list of objects with .x, .y, .speed
+        self.lookahead_distance = float(lookahead_distance)
+        self.current_index = 0
+        self.completed = False
+
+    @staticmethod
+    def _dist(wp_a, wp_b):
+        return math.hypot(wp_a.x - wp_b.x, wp_a.y - wp_b.y)
+
+    def _advance_by_distance(self, start_idx, lookahead_m):
+        """Return index >= start_idx whose cumulative arc length >= lookahead_m."""
+        i = start_idx
+        s = 0.0
+        n = len(self.waypoints)
+        while i < n - 1 and s < lookahead_m:
+            s += self._dist(self.waypoints[i], self.waypoints[i+1])
+            i += 1
+        return i
+
+    def get_target_waypoint(self, current_pos, sync_mode=False):
+        """
+        Get target Waypoint based on current position and *metric* lookahead.
+        current_pos: (x, y)
+        """
+        import time 
+        print(f"[get_target_waypoint] time: {time.time()} Current pos: ({current_pos[0]:.2f}, {current_pos[1]:.2f}), sync_mode: {sync_mode}")
+        print(f"[get_target_waypoint] Path completed: {self.completed}, current_index: {self.current_index}/{len(self.waypoints)}")
+
+        if not self.waypoints:
+            print("[get_target_waypoint] No waypoints.")
+            return None
+
+        if self.completed:
+            # Hold the final waypoint as target
+            final_wp = self.waypoints[-1]
+            print(f"[get_target_waypoint] Completed; holding final waypoint at ({final_wp.x:.2f}, {final_wp.y:.2f})")
+            return final_wp
+
+        # ---- nearest forward waypoint (monotonic progress, no bias) ----
+        search_range = min(200, len(self.waypoints) - self.current_index)
+        min_dist = float('inf')
+        closest_idx = self.current_index
+
+        # If we're already close to the current index, allow a single-step advance
+        if self.current_index < len(self.waypoints) - 1:
+            cur_wp = self.waypoints[self.current_index]
+            cur_d = math.hypot(cur_wp.x - current_pos[0], cur_wp.y - current_pos[1])
+            if cur_d < 2.0:
+                closest_idx = self.current_index + 1
+                min_dist = cur_d
+
+        if min_dist == float('inf'):  # do an actual search if we didn't advance above
+            start = self.current_index
+            end = min(len(self.waypoints), start + search_range)
+            for i in range(start, end):
+                wp = self.waypoints[i]
+                d = math.hypot(wp.x - current_pos[0], wp.y - current_pos[1])
+                if d < min_dist:
+                    min_dist = d
+                    closest_idx = i
+
+        # Monotonic: never move backwards
+        closest_idx = max(closest_idx, self.current_index)
+        print(f"[get_target_waypoint] Closest waypoint: idx={closest_idx}, distance={min_dist:.2f}")
+
+        old_idx = self.current_index
+        self.current_index = closest_idx
+        print(f"[get_target_waypoint] Updated current_index: {old_idx} -> {self.current_index}")
+
+        # ---- metric lookahead (meters, not indices) ----
+        # Optionally scale with speed if available; here we keep it fixed and ignore sync_mode density.
+        lookahead_m = max(1.0, float(self.lookahead_distance))  # guard against tiny values
+        target_idx = self._advance_by_distance(self.current_index, lookahead_m)
+        target_idx = min(target_idx, len(self.waypoints) - 1)
+        print(f"[get_target_waypoint] Metric lookahead: {lookahead_m:.2f} m -> target_idx={target_idx}")
+
+        # ---- check completion (close to final) ----
+        final_wp = self.waypoints[-1]
+        final_dist = math.hypot(final_wp.x - current_pos[0], final_wp.y - current_pos[1])
+        near_end = (len(self.waypoints) - 1) - self.current_index <= 5
+        if near_end and final_dist < max(0.5, 0.3 * lookahead_m):
+            self.completed = True
+            print(f"[get_target_waypoint] Path completed! Distance to final waypoint: {final_dist:.2f}")
+            return final_wp  # keep returning a stable target instead of None
+
+        target_wp = self.waypoints[target_idx]
+        print(f"[get_target_waypoint] Target waypoint: idx={target_idx}, pos=({target_wp.x:.2f}, {target_wp.y:.2f}), speed={target_wp.speed}")
+        return target_wp
+
+    def is_completed(self):
+        return self.completed
+
+# def _wrap(a):
+#     while a <= -math.pi: a += 2*math.pi
+#     while a >   math.pi: a -= 2*math.pi
+#     return a
+
+# class PathManager:
+#     """
+#     Robust path follower:
+#       • Project ego onto polyline -> s_proj (arc length)
+#       • Target at s_proj + Ld (Ld = L0 + kv*|v|)
+#       • Optional forward-cone to keep target in front of vehicle
+#       • Tight completion: remaining arc AND Euclidean distance must be small
+#     Waypoint must have: .x, .y, (optional) .speed
+#     """
+#     def __init__(self, waypoints, lookahead_distance=None, L0=3.0, kv=0.6,
+#                  cone_deg=70.0, base_window=60, expand_rounds=5, recovery_dist=1.0):
+#         # if caller uses lookahead_distance, map it to L0
+#         if lookahead_distance is not None:
+#             L0 = lookahead_distance
+#         self.wp = waypoints
+#         self.N = len(self.wp)
+#         self.L0 = float(L0)
+#         self.kv = float(kv)
+#         self.cone_cos = math.cos(math.radians(cone_deg))
+#         self.base_window = int(base_window)
+#         self.expand_rounds = int(expand_rounds)
+#         self.recovery_dist = float(recovery_dist)
+
+#         # cumulative arc-length at nodes: s[i]
+#         self.s = [0.0]
+#         for i in range(1, self.N):
+#             dx = self.wp[i].x - self.wp[i-1].x
+#             dy = self.wp[i].y - self.wp[i-1].y
+#             self.s.append(self.s[-1] + math.hypot(dx, dy))
+#         self.S_total = self.s[-1]
+
+#         # progress guard in arc-length space (never go backwards)
+#         self.s_min = 0.0
+#         self.completed = False
+
+#     # ---------- geometry helpers ----------
+#     def _proj_to_seg(self, px, py, i):
+#         """Project P onto segment i..i+1 -> (t in [0,1], qx, qy, dist)."""
+#         x0, y0 = self.wp[i].x, self.wp[i].y
+#         x1, y1 = self.wp[i+1].x, self.wp[i+1].y
+#         vx, vy = (x1 - x0), (y1 - y0)
+#         wx, wy = (px - x0), (py - y0)
+#         vv = vx*vx + vy*vy
+#         if vv <= 1e-12:
+#             return 0.0, x0, y0, math.hypot(px - x0, py - y0)
+#         t = max(0.0, min(1.0, (wx*vx + wy*vy) / vv))
+#         qx, qy = x0 + t*vx, y0 + t*vy
+#         return t, qx, qy, math.hypot(px - qx, py - qy)
+
+#     def _nearest_projection(self, px, py, start_seg):
+#         """
+#         Search forward segments with exponentially expanding window.
+#         Returns (s_proj, seg_i, t, qx, qy, dist).
+#         """
+#         best_d = float('inf'); best = None
+#         nseg = self.N - 1
+
+#         window = self.base_window
+#         seg0 = max(0, min(nseg - 1, start_seg))
+#         for _ in range(self.expand_rounds):
+#             i0 = max(0, seg0)
+#             i1 = min(nseg - 1, seg0 + window)
+#             for i in range(i0, i1 + 1):
+#                 t, qx, qy, d = self._proj_to_seg(px, py, i)
+#                 if d < best_d:
+#                     s_proj = self.s[i] + t*(self.s[i+1] - self.s[i])
+#                     best_d = d
+#                     best = (s_proj, i, t, qx, qy, d)
+#             if best_d <= 3.0 or i1 == nseg - 1:
+#                 break
+#             # expand and step a bit backward to catch misses
+#             window *= 2
+#             seg0 = max(0, seg0 - window // 4)
+
+#         return best
+
+#     def _global_projection(self, px, py):
+#         """Full sweep for recovery. Returns (s_proj, seg_i, t, qx, qy, dist)."""
+#         best_d = float('inf'); best = None
+#         for i in range(self.N - 1):
+#             t, qx, qy, d = self._proj_to_seg(px, py, i)
+#             if d < best_d:
+#                 s_proj = self.s[i] + t*(self.s[i+1] - self.s[i])
+#                 best_d = d
+#                 best = (s_proj, i, t, qx, qy, d)
+#         return best
+
+#     def _pose_at_s(self, s_target):
+#         """Interpolate (x,y,yaw) at arc-length s_target."""
+#         s_target = max(0.0, min(self.S_total, s_target))
+#         # find i s.t. s[i] <= s_target <= s[i+1]
+#         i = 0
+#         # small scan is fine; swap to binary search if path is huge
+#         while i < self.N - 2 and self.s[i+1] < s_target:
+#             i += 1
+#         ds = max(1e-9, self.s[i+1] - self.s[i])
+#         t = (s_target - self.s[i]) / ds
+#         x0, y0 = self.wp[i].x, self.wp[i].y
+#         x1, y1 = self.wp[i+1].x, self.wp[i+1].y
+#         x = x0 + t*(x1 - x0)
+#         y = y0 + t*(y1 - y0)
+#         yaw = math.atan2(y1 - y0, x1 - x0)
+#         return x, y, yaw, i, t
+
+#     def _in_forward_cone(self, px, py, psi, tx, ty):
+#         hx, hy = math.cos(psi), math.sin(psi)
+#         vx, vy = (tx - px), (ty - py)
+#         vn = math.hypot(vx, vy)
+#         if vn < 1e-6:
+#             return True
+#         return (vx*hx + vy*hy) / vn >= self.cone_cos
+
+#     # ---------- main API ----------
+#     def get_target_pose(self, current_pos, current_yaw=None, current_speed=None):
+#         """
+#         Returns (xt, yt, yaw_path, s_proj, s_target).
+#         - current_yaw: if provided, enforce forward-cone on target
+#         - current_speed: m/s for speed-aware lookahead; falls back to wp speed
+#         """
+#         px, py = current_pos
+
+#         # completed -> hold final pose
+#         if self.completed:
+#             xf, yf = self.wp[-1].x, self.wp[-1].y
+#             yawf = math.atan2(self.wp[-1].y - self.wp[-2].y,
+#                               self.wp[-1].x - self.wp[-2].x)
+#             print(f"[get_target_pose] Completed; holding final ({xf:.2f},{yf:.2f})")
+#             return xf, yf, yawf, self.S_total, self.S_total
+
+#         # choose starting segment near previous s_min
+#         start_seg = 0
+#         while start_seg < self.N - 1 and self.s[start_seg + 1] < self.s_min:
+#             start_seg += 1
+
+#         # projection (expand window)
+#         proj = self._nearest_projection(px, py, start_seg)
+#         s_proj, seg_i, t, qx, qy, d = proj
+
+#         # recovery hatch if very far (handles your "stuck at same index" case)
+#         if d > self.recovery_dist:
+#             proj = self._global_projection(px, py)
+#             s_proj, seg_i, t, qx, qy, d = proj
+#             print(f"[get_target_pose] Global recovery: seg={seg_i}, d={d:.2f}")
+
+#         # monotone progress in arc-length
+#         if s_proj > self.s_min:
+#             self.s_min = s_proj
+
+#         # speed-aware lookahead
+#         v = 0.0
+#         if current_speed is not None:
+#             v = float(current_speed)
+#         elif hasattr(self.wp[min(seg_i + 1, self.N - 1)], "speed"):
+#             try:
+#                 v = float(getattr(self.wp[min(seg_i + 1, self.N - 1)], "speed"))
+#             except Exception:
+#                 v = 0.0
+#         Ld = max(1.0, self.L0 + self.kv * abs(v))
+
+#         s_tgt = min(self.S_total, s_proj + Ld)
+#         xt, yt, yaw_t, _, _ = self._pose_at_s(s_tgt)
+
+#         # optional forward-cone (helps in async/sparse)
+#         if current_yaw is not None and not self._in_forward_cone(px, py, current_yaw, xt, yt):
+#             for _ in range(40):
+#                 s_tgt = min(self.S_total, s_tgt + 0.3 * Ld)
+#                 xt, yt, yaw_t, _, _ = self._pose_at_s(s_tgt)
+#                 if self._in_forward_cone(px, py, current_yaw, xt, yt) or s_tgt >= self.S_total:
+#                     break
+
+#         # tightened completion: BOTH arc-length and Euclidean distance must be small
+#         remaining_s = self.S_total - s_proj
+#         d_final = math.hypot(self.wp[-1].x - px, self.wp[-1].y - py)
+#         if remaining_s < max(1.0, 0.5 * Ld) and d_final < max(1.0, 0.5 * Ld):
+#             self.completed = True
+
+#         # debug prints (helpful for your logs)
+#         print(f"[get_target_pose] s_min={self.s_min:.2f}, s_proj={s_proj:.2f}, d={d:.2f}, "
+#               f"Ld={Ld:.2f}, s_tgt={s_tgt:.2f}, tgt=({xt:.2f},{yt:.2f})")
+
+#         return xt, yt, yaw_t, s_proj, s_tgt
+#     def get_target_waypoint(self, current_pos, sync_mode=False, current_yaw=None, current_speed=None):
+#         """
+#         Backward-compatible wrapper for legacy code.
+#         Ignores sync_mode (kept for signature). Uses arc-length projection logic via get_target_pose
+#         and returns an existing waypoint object close to s_target.
+#         """
+#         xt, yt, yaw_path, s_proj, s_tgt = self.get_target_pose(
+#             current_pos=current_pos,
+#             current_yaw=current_yaw,
+#             current_speed=current_speed
+#         )
+#         # Find an actual waypoint index near s_tgt to return (for .speed, etc.)
+#         # Reuse the internal interpolator to get segment and param t
+#         x, y, yaw, i, t = self._pose_at_s(s_tgt)
+#         target_idx = i + (1 if t >= 0.5 else 0)
+#         target_idx = max(0, min(self.N - 1, target_idx))
+#         return self.wp[target_idx]
+#     def is_completed(self):
+#         return self.completed
+ 
+# ========================= Configuration =========================
 
 unprotected_right_turn_config = {
     'simulation': {
@@ -129,7 +597,7 @@ unprotected_left_turn_config = {
         'turn_ticks': 250,  # * 10ms = 2.5s
         'after_turn_ticks': 200,  # Add this new parameter for post-turn straight driving
         'throttle': {
-            'straight': 0.4,
+            'straight': 0.5,
             'turn': 0.4,
             'after_turn': 0.4  # Add throttle for after turn
         },
@@ -144,11 +612,11 @@ unprotected_left_turn_config = {
             'y': 55,
             'yaw': 180
         },
-        'go_straight_ticks': 400,
+        'go_straight_ticks': 300,
         'turn_ticks': 200,
-        'after_turn_ticks': 350,
+        'after_turn_ticks': 450,
         'throttle': {
-            'straight': 0.53,
+            'straight': 0.4,
             'turn': 0.4,
             'after_turn': 0.52
         },
@@ -288,8 +756,20 @@ class CollisionHandler(BaseHandler):
         self.collision_prob_file = os.path.join(output_dir, 
             f'collision_probabilities_{config["simulation"]["l_max"]}_fogsim.csv')
         
-        # Phase control for obstacle vehicle
+        # PID Controller setup - will be initialized in launch() after vehicles are spawned
+        self.ego_pid_controller = None
+        self.obstacle_pid_controller = None
+        
+        # Path management
+        self.ego_path_manager = None
+        self.obstacle_path_manager = None
+        
+        # Phase control for obstacle vehicle (keep for backwards compatibility)
         self.obstacle_phase = 'straight'
+        
+        # Actual trajectory tracking
+        self.ego_actual_trajectory = []
+        self.obstacle_actual_trajectory = []
         
     def launch(self):
         """Initialize CARLA and spawn vehicles."""
@@ -335,6 +815,24 @@ class CollisionHandler(BaseHandler):
         obstacle_bp.set_attribute('role_name', 'obstacle')
         self.obstacle_vehicle = self.world.try_spawn_actor(obstacle_bp, obstacle_spawn_point)
         
+        # Initialize PID controllers after vehicles are spawned
+                
+        if self.config['simulation'].get('sync_mode', False):
+            dt = self.config['simulation']['delta_seconds']
+            # Original gains for sync mode
+            lateral_args = {'K_P': 1.0, 'K_I': 0.0, 'K_D': 0.1, 'dt': dt}
+            longitudinal_args = {'K_P': 1.0, 'K_I': 0.1, 'K_D': 0.0, 'dt': dt}
+        else:
+            dt = 0.15
+            # Reduced gains for async mode stability
+            lateral_args = {'K_P': 0.2, 'K_I': 0.0, 'K_D': 0.3, 'dt': dt}
+            longitudinal_args = {'K_P': 0.3, 'K_I': 0.05, 'K_D': 0.05, 'dt': dt}
+            
+        # lateral_args = {'K_P': 1.0, 'K_I': 0.0, 'K_D': 0.1, 'dt': delta_second}
+        # longitudinal_args = {'K_P': 1.0, 'K_I': 0.1, 'K_D': 0.0, 'dt': delta_second}
+        self.ego_pid_controller = VehiclePIDController(self.ego_vehicle, lateral_args, longitudinal_args)
+        self.obstacle_pid_controller = VehiclePIDController(self.obstacle_vehicle, lateral_args, longitudinal_args)
+        
         # Setup single BEV camera above the intersection
         camera_bp = blueprint_library.find('sensor.camera.rgb')
         camera_bp.set_attribute('image_size_x', str(self.config['video']['width']))
@@ -344,8 +842,8 @@ class CollisionHandler(BaseHandler):
         # BEV camera positioned above the scene, looking down
         bev_transform = carla.Transform(
             carla.Location(
-                x=self.ego_vehicle.get_transform().location.x + self.config['camera']['offset']['x'],
-                y=self.ego_vehicle.get_transform().location.y + self.config['camera']['offset']['y'],
+                x=ego_spawn_point.location.x + self.config['camera']['offset']['x'],
+                y=ego_spawn_point.location.y + self.config['camera']['offset']['y'],
                 z=self.config['camera']['height']
             ),
             carla.Rotation(pitch=-90)  # Looking straight down
@@ -364,12 +862,36 @@ class CollisionHandler(BaseHandler):
         # Setup camera callback for BEV camera
         self.cameras['bev'].listen(lambda image: self._camera_callback(image, 'bev'))
         
-        # Load ego trajectory if it exists
+        # Generate and load trajectories if they don't exist
+        if not os.path.exists(self.config['trajectories']['ego']) or not os.path.exists(self.config['trajectories']['obstacle']):
+            print("Trajectories not found, generating them...")
+            run_first_simulation(self.config, 
+                               ego_trajectory_file=self.config['trajectories']['ego'],
+                               obstacle_trajectory_file=self.config['trajectories']['obstacle'])
+        
+        # Load ego trajectory
         if os.path.exists(self.config['trajectories']['ego']):
             self.ego_trajectory = load_trajectory(self.config['trajectories']['ego'])
+            print(f"Loaded ego trajectory with {len(self.ego_trajectory)} points")
         else:
-            # Create empty trajectory that will be filled later
             self.ego_trajectory = []
+        
+
+        # Load obstacle trajectory for waypoint generation
+        obstacle_trajectory_points = []
+        if os.path.exists(self.config['trajectories']['obstacle']):
+            obstacle_trajectory_points = load_trajectory(self.config['trajectories']['obstacle'])
+            print(f"Loaded obstacle trajectory with {len(obstacle_trajectory_points)} points")
+        
+        #draw waypoints
+        # Visualize the loaded trajectories
+
+
+        # Convert trajectories to waypoints for PID control
+        self.ego_path_manager = self._create_path_manager_from_trajectory(
+            self.ego_trajectory, lookahead_distance=5.0)
+        self.obstacle_path_manager = self._create_path_manager_from_trajectory(
+            obstacle_trajectory_points, lookahead_distance=3.0)
         
         # Initialize trackers
         if not self.no_risk_eval:
@@ -405,6 +927,24 @@ class CollisionHandler(BaseHandler):
             with open(self.collision_prob_file, 'w') as f:
                 f.write('timestamp,tick,delta_k,collision_probability,ground_truth_probability\n')
     
+    def _create_path_manager_from_trajectory(self, trajectory_points, lookahead_distance=3.0):
+        """Create a PathManager from trajectory points loaded from CSV."""
+        if not trajectory_points:
+            return None
+            
+        waypoints = []
+        for point in trajectory_points:
+            x, y, theta = point  # theta is already in radians from load_trajectory
+            # Estimate speed based on distance to next point
+            speed = 30.0  # Default speed in km/h
+            waypoints.append(Waypoint(x, y, theta, speed))
+        
+        if waypoints:
+            print(f"Created path manager with {len(waypoints)} waypoints")
+            return PathManager(waypoints, lookahead_distance=lookahead_distance)
+        else:
+            return None
+    
     def _collision_callback(self, event):
         """Handle collision events."""
         self.has_collided = True
@@ -418,28 +958,167 @@ class CollisionHandler(BaseHandler):
         self.frame_queues[camera_name].append(frame_bgr)
     
     def set_states(self, states=None, action=None):
-        """Apply action (brake decision) to ego vehicle."""
+        """Apply action (brake decision) to ego vehicle using PID control."""
         if action is not None:
             # Action is binary: 0 = no brake, 1 = brake
             brake = int(action) if not isinstance(action, (list, np.ndarray)) else int(action[0])
             
             if brake:
-                ego_control = carla.VehicleControl(throttle=0.0, brake=1.0)
+                # Emergency brake - override PID control
+                ego_control = carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0)
+                self.ego_vehicle.apply_control(ego_control)
             else:
-                # Normal driving based on tick phase
-                ego_control = carla.VehicleControl()
-                if self.tick < self.config['ego_vehicle']['go_straight_ticks']:
-                    ego_control.throttle = self.config['ego_vehicle']['throttle']['straight']
-                elif self.tick < (self.config['ego_vehicle']['go_straight_ticks'] + 
-                                self.config['ego_vehicle']['turn_ticks']):
-                    ego_control.throttle = self.config['ego_vehicle']['throttle']['turn']
-                    ego_control.steer = self.config['ego_vehicle']['steer']['turn']
-                else:
-                    ego_control.throttle = self.config['ego_vehicle']['throttle']['after_turn']
-            
-            self.ego_vehicle.apply_control(ego_control)
+                # Use PID control for normal driving
+                try:
+                    self._apply_pid_control_ego()
+                except Exception as e:
+                    print(f"PID control failed, using basic control: {e}")
+                    self._apply_basic_ego_control()
+        else:
+            # No action provided, use PID control
+            try:
+                self._apply_pid_control_ego()
+            except Exception as e:
+                print(f"PID control failed, using basic control: {e}")
+                self._apply_basic_ego_control()
         
-        # Apply obstacle vehicle control (independent of action)
+        # Apply PID control for obstacle vehicle (independent of ego action)
+        try:
+            self._apply_pid_control_obstacle()
+        except Exception as e:
+            print(f"Obstacle PID control failed, using basic control: {e}")
+            self._apply_basic_obstacle_control()
+    
+    def _apply_pid_control_ego(self):
+        """Apply PID control to ego vehicle based on waypoints."""
+        if self.ego_pid_controller is None or self.ego_path_manager is None:
+            # Path manager not initialized, use basic controls
+            self._apply_basic_ego_control()
+            return
+            
+        if self.ego_path_manager.is_completed():
+            # Path completed, maintain current speed and direction
+            control = carla.VehicleControl(throttle=0.2, brake=0.0, steer=0.0)
+            self.ego_vehicle.apply_control(control)
+            return
+        
+        # Get current vehicle state
+        transform = self.ego_vehicle.get_transform()
+        velocity = self.ego_vehicle.get_velocity()
+        current_speed = get_speed(velocity)
+        
+        # Create current state object
+        class CurrentState:
+            def __init__(self, x, y, angle):
+                self.x = x
+                self.y = y
+                self.angle = angle
+        
+        current_state = CurrentState(
+            transform.location.x,
+            transform.location.y,
+            math.radians(transform.rotation.yaw)
+        )
+        
+        # Get target waypoint with sync mode awareness
+        current_pos = (transform.location.x, transform.location.y)
+        sync_mode = self.config['simulation'].get('sync_mode', False)
+        target_waypoint = self.ego_path_manager.get_target_waypoint(current_pos, sync_mode)
+        
+        if target_waypoint is None:
+            # No target waypoint available, use basic controls
+            self._apply_basic_ego_control()
+            return
+        
+        # Apply PID control
+        try:
+            # carla_waypoint = CarlaWaypoint(target_waypoint.x, target_waypoint.y, target_waypoint.angle)
+            
+            control = self.ego_pid_controller.run_step(
+                current_speed,
+                target_waypoint.speed,
+                current_state,
+                target_waypoint
+            )
+            self.ego_vehicle.apply_control(control)
+        except Exception as e:
+            print(f"Error in ego PID control: {e}")
+            self._apply_basic_ego_control()
+    
+    def _apply_basic_ego_control(self):
+        """Apply basic tick-based control to ego vehicle as fallback."""
+        ego_control = carla.VehicleControl()
+        if self.tick < self.config['ego_vehicle']['go_straight_ticks']:
+            ego_control.throttle = self.config['ego_vehicle']['throttle']['straight']
+            ego_control.steer = 0.0
+        elif self.tick < (self.config['ego_vehicle']['go_straight_ticks'] + 
+                         self.config['ego_vehicle']['turn_ticks']):
+            ego_control.throttle = self.config['ego_vehicle']['throttle']['turn']
+            ego_control.steer = self.config['ego_vehicle']['steer']['turn']
+        else:
+            ego_control.throttle = self.config['ego_vehicle']['throttle']['after_turn']
+            ego_control.steer = 0.0
+        
+        self.ego_vehicle.apply_control(ego_control)
+    
+    def _apply_pid_control_obstacle(self):
+        """Apply PID control to obstacle vehicle based on waypoints."""
+        if self.obstacle_pid_controller is None or self.obstacle_path_manager is None:
+            # Path manager not initialized, use basic controls
+            self._apply_basic_obstacle_control()
+            return
+            
+        if self.obstacle_path_manager.is_completed():
+            # Path completed, maintain current speed and direction
+            control = carla.VehicleControl(throttle=0.2, brake=0.0, steer=0.0)
+            self.obstacle_vehicle.apply_control(control)
+            return
+        
+        # Get current vehicle state
+        transform = self.obstacle_vehicle.get_transform()
+        velocity = self.obstacle_vehicle.get_velocity()
+        current_speed = get_speed(velocity)
+        
+        # Create current state object
+        class CurrentState:
+            def __init__(self, x, y, angle):
+                self.x = x
+                self.y = y
+                self.angle = angle
+        
+        current_state = CurrentState(
+            transform.location.x,
+            transform.location.y,
+            math.radians(transform.rotation.yaw)
+        )
+        
+        # Get target waypoint with sync mode awareness
+        current_pos = (transform.location.x, transform.location.y)
+        sync_mode = self.config['simulation'].get('sync_mode', False)
+        target_waypoint = self.obstacle_path_manager.get_target_waypoint(current_pos, sync_mode)
+        
+        if target_waypoint is None:
+            # No target waypoint available, use basic controls
+            self._apply_basic_obstacle_control()
+            return
+        
+        # Apply PID control
+        try:
+            # carla_waypoint = CarlaWaypoint(target_waypoint.x, target_waypoint.y, target_waypoint.angle)
+            
+            control = self.obstacle_pid_controller.run_step(
+                current_speed,
+                target_waypoint.speed,
+                current_state,
+                target_waypoint
+            )
+            self.obstacle_vehicle.apply_control(control)
+        except Exception as e:
+            print(f"Error in obstacle PID control: {e}")
+            self._apply_basic_obstacle_control()
+    
+    def _apply_basic_obstacle_control(self):
+        """Apply basic tick-based control to obstacle vehicle as fallback."""
         obstacle_control = carla.VehicleControl()
         if self.tick < self.config['obstacle_vehicle']['go_straight_ticks']:
             obstacle_control.throttle = self.config['obstacle_vehicle']['throttle']['straight']
@@ -475,6 +1154,23 @@ class CollisionHandler(BaseHandler):
         """Step CARLA simulation forward."""
         self.world.tick()
         self.tick += 1
+        
+        # Track actual vehicle positions
+        if self.ego_vehicle:
+            ego_transform = self.ego_vehicle.get_transform()
+            self.ego_actual_trajectory.append([
+                ego_transform.location.x,
+                ego_transform.location.y, 
+                math.radians(ego_transform.rotation.yaw)
+            ])
+            
+        if self.obstacle_vehicle:
+            obs_transform = self.obstacle_vehicle.get_transform()
+            self.obstacle_actual_trajectory.append([
+                obs_transform.location.x,
+                obs_transform.location.y,
+                math.radians(obs_transform.rotation.yaw)
+            ])
     
     def render(self, camera_name='bev'):
         """Process and return camera frames."""
@@ -488,7 +1184,20 @@ class CollisionHandler(BaseHandler):
             frame_bgr = self.frame_queues['bev'][-1]
             bev_output_dir = os.path.join(output_dir, 'bev_images')
             os.makedirs(bev_output_dir, exist_ok=True)
-            cv2.imwrite(os.path.join(bev_output_dir, f'frame_{tick}.png'), frame_bgr)
+            
+            # Get scenario type from config
+            scenario_type = self.config.get('scenario_type', 'unknown')
+            sync_mode = self.config['simulation'].get('sync_mode', False)
+            
+            # Generate descriptive filename
+            filename = generate_descriptive_filename(
+                f'frame_{tick}',
+                'png',
+                sync_mode=sync_mode,
+                scenario_type=scenario_type
+            )
+            
+            cv2.imwrite(os.path.join(bev_output_dir, filename), frame_bgr)
     
     def get_latest_frames(self):
         """Get the latest BEV frame."""
@@ -497,8 +1206,58 @@ class CollisionHandler(BaseHandler):
             latest_frames['bev'] = self.frame_queues['bev'][-1]
         return latest_frames
     
+    def plot_trajectory_comparison(self, save_plots=True):
+        """Plot reference vs actual trajectories for both vehicles."""
+        if not save_plots:
+            return
+            
+        output_dir = os.path.dirname(self.collision_prob_file)
+        
+        # Load reference trajectories
+        ego_ref = []
+        obstacle_ref = []
+        
+        if os.path.exists(self.config['trajectories']['ego']):
+            ego_ref = load_trajectory(self.config['trajectories']['ego'])
+        
+        if os.path.exists(self.config['trajectories']['obstacle']):
+            obstacle_ref = load_trajectory(self.config['trajectories']['obstacle'])
+        
+        # Get configuration parameters for plotting
+        sync_mode = self.config['simulation'].get('sync_mode', False)
+        scenario_type = self.config.get('scenario_type', None)
+        
+        # Plot individual vehicle comparisons
+        if ego_ref or self.ego_actual_trajectory:
+            ego_plot_path = os.path.join(output_dir, 'ego_trajectory_comparison.png')
+            plot_trajectory_comparison(ego_ref, self.ego_actual_trajectory, 
+                                     "Ego Vehicle", ego_plot_path,
+                                     sync_mode=sync_mode,
+                                     scenario_type=scenario_type)
+        
+        if obstacle_ref or self.obstacle_actual_trajectory:
+            obs_plot_path = os.path.join(output_dir, 'obstacle_trajectory_comparison.png')
+            plot_trajectory_comparison(obstacle_ref, self.obstacle_actual_trajectory, 
+                                     "Obstacle Vehicle", obs_plot_path,
+                                     sync_mode=sync_mode,
+                                     scenario_type=scenario_type)
+        
+        # Plot dual vehicle comparison
+        if any([ego_ref, self.ego_actual_trajectory, obstacle_ref, self.obstacle_actual_trajectory]):
+            dual_plot_path = os.path.join(output_dir, 'dual_vehicle_trajectory_comparison.png')
+            sync_mode = self.config['simulation'].get('sync_mode', False)
+            scenario_type = self.config.get('scenario_type', None)
+            plot_dual_vehicle_trajectories(ego_ref, self.ego_actual_trajectory,
+                                         obstacle_ref, self.obstacle_actual_trajectory,
+                                         dual_plot_path,
+                                         sync_mode=sync_mode,
+                                         scenario_type=scenario_type)
+    
     def close(self):
         """Clean up CARLA resources."""
+        # Plot trajectories before cleanup
+        self.plot_trajectory_comparison(save_plots=True)
+        
         if self.collision_sensor:
             self.collision_sensor.stop()
             self.collision_sensor.destroy()
@@ -941,50 +1700,6 @@ class KFObstacleTracker(BaseTracker):
         return all_predicted_states
 
 
-class GroundTruthTracker(BaseTracker):
-
-    def __init__(self,
-                 ego_vehicle,
-                 obstacle_vehicle,
-                 dt=0.05,
-                 trajectory_file='./obstacle_trajectory.csv'):
-        super().__init__(ego_vehicle, obstacle_vehicle, dt)
-        self.trajectory_file = trajectory_file
-        self.trajectory = self.load_trajectory()
-        self.current_index = 0
-        self.obs_cov = np.identity(
-            2) * 0.001  # Very small uncertainty for ground truth
-
-    def load_trajectory(self):
-        """Load pre-recorded trajectory from file"""
-        trajectory = []
-        with open(self.trajectory_file, 'r') as f:
-            for line in f:
-                x, y, yaw = map(float, line.strip().split(','))
-                trajectory.append([x, y, math.radians(yaw)])
-        return trajectory
-
-    def update(self, state, tick_number):
-        """Update tracker with new state measurement"""
-        x, y, yaw_deg = state
-        theta = math.radians(yaw_deg)
-        self.history.append((x, y, theta))
-        self.history_ticks.append(tick_number)
-        self.current_index = tick_number
-
-    def predict_future_position(self, steps_ahead):
-        """Predict future position using ground truth trajectory"""
-        predicted_states = []
-        for i in range(steps_ahead):
-            future_index = self.current_index + i
-            if future_index < len(self.trajectory):
-                predicted_states.append(self.trajectory[future_index])
-            else:
-                # If we run out of trajectory, use the last known position
-                predicted_states.append(self.trajectory[-1])
-        return predicted_states
-
-
 class EKFObstacleTracker(BaseTracker):
 
     def __init__(self, ego_vehicle, obstacle_vehicle, dt=0.05):
@@ -1088,697 +1803,342 @@ def load_trajectory(filename):
     return trajectory
 
 
-def run_first_simulation(config, trajectory_file=None):
-    """Run the first simulation to generate the ego vehicle trajectory"""
-    # Use trajectory file from config if none provided
-    if trajectory_file is None:
-        trajectory_file = config['trajectories']['ego']
-
-    client = carla.Client(config['simulation']['host'],
-                          config['simulation']['port'])
-    client.set_timeout(10.0)
-    world = client.load_world("Town03")
-
-    # Set synchronous mode
-    original_settings = world.get_settings()
-    settings = world.get_settings()
-    settings.fixed_delta_seconds = config['simulation']['delta_seconds']
-    settings.synchronous_mode = config['simulation'].get('sync_mode', False)
-    settings.no_rendering_mode = False
-    world.apply_settings(settings)
-
-    blueprint_library = world.get_blueprint_library()
-
-    # Get spawn points
-    spawn_points = world.get_map().get_spawn_points()
-
-    # Setup ego vehicle spawn point
-    ego_spawn_point = spawn_points[0]
-    ego_spawn_point.location.x += config['ego_vehicle']['spawn_offset']['x']
-    ego_spawn_point.location.y += config['ego_vehicle']['spawn_offset']['y']
-    ego_spawn_point.rotation.yaw += config['ego_vehicle']['spawn_offset']['yaw']
-
-    # Spawn only the ego vehicle
-    ego_bp = blueprint_library.find(config['ego_vehicle']['model'])
-    ego_bp.set_attribute('role_name', 'ego')
-    ego_vehicle = world.try_spawn_actor(ego_bp, ego_spawn_point)
-    ego_vehicle.set_autopilot(False)
-
-    try:
-        for tick in range(config['ego_vehicle']['go_straight_ticks'] +
-                          config['ego_vehicle']['turn_ticks'] +
-                          config['ego_vehicle']['after_turn_ticks']):
-            world.tick()
-
-            # Apply controls and save trajectory
-            ego_control = carla.VehicleControl()
-            if tick < config['ego_vehicle']['go_straight_ticks']:
-                # Initial straight phase
-                ego_control.throttle = config['ego_vehicle']['throttle'][
-                    'straight']
-                ego_control.steer = 0.0
-            elif tick < config['ego_vehicle']['go_straight_ticks'] + config[
-                    'ego_vehicle']['turn_ticks']:
-                # Turning phase
-                ego_control.throttle = config['ego_vehicle']['throttle']['turn']
-                ego_control.steer = config['ego_vehicle']['steer']['turn']
+def plot_trajectory_comparison(reference_trajectory, actual_trajectory, vehicle_name="Vehicle", output_path=None, show_arrows=True, arrow_spacing=10, sync_mode=False, scenario_type=None):
+    """
+    Plot reference trajectory vs actual vehicle movement.
+    
+    Args:
+        reference_trajectory: List of [x, y, yaw] points from CSV (reference path)
+        actual_trajectory: List of [x, y, yaw] points from actual simulation
+        vehicle_name: Name for the vehicle (ego or obstacle)
+        output_path: Path to save the plot (if None, shows the plot)
+        show_arrows: Whether to show direction arrows
+        arrow_spacing: Spacing between direction arrows (every N points)
+        sync_mode: Whether running in synchronous mode
+        scenario_type: Type of scenario being run
+    """
+    sns.set_context("talk")
+    plt.figure(figsize=(12, 10))
+    
+    if reference_trajectory:
+        ref_x = [point[0] for point in reference_trajectory]
+        ref_y = [point[1] for point in reference_trajectory]
+        ref_yaw = [point[2] for point in reference_trajectory]
+        
+        # Plot with flipped axes (y, x) and dotted line for reference
+        plt.plot(ref_y, ref_x, 'b:', linewidth=2, label=f'{vehicle_name} Reference Trajectory', alpha=0.7)
+        
+        if show_arrows and len(reference_trajectory) > arrow_spacing:
+            for i in range(0, len(reference_trajectory), arrow_spacing):
+                # Flip the arrow directions for rotated plot
+                dx = 2.0 * np.sin(ref_yaw[i])
+                dy = 2.0 * np.cos(ref_yaw[i])
+                plt.arrow(ref_y[i], ref_x[i], dx, dy, head_width=1.0, head_length=1.0, 
+                         fc='blue', ec='blue', alpha=0.6)
+    
+    if actual_trajectory:
+        actual_x = [point[0] for point in actual_trajectory]
+        actual_y = [point[1] for point in actual_trajectory]
+        actual_yaw = [point[2] for point in actual_trajectory]
+        
+        # Plot with flipped axes (y, x) and solid line for actual
+        plt.plot(actual_y, actual_x, 'r-', linewidth=2, label=f'{vehicle_name} Actual Movement', alpha=0.8)
+        
+        if show_arrows and len(actual_trajectory) > arrow_spacing:
+            for i in range(0, len(actual_trajectory), arrow_spacing):
+                # Flip the arrow directions for rotated plot
+                dx = 2.0 * np.sin(actual_yaw[i])
+                dy = 2.0 * np.cos(actual_yaw[i])
+                plt.arrow(actual_y[i], actual_x[i], dx, dy, head_width=1.0, head_length=1.0, 
+                         fc='red', ec='red', alpha=0.6)
+        
+        # Mark start and end points with flipped axes
+        plt.plot(actual_y[0], actual_x[0], 'go', markersize=8, label=f'{vehicle_name} Start')
+        plt.plot(actual_y[-1], actual_x[-1], 'ro', markersize=8, label=f'{vehicle_name} End')
+    
+    plt.xlabel('Y Position (m)')
+    plt.ylabel('X Position (m)')
+    plt.title(f'{vehicle_name} Trajectory Comparison: Reference vs Actual')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Set axis limits with some padding
+    all_x = []
+    all_y = []
+    if reference_trajectory:
+        all_x.extend([point[0] for point in reference_trajectory])
+        all_y.extend([point[1] for point in reference_trajectory])
+    if actual_trajectory:
+        all_x.extend([point[0] for point in actual_trajectory])
+        all_y.extend([point[1] for point in actual_trajectory])
+    
+    if all_x and all_y:
+        padding = 5  # meters of padding
+        plt.xlim(min(all_y) - padding, max(all_y) + padding)
+        plt.ylim(min(all_x) - padding, max(all_x) + padding)
+    
+    plt.gca().set_aspect('equal', adjustable='box')
+    
+    if output_path:
+        # Generate descriptive filenames for both PNG and PDF
+        if sync_mode is not None or scenario_type is not None:
+            # Extract directory and base name from output_path
+            dir_path = os.path.dirname(output_path)
+            
+            # Determine base name from vehicle name
+            if "Ego" in vehicle_name:
+                base_name = "ego_trajectory"
+            elif "Obstacle" in vehicle_name:
+                base_name = "obstacle_trajectory"
             else:
-                # After turn straight phase
-                ego_control.throttle = config['ego_vehicle']['throttle'][
-                    'after_turn']
-                ego_control.steer = 0.0
-
-            ego_vehicle.apply_control(ego_control)
-            save_trajectory(ego_vehicle, trajectory_file)
-
-    finally:
-        if ego_vehicle is not None:
-            ego_vehicle.destroy()
-        client.reload_world()
-        world.apply_settings(original_settings)
-
-
-def run_simulation(config, output_dir):
-    """Run a simulation with the given configuration using pre-recorded trajectory"""
-    # Connect to CARLA
-    client = carla.Client(config['simulation']['host'],
-                          config['simulation']['port'])
-    client.set_timeout(10.0)
-    world = client.load_world("Town03")
-
-    # Set synchronous mode
-    original_settings = world.get_settings()
-    settings = world.get_settings()
-    settings.fixed_delta_seconds = config['simulation']['delta_seconds']
-    settings.synchronous_mode = config['simulation'].get('sync_mode', False)
-    settings.no_rendering_mode = False
-    world.apply_settings(settings)
-
-    blueprint_library = world.get_blueprint_library()
-
-    # Get spawn points
-    spawn_points = world.get_map().get_spawn_points()
-
-    # Find two spawn points close to each other
-    ego_spawn_point = spawn_points[0]
-    ego_spawn_point.location.x += config['ego_vehicle']['spawn_offset']['x']
-    ego_spawn_point.location.y += config['ego_vehicle']['spawn_offset']['y']
-    ego_spawn_point.rotation.yaw += config['ego_vehicle']['spawn_offset']['yaw']
-
-    obstacle_spawn_point = spawn_points[1]
-    obstacle_spawn_point.location.x = ego_spawn_point.location.x + config[
-        'obstacle_vehicle']['spawn_offset']['x']
-    obstacle_spawn_point.location.y = ego_spawn_point.location.y + config[
-        'obstacle_vehicle']['spawn_offset']['y']
-    obstacle_spawn_point.rotation.yaw = ego_spawn_point.rotation.yaw + config[
-        'obstacle_vehicle']['spawn_offset']['yaw']
-
-    # Spawn the ego vehicle
-    ego_bp = blueprint_library.find(config['ego_vehicle']['model'])
-    ego_bp.set_attribute('role_name', 'ego')
-
-    # Spawn both vehicles
-    ego_vehicle = world.try_spawn_actor(ego_bp, ego_spawn_point)
-    obstacle_bp = blueprint_library.find(config['obstacle_vehicle']['model'])
-    obstacle_bp.set_attribute('role_name', 'obstacle')
-    obstacle_vehicle = world.try_spawn_actor(obstacle_bp, obstacle_spawn_point)
-
-    # Load the reference trajectory
-    ego_trajectory = load_trajectory(config['trajectories']['ego'])
-    tracker_type = "ekf"  # Options: "kf", "ekf", "ground_truth"
-    if tracker_type == "ground_truth":
-        obstacle_tracker = GroundTruthTracker(
-            ego_vehicle,
-            obstacle_vehicle,
-            dt=config['simulation']['delta_seconds'])
-    elif tracker_type == "ekf":
-        obstacle_tracker = EKFObstacleTracker(
-            ego_vehicle,
-            obstacle_vehicle,
-            dt=config['simulation']['delta_seconds'])
-    else:  # "kf"
-        obstacle_tracker = KFObstacleTracker(
-            ego_vehicle,
-            obstacle_vehicle,
-            dt=config['simulation']['delta_seconds'])
-
-    # No autopilot, we will manually control both
-    ego_vehicle.set_autopilot(False)
-    if obstacle_vehicle is not None:
-        obstacle_vehicle.set_autopilot(False)
-
-    # Attach a top-down BEV camera above the intersection or ego vehicle's start
-    camera_bp = blueprint_library.find('sensor.camera.rgb')
-    camera_bp.set_attribute('image_size_x', str(config['video']['width']))
-    camera_bp.set_attribute('image_size_y', str(config['video']['height']))
-    camera_bp.set_attribute('fov', config['camera']['fov'])
-
-    camera_transform = carla.Transform(
-        carla.Location(
-            x=ego_spawn_point.location.x + config['camera']['offset']['x'],
-            y=ego_spawn_point.location.y + config['camera']['offset']['y'],
-            z=config['camera']['height']), carla.Rotation(pitch=-90))
-    camera = world.spawn_actor(camera_bp, camera_transform, attach_to=None)
-
-    # Only create video writer if save_video is True
-    video_writer = None
-    if config['save_options']['save_video']:
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        video_writer = cv2.VideoWriter(
-            config['video']['filename'], fourcc, config['video']['fps'],
-            (config['video']['width'], config['video']['height']))
-
-    collision_prob = 0.0
-    frame_queue = []
-
-    def camera_callback(image):
-        image.convert(carla.ColorConverter.Raw)
-        img_array = np.frombuffer(image.raw_data, dtype=np.uint8)
-        img_array = img_array.reshape((image.height, image.width, 4))
-        frame_bgr = img_array[:, :, :3].copy()
-
-        frame_queue.append(frame_bgr)
-
-        # Only save individual frames if save_images is True
-        if config['save_options']['save_images']:
-            os.makedirs(os.path.join(output_dir, 'bev_images'), exist_ok=True)
-            cv2.imwrite(os.path.join(output_dir, f'bev_images/frame_{tick}.png'), frame_bgr)
-
-    camera.listen(camera_callback)
-
-    # Initialize obstacle tracker with dt from simulation settings
-    obstacle_buffer = [obstacle_vehicle.get_transform()
-                      ] * config['simulation']['l_max']
-
-    # Add collision sensor
-    collision_bp = blueprint_library.find('sensor.other.collision')
-    collision_sensor = world.spawn_actor(collision_bp,
-                                         carla.Transform(),
-                                         attach_to=ego_vehicle)
-
-    # Collision flag
-    has_collided = False
-
-    def collision_callback(event):
-        nonlocal has_collided
-        has_collided = True
-        # print(f"Collision detected with {event.other_actor}")
-
-    collision_sensor.listen(collision_callback)
-
-    # Add CSV setup for collision probability logging
-    collision_prob_file = os.path.join(output_dir,
-                                       'collision_probabilities.csv')
-
-    if os.path.exists(collision_prob_file):
-        pass
-    else:
-        with open(os.path.join(output_dir, 'collision_probabilities.csv'),
-                  'w') as f:
-            f.write('timestamp,tick,delta_k,collision_probability\n')
-
-    try:
-        for tick in range(config['ego_vehicle']['go_straight_ticks'] +
-                          config['ego_vehicle']['turn_ticks'] +
-                          config['ego_vehicle']['after_turn_ticks']):
-            world.tick()
-
-            # Check for collision
-            if has_collided:
-                print("Collision detected! Stopping vehicles.")
-                # Stop both vehicles
-                ego_vehicle.apply_control(
-                    carla.VehicleControl(throttle=0.0, brake=1.0))
-                if obstacle_vehicle is not None:
-                    obstacle_vehicle.apply_control(
-                        carla.VehicleControl(throttle=0.0, brake=1.0))
-                break
-
-            # Update buffer with current transform
-            current_transform = obstacle_vehicle.get_transform()
-            obstacle_buffer.append(current_transform)
-            obstacle_buffer.pop(0)
-
-            # Only update obstacle tracking at delta_k intervals
-            # if tick % config['simulation']['delta_k'] == 0:
-            # Get historical transform from l_max steps ago
-            historical_transform = obstacle_buffer[
-                0]  # oldest transform in buffer
-
-            obstacle_tracker.update((historical_transform.location.x,
-                                     historical_transform.location.y,
-                                     historical_transform.rotation.yaw), tick)
-
-            predicted_ego_positions = obstacle_tracker.predict_future_position(
-                int(config['simulation']['prediction_steps'] /
-                    config['simulation']['delta_k']))
-            collision_probabilities = []
-
-            for step, predicted_pos in enumerate(predicted_ego_positions):
-                if tick + step < len(ego_trajectory):
-                    ego_trajectory_point = ego_trajectory[tick + step]
-                    predicted_pos = [
-                        predicted_pos[0], predicted_pos[1], predicted_pos[2]
-                    ]
-                    collision_prob = obstacle_tracker.calculate_collision_probability_with_trajectory(
-                        ego_trajectory_point, predicted_pos)
-                    collision_probabilities.append(collision_prob)
-
-            # print (predicted_ego_positions, collision_probabilities) mapping
-
-            collision_prob = max(collision_probabilities)
-            collision_time = collision_probabilities.index(collision_prob)
-
-            # print(f"Tick {tick}: Max collision probability: {collision_prob:.4f} at time step {collision_time}")
-
-            # Vehicle control logic remains the same
-            ego_control = carla.VehicleControl()
-            if tick < config['ego_vehicle']['go_straight_ticks']:
-                # Initial straight phase
-                ego_control.throttle = config['ego_vehicle']['throttle'][
-                    'straight']
-                ego_control.steer = 0.0
-            elif tick < config['ego_vehicle']['go_straight_ticks'] + config[
-                    'ego_vehicle']['turn_ticks']:
-                # Turning phase
-                ego_control.throttle = config['ego_vehicle']['throttle']['turn']
-                ego_control.steer = config['ego_vehicle']['steer']['turn']
-            else:
-                # After turn straight phase
-                ego_control.throttle = config['ego_vehicle']['throttle'][
-                    'after_turn']
-                ego_control.steer = 0.0
-
-            ego_vehicle.apply_control(ego_control)
-
-            obstacle_control = carla.VehicleControl()
-            obstacle_control.throttle = config['obstacle_vehicle']['throttle']
-            obstacle_control.steer = config['obstacle_vehicle']['steer']
-            obstacle_vehicle.apply_control(obstacle_control)
-
-            # Write queued frames to video
-            while frame_queue:
-                frame_bgr = frame_queue.pop(0)
-
-                # Add collision probability text to the frame
-                collision_text = f"Collision Probability: {collision_prob:.4f}"
-                cv2.putText(frame_bgr, collision_text, (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2,
-                            cv2.LINE_AA)
-
-                if config['save_options']['save_video']:
-                    video_writer.write(frame_bgr)
-                if config['save_options']['save_images']:
-                    os.makedirs(os.path.join(output_dir, 'bev_images'), exist_ok=True)
-                    cv2.imwrite(os.path.join(output_dir, f'bev_images/frame_{tick}.png'), frame_bgr)
-
-            # After calculating collision_prob and collision_time
-            timestamp = tick * config['simulation']['delta_seconds']
-            with open(collision_prob_file, 'a') as f:
-                f.write(
-                    f'{timestamp:.2f},{tick},{config["simulation"]["delta_k"]},{collision_prob:.4f}\n'
-                )
-
-    finally:
-        # Add collision sensor cleanup
-        if collision_sensor is not None:
-            collision_sensor.stop()
-            collision_sensor.destroy()
-
-        # Cleanup
-        camera.stop()
-        if video_writer is not None:
-            video_writer.release()
-
-        if ego_vehicle is not None:
-            ego_vehicle.destroy()
-        if obstacle_vehicle is not None:
-            obstacle_vehicle.destroy()
-        if camera is not None:
-            camera.destroy()
-
-        client.reload_world()
-        world.apply_settings(original_settings)
-        # print(f"Video saved to {config['video']['filename']}")
-
-
-def run_adaptive_simulation(config, output_dir, no_risk_eval=False):
-    """Run a simulation with adaptive delta_k and braking based on collision probability"""
-    # Connect to CARLA
-    client = carla.Client(config['simulation']['host'],
-                          config['simulation']['port'])
-    client.set_timeout(10.0)
-    world = client.load_world("Town03")
-
-    # Set synchronous mode
-    original_settings = world.get_settings()
-    settings = world.get_settings()
-    settings.fixed_delta_seconds = config['simulation']['delta_seconds']
-    settings.synchronous_mode = config['simulation'].get('sync_mode', False)
-    settings.no_rendering_mode = False
-    world.apply_settings(settings)
-
-    blueprint_library = world.get_blueprint_library()
-
-    # Get spawn points
-    spawn_points = world.get_map().get_spawn_points()
-
-    # Setup ego vehicle spawn point
-    ego_spawn_point = spawn_points[0]
-    ego_spawn_point.location.x += config['ego_vehicle']['spawn_offset']['x']
-    ego_spawn_point.location.y += config['ego_vehicle']['spawn_offset']['y']
-    ego_spawn_point.rotation.yaw += config['ego_vehicle']['spawn_offset']['yaw']
-
-    obstacle_spawn_point = spawn_points[1]
-    obstacle_spawn_point.location.x = ego_spawn_point.location.x + config[
-        'obstacle_vehicle']['spawn_offset']['x']
-    obstacle_spawn_point.location.y = ego_spawn_point.location.y + config[
-        'obstacle_vehicle']['spawn_offset']['y']
-    obstacle_spawn_point.rotation.yaw = ego_spawn_point.rotation.yaw + config[
-        'obstacle_vehicle']['spawn_offset']['yaw']
-
-    # Spawn both vehicles
-    ego_bp = blueprint_library.find(config['ego_vehicle']['model'])
-    ego_bp.set_attribute('role_name', 'ego')
-    ego_vehicle = world.try_spawn_actor(ego_bp, ego_spawn_point)
-
-    obstacle_bp = blueprint_library.find(config['obstacle_vehicle']['model'])
-    obstacle_bp.set_attribute('role_name', 'obstacle')
-    obstacle_vehicle = world.try_spawn_actor(obstacle_bp, obstacle_spawn_point)
-
-    # Attach camera
-    camera_bp = blueprint_library.find('sensor.camera.rgb')
-    camera_bp.set_attribute('image_size_x', str(config['video']['width']))
-    camera_bp.set_attribute('image_size_y', str(config['video']['height']))
-    camera_bp.set_attribute('fov', config['camera']['fov'])
-
-    camera_transform = carla.Transform(
-        carla.Location(
-            x=ego_spawn_point.location.x + config['camera']['offset']['x'],
-            y=ego_spawn_point.location.y + config['camera']['offset']['y'],
-            z=config['camera']['height']), carla.Rotation(pitch=-90))
-    camera = world.spawn_actor(camera_bp, camera_transform, attach_to=None)
-
-    # Video writer setup
-    video_writer = None
-    if config['save_options']['save_video']:
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        video_writer = cv2.VideoWriter(
-            config['video']['filename'], fourcc, config['video']['fps'],
-            (config['video']['width'], config['video']['height']))
-
-    frame_queue = []
-
-    def camera_callback(image):
-        image.convert(carla.ColorConverter.Raw)
-        img_array = np.frombuffer(image.raw_data, dtype=np.uint8)
-        img_array = img_array.reshape((image.height, image.width, 4))
-        frame_bgr = img_array[:, :, :3].copy()
-
-        frame_queue.append(frame_bgr)
-
-        if config['save_options']['save_images']:
-            os.makedirs(os.path.join(output_dir, 'bev_images'), exist_ok=True)
-            cv2.imwrite(os.path.join(output_dir, f'bev_images/frame_{tick}.png'), frame_bgr)
-
-    camera.listen(camera_callback)
-
-    # Load trajectory and setup tracker
-    ego_trajectory = load_trajectory(config['trajectories']['ego'])
-
-    # Initialize tracker with initial delta_k
-    initial_delta_k = config['simulation']['delta_k']
-    current_delta_k = initial_delta_k
-
-    if not no_risk_eval:
-        if config['simulation']['tracker_type'] == 'ekf':
-            obstacle_tracker = EKFObstacleTracker(
-                ego_vehicle,
-                obstacle_vehicle,
-                dt=config['simulation']['delta_seconds'])
-        else:
-            obstacle_tracker = KFObstacleTracker(
-                ego_vehicle,
-                obstacle_vehicle,
-                dt=config['simulation']['delta_seconds'])
-
-        # Add ground truth tracker (using same type as regular tracker)
-        if config['simulation']['tracker_type'] == 'ekf':
-            ground_truth_tracker = EKFObstacleTracker(
-                ego_vehicle,
-                obstacle_vehicle,
-                dt=config['simulation']['delta_seconds'])
-        else:
-            ground_truth_tracker = KFObstacleTracker(
-                ego_vehicle,
-                obstacle_vehicle,
-                dt=config['simulation']['delta_seconds'])
-    else:
-        obstacle_tracker = None
-        ground_truth_tracker = None
-
-    # Initialize obstacle buffer
-    obstacle_buffer = []
-
-    # Add collision sensor
-    collision_bp = blueprint_library.find('sensor.other.collision')
-    collision_sensor = world.spawn_actor(collision_bp,
-                                         carla.Transform(),
-                                         attach_to=ego_vehicle)
-
-    has_collided = False
-
-    def collision_callback(event):
-        nonlocal has_collided
-        has_collided = True
-        # print(f"Collision detected with {event.other_actor}")
-
-    collision_sensor.listen(collision_callback)
-
-    # Setup CSV logging
-    # collision_probabilities_lmax_config_type.csv
-    collision_prob_file = os.path.join(output_dir,
-                                       f'collision_probabilities_{config["simulation"]["l_max"]}.csv')
-    if not os.path.exists(collision_prob_file):
-        with open(collision_prob_file, 'w') as f:
-            f.write(
-                'timestamp,tick,delta_k,collision_probability,ground_truth_probability\n'
+                base_name = "trajectory"
+            
+            # Generate PNG filename
+            png_filename = generate_descriptive_filename(
+                base_name,
+                'png',
+                sync_mode=sync_mode,
+                scenario_type=scenario_type
             )
+            png_path = os.path.join(dir_path, png_filename)
+            
+            # Generate PDF filename  
+            pdf_filename = generate_descriptive_filename(
+                base_name,
+                'pdf',
+                sync_mode=sync_mode,
+                scenario_type=scenario_type
+            )
+            pdf_path = os.path.join(dir_path, pdf_filename)
+            
+            # Save both formats
+            plt.savefig(png_path, dpi=300, bbox_inches='tight')
+            plt.savefig(pdf_path, dpi=300, bbox_inches='tight')
+            print(f"{vehicle_name} trajectory plots saved to:")
+            print(f"  PNG: {png_path}")
+            print(f"  PDF: {pdf_path}")
+        else:
+            # Fallback to original behavior if no mode/scenario info
+            plt.savefig(output_path, dpi=300, bbox_inches='tight')
+            print(f"Trajectory plot saved to {output_path}")
+    else:
+        plt.show()
+    
+    plt.close()
+
+
+def plot_dual_vehicle_trajectories(ego_ref, ego_actual, obs_ref, obs_actual, output_path=None, show_arrows=True, sync_mode=False, scenario_type=None, run_number=None):
+    """
+    Plot trajectories for both ego and obstacle vehicles in the same figure.
+    
+    Args:
+        ego_ref: Reference trajectory for ego vehicle
+        ego_actual: Actual trajectory for ego vehicle  
+        obs_ref: Reference trajectory for obstacle vehicle
+        obs_actual: Actual trajectory for obstacle vehicle
+        output_path: Path to save the plot
+        show_arrows: Whether to show direction arrows
+    """
+    sns.set_context("talk", font_scale=1.5)
+    plt.figure(figsize=(15, 12))
+    
+    # Plot ego vehicle trajectories with flipped axes
+    if ego_ref:
+        ego_ref_x = [point[0] for point in ego_ref]
+        ego_ref_y = [point[1] for point in ego_ref]
+        # Dotted line for reference, flipped axes
+        plt.plot(ego_ref_y, ego_ref_x, 'b:', linewidth=8, label='Ego Reference', alpha=0.2)
+        
+    if ego_actual:
+        ego_actual_x = [point[0] for point in ego_actual]
+        ego_actual_y = [point[1] for point in ego_actual]
+        # Solid line for actual, flipped axes
+        plt.plot(ego_actual_y, ego_actual_x, 'b-', linewidth=4, label='Ego Actual', alpha=0.6)
+        plt.plot(ego_actual_y[0], ego_actual_x[0], 'bo', markersize=8, label='Ego Start')
+        
+    # Plot obstacle vehicle trajectories with flipped axes
+    if obs_ref:
+        obs_ref_x = [point[0] for point in obs_ref]
+        obs_ref_y = [point[1] for point in obs_ref]
+        # Dotted line for reference, flipped axes
+        plt.plot(obs_ref_y, obs_ref_x, 'r:', linewidth=8, label='Obstacle Reference', alpha=0.2)
+        
+    if obs_actual:
+        obs_actual_x = [point[0] for point in obs_actual]
+        obs_actual_y = [point[1] for point in obs_actual]
+        # Solid line for actual, flipped axes
+        plt.plot(obs_actual_y, obs_actual_x, 'r-', linewidth=4, label='Obstacle Actual', alpha=0.6)
+        plt.plot(obs_actual_y[0], obs_actual_x[0], 'ro', markersize=8, label='Obstacle Start')
+    
+    plt.xlabel('X Position (m)')
+    plt.ylabel('Y Position (m)')
+    # plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    # if all_x and all_y:
+    plt.xlim(-180, -110)
+    plt.ylim(-30, 20)
+    
+    plt.gca().set_aspect('equal', adjustable='box')
+    
+    if output_path:
+        # Generate descriptive filenames for both PNG and PDF
+        if sync_mode is not None or scenario_type is not None:
+            # Extract directory and base name from output_path
+            dir_path = os.path.dirname(output_path)
+            base_name = "dual_vehicle_trajectory"
+            
+            # Generate PNG filename
+            png_filename = generate_descriptive_filename(
+                base_name,
+                'png',
+                sync_mode=sync_mode,
+                scenario_type=scenario_type,
+                run_number=run_number
+            )
+            png_path = os.path.join(dir_path, png_filename)
+            
+            # Generate PDF filename  
+            pdf_filename = generate_descriptive_filename(
+                base_name,
+                'pdf',
+                sync_mode=sync_mode,
+                scenario_type=scenario_type,
+                run_number=run_number
+            )
+            pdf_path = os.path.join(dir_path, pdf_filename)
+            
+            # Save both formats
+            plt.savefig(png_path, dpi=300, bbox_inches='tight')
+            plt.savefig(pdf_path, dpi=300, bbox_inches='tight')
+            print(f"Dual vehicle trajectory plots saved to:")
+            print(f"  PNG: {png_path}")
+            print(f"  PDF: {pdf_path}")
+        else:
+            # Fallback to original behavior if no mode/scenario info
+            plt.savefig(output_path, dpi=300, bbox_inches='tight')
+            plt.savefig(output_path.replace("png", "pdf"), dpi=300, bbox_inches='tight')
+            print(f"Dual vehicle trajectory plot saved to {output_path}")
+    else:
+        plt.show()
+        
+    plt.close()
+
+
+def run_first_simulation(config, ego_trajectory_file=None, obstacle_trajectory_file=None):
+    """Run the first simulation to generate both ego and obstacle vehicle trajectories"""
+    # Use trajectory files from config if none provided
+    if ego_trajectory_file is None:
+        ego_trajectory_file = config['trajectories']['ego']
+    if obstacle_trajectory_file is None:
+        obstacle_trajectory_file = config['trajectories']['obstacle']
+
+    client = carla.Client(config['simulation']['host'],
+                          config['simulation']['port'])
+    client.set_timeout(10.0)
+    world = client.load_world("Town03")
+
+    # Always use synchronous mode for consistent waypoint collection
+    original_settings = world.get_settings()
+    settings = world.get_settings()
+    settings.fixed_delta_seconds = config['simulation']['delta_seconds']
+    settings.synchronous_mode = True
+    settings.no_rendering_mode = False
+    world.apply_settings(settings)
+    
+    print(f"Using synchronous mode for trajectory collection (delta_seconds={settings.fixed_delta_seconds})")
+
+    blueprint_library = world.get_blueprint_library()
+
+    # Get spawn points
+    spawn_points = world.get_map().get_spawn_points()
+
+    # Setup ego vehicle spawn point
+    ego_spawn_point = spawn_points[0]
+    ego_spawn_point.location.x += config['ego_vehicle']['spawn_offset']['x']
+    ego_spawn_point.location.y += config['ego_vehicle']['spawn_offset']['y']
+    ego_spawn_point.rotation.yaw += config['ego_vehicle']['spawn_offset']['yaw']
+
+    # Setup obstacle vehicle spawn point
+    obstacle_spawn_point = spawn_points[1]
+    obstacle_spawn_point.location.x = ego_spawn_point.location.x + config['obstacle_vehicle']['spawn_offset']['x']
+    obstacle_spawn_point.location.y = ego_spawn_point.location.y + config['obstacle_vehicle']['spawn_offset']['y']
+    obstacle_spawn_point.rotation.yaw = ego_spawn_point.rotation.yaw + config['obstacle_vehicle']['spawn_offset']['yaw']
+
+    # Spawn both vehicles
+    ego_bp = blueprint_library.find(config['ego_vehicle']['model'])
+    ego_bp.set_attribute('role_name', 'ego')
+    ego_vehicle = world.try_spawn_actor(ego_bp, ego_spawn_point)
+    ego_vehicle.set_autopilot(False)
+    
+    obstacle_bp = blueprint_library.find(config['obstacle_vehicle']['model'])
+    obstacle_bp.set_attribute('role_name', 'obstacle')
+    obstacle_vehicle = world.try_spawn_actor(obstacle_bp, obstacle_spawn_point)
+    obstacle_vehicle.set_autopilot(False)
+
+    # Clear existing trajectory files
+    if os.path.exists(ego_trajectory_file):
+        os.remove(ego_trajectory_file)
+    if os.path.exists(obstacle_trajectory_file):
+        os.remove(obstacle_trajectory_file)
 
     try:
-        for tick in range(config['ego_vehicle']['go_straight_ticks'] +
-                          config['ego_vehicle']['turn_ticks'] +
-                          config['ego_vehicle']['after_turn_ticks']):
-
+        # Use ORIGINAL tick-based control to record accurate waypoints for collision scenarios
+        total_ticks = (config['ego_vehicle']['go_straight_ticks'] +
+                       config['ego_vehicle']['turn_ticks'] +
+                       config['ego_vehicle']['after_turn_ticks'])
+        
+        for tick in range(total_ticks):
             world.tick()
-
-            if has_collided:
-                # print("Collision detected! Stopping vehicles.")
-                ego_vehicle.apply_control(
-                    carla.VehicleControl(throttle=0.0, brake=1.0))
-                obstacle_vehicle.apply_control(
-                    carla.VehicleControl(throttle=0.0, brake=1.0))
-                break
-
-            current_transform = obstacle_vehicle.get_transform()
-            ground_truth_tracker.update(
-                (current_transform.location.x, current_transform.location.y,
-                 current_transform.rotation.yaw), tick)
-
-            obstacle_buffer.append(current_transform)
-            brake = False
-            max_collision_prob = 0.0
-            ground_truth_collision_prob = 0.0
-
-            if tick >= config['simulation']['l_max']:
-                obstacle_buffer.pop(0)
-
-                historical_transform = obstacle_buffer[0]
-
-                obstacle_tracker.update((historical_transform.location.x,
-                                         historical_transform.location.y,
-                                         historical_transform.rotation.yaw),
-                                        tick)
-
-                # Predict future positions and calculate collision probabilities
-                predicted_positions = obstacle_tracker.predict_future_position(
-                    int(config['simulation']['prediction_steps'] /
-                        current_delta_k))
-
-                max_collision_prob, collision_time, collision_probabilities = calculate_collision_probabilities(
-                    obstacle_tracker, predicted_positions, ego_trajectory, tick)
-                ground_truth_predictions = ground_truth_tracker.predict_future_position(
-                    int(config['simulation']['prediction_steps'] /
-                        current_delta_k))
-
-                ground_truth_max_prob, ground_truth_collision_time, ground_truth_probabilities = calculate_collision_probabilities(
-                    ground_truth_tracker, ground_truth_predictions,
-                    ego_trajectory, tick)
-                # Get current ego vehicle position
-                ego_transform = ego_vehicle.get_transform()
-                ego_pos = (ego_transform.location.x, ego_transform.location.y,
-                           math.radians(ego_transform.rotation.yaw))
-                obstacle_pos = (current_transform.location.x,
-                                current_transform.location.y,
-                                math.radians(current_transform.rotation.yaw))
-                max_prob_idx = collision_probabilities.index(max_collision_prob)
-                predicted_pos = predicted_positions[max_prob_idx]
-                ego_predicted_pos = ego_trajectory[tick + max_prob_idx]
-                ground_truth_collision_prob = ground_truth_max_prob
-                # Get predicted position with highest collision probability
-                # print(f"\nTick {tick}:")
-                # print("obstacle vehicle current position:")
-                # print(f"(x={obstacle_pos[0]:.2f}, y={obstacle_pos[1]:.2f}, yaw={obstacle_pos[2]:.2f})")
-                # print(f"Predicted obstacle position with max collision prob {max_collision_prob:.4f}:")
-                # print(f"(x={predicted_pos[0]:.2f}, y={predicted_pos[1]:.2f}, yaw={predicted_pos[2]:.2f})")
-                # # ego vehicle predicted position
-                # print(f"Current ego position: (x={ego_pos[0]:.2f}, y={ego_pos[1]:.2f}, yaw={ego_pos[2]:.2f})")
-
-                # print(f"Ego vehicle predicted position:")
-                # print(f"(x={ego_predicted_pos[0]:.2f}, y={ego_predicted_pos[1]:.2f}, yaw={ego_predicted_pos[2]:.2f})")
-                # print(f"Groundtruth collision probability:{ground_truth_collision_prob:.4f}")
-
-                # Adaptive behavior based on collision probability
-                if max_collision_prob > config['simulation'][
-                        'emergency_brake_threshold']:
-                    # Emergency brake
-                    brake = True
-                    print(
-                        f"Emergency brake activated! Collision probability: {max_collision_prob:.4f}"
-                    )
-
-                elif max_collision_prob > config['simulation'][
-                        'cautious_threshold']:
-                    # Increase tracking frequency (decrease delta_k)
-                    new_delta_k = config['simulation']['cautious_delta_k']
-                    if new_delta_k != current_delta_k:
-                        print(
-                            f"Adjusting delta_k from {current_delta_k} to {new_delta_k}"
-                        )
-                        current_delta_k = new_delta_k
-                        # drop the obstacle buffer to new delta_k
-                        for i in range(config['simulation']['l_max'] -
-                                       new_delta_k):
-                            obstacle_pos = obstacle_buffer.pop(0)
-                            # update obstacle tracker with the new position
-                            obstacle_tracker.update((obstacle_pos.location.x,
-                                                     obstacle_pos.location.y,
-                                                     obstacle_pos.rotation.yaw),
-                                                    tick)
-
-            if brake:
-                ego_control = carla.VehicleControl(throttle=0.0, brake=1.0)
+            
+            # Apply ORIGINAL tick-based controls to ego vehicle
+            ego_control = carla.VehicleControl()
+            if tick < config['ego_vehicle']['go_straight_ticks']:
+                # Initial straight phase
+                ego_control.throttle = config['ego_vehicle']['throttle']['straight']
+                ego_control.steer = 0.0
+            elif tick < config['ego_vehicle']['go_straight_ticks'] + config['ego_vehicle']['turn_ticks']:
+                # Turning phase
+                ego_control.throttle = config['ego_vehicle']['throttle']['turn']
+                ego_control.steer = config['ego_vehicle']['steer']['turn']
             else:
-                # Normal driving
-                ego_control = carla.VehicleControl()
-                if tick < config['ego_vehicle']['go_straight_ticks']:
-                    ego_control.throttle = config['ego_vehicle']['throttle'][
-                        'straight']
-                elif tick < config['ego_vehicle']['go_straight_ticks'] + config[
-                        'ego_vehicle']['turn_ticks']:
-                    ego_control.throttle = config['ego_vehicle']['throttle'][
-                        'turn']
-                    ego_control.steer = config['ego_vehicle']['steer']['turn']
-                else:
-                    ego_control.throttle = config['ego_vehicle']['throttle'][
-                        'after_turn']
+                # After turn straight phase
+                ego_control.throttle = config['ego_vehicle']['throttle']['after_turn']
+                ego_control.steer = 0.0
 
             ego_vehicle.apply_control(ego_control)
-
-            # Apply controls
+            
+            # Apply ORIGINAL tick-based controls to obstacle vehicle
             obstacle_control = carla.VehicleControl()
-
             if tick < config['obstacle_vehicle']['go_straight_ticks']:
                 # Initial straight phase
-                obstacle_control.throttle = config['obstacle_vehicle'][
-                    'throttle']['straight']
-                obstacle_control.steer = config['obstacle_vehicle']['steer'][
-                    'straight']
-            elif tick < config['obstacle_vehicle']['go_straight_ticks'] + config[
-                    'obstacle_vehicle']['turn_ticks']:
+                obstacle_control.throttle = config['obstacle_vehicle']['throttle']['straight']
+                obstacle_control.steer = config['obstacle_vehicle']['steer']['straight']
+            elif tick < config['obstacle_vehicle']['go_straight_ticks'] + config['obstacle_vehicle']['turn_ticks']:
                 # Turning phase
-                obstacle_control.throttle = config['obstacle_vehicle'][
-                    'throttle']['turn']
-                obstacle_control.steer = config['obstacle_vehicle']['steer'][
-                    'turn']
+                obstacle_control.throttle = config['obstacle_vehicle']['throttle']['turn']
+                obstacle_control.steer = config['obstacle_vehicle']['steer']['turn']
             else:
                 # After turn straight phase
-                obstacle_control.throttle = config['obstacle_vehicle'][
-                    'throttle']['after_turn']
-                obstacle_control.steer = config['obstacle_vehicle']['steer'][
-                    'after_turn']
+                obstacle_control.throttle = config['obstacle_vehicle']['throttle']['after_turn']
+                obstacle_control.steer = config['obstacle_vehicle']['steer']['after_turn']
 
             obstacle_vehicle.apply_control(obstacle_control)
+            
+            # Save both trajectories every tick
+            save_trajectory(ego_vehicle, ego_trajectory_file)
+            save_trajectory(obstacle_vehicle, obstacle_trajectory_file)
 
-            # Process camera frames
-            while frame_queue:
-                frame_bgr = frame_queue.pop(0)
+        print(f"Ego trajectory saved to {ego_trajectory_file}")
+        print(f"Obstacle trajectory saved to {obstacle_trajectory_file}")
 
-                # Add collision probability text to the frame
-                collision_text = f"Predicted Collision Probability: {max_collision_prob:.4f}"
-                cv2.putText(frame_bgr, collision_text, (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2,
-                            cv2.LINE_AA)
-
-                # Add ground truth collision probability text to the frame
-                ground_truth_collision_text = f"Groundtruth Collision Probability: {ground_truth_collision_prob:.4f}"
-                cv2.putText(frame_bgr, ground_truth_collision_text, (10, 60),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2,
-                            cv2.LINE_AA)
-
-                # Add delta_k text to the frame
-                delta_k_text = f"Current Latency: {current_delta_k * 10} ms"
-                cv2.putText(frame_bgr, delta_k_text, (10, 90),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2,
-                            cv2.LINE_AA)
-
-                if config['save_options']['save_video']:
-                    video_writer.write(frame_bgr)
-                if config['save_options']['save_images']:
-                    cv2.imwrite(
-                        os.path.join(
-                            output_dir,
-                            'bev_images/frame_{tick}.png').format(tick=tick),
-                        frame_bgr)
-
-            # Log data
-            timestamp = tick * config['simulation']['delta_seconds']
-            # Read existing content
-            try:
-                with open(collision_prob_file, 'r') as f:
-                    existing_content = f.read()
-            except FileNotFoundError:
-                existing_content = ''
-
-            # Write updated content
-            with open(collision_prob_file, 'w') as f:
-                f.write(
-                    existing_content +
-                    f'{timestamp:.2f},{tick},{current_delta_k},{max_collision_prob:.4f},{ground_truth_collision_prob:.4f}\n'
-                )
-    except Exception as e:
-        print(f"Error in simulation: {e}")
     finally:
-        # Cleanup
-        if collision_sensor is not None:
-            collision_sensor.stop()
-            collision_sensor.destroy()
-
-        camera.stop()
-        if video_writer is not None:
-            video_writer.release()
-
         if ego_vehicle is not None:
             ego_vehicle.destroy()
         if obstacle_vehicle is not None:
             obstacle_vehicle.destroy()
-        if camera is not None:
-            camera.destroy()
-
         client.reload_world()
         world.apply_settings(original_settings)
-        # print(f"Video saved to {config['video']['filename']}")
-        return has_collided, current_delta_k
 
 
 def run_adaptive_simulation_fogsim(config, output_dir, no_risk_eval=False):
@@ -1819,10 +2179,12 @@ def run_adaptive_simulation_fogsim(config, output_dir, no_risk_eval=False):
         obs, info = env.reset()
         print(f"Initial observation: {obs}")
         
-        # Run first simulation to generate ego trajectory if it doesn't exist
-        if not os.path.exists(config['trajectories']['ego']):
-            print("Generating ego trajectory...")
-            run_first_simulation(config)
+        # Run first simulation to generate trajectories if they don't exist
+        if not os.path.exists(config['trajectories']['ego']) or not os.path.exists(config['trajectories']['obstacle']):
+            print("Generating trajectories...")
+            run_first_simulation(config, 
+                               ego_trajectory_file=config['trajectories']['ego'],
+                               obstacle_trajectory_file=config['trajectories']['obstacle'])
         
         # Reload ego trajectory in handler
         if os.path.exists(config['trajectories']['ego']):
@@ -1832,6 +2194,20 @@ def run_adaptive_simulation_fogsim(config, output_dir, no_risk_eval=False):
         max_collision_prob = 0.0
         ground_truth_collision_prob = 0.0
         tick = 0
+        
+        #     # Attach camera
+#     camera_bp = blueprint_library.find('sensor.camera.rgb')
+#     camera_bp.set_attribute('image_size_x', str(config['video']['width']))
+#     camera_bp.set_attribute('image_size_y', str(config['video']['height']))
+#     camera_bp.set_attribute('fov', config['camera']['fov'])
+
+#     camera_transform = carla.Transform(
+#         carla.Location(
+#             x=ego_spawn_point.location.x + config['camera']['offset']['x'],
+#             y=ego_spawn_point.location.y + config['camera']['offset']['y'],
+#             z=config['camera']['height']), carla.Rotation(pitch=-90))
+#     camera = world.spawn_actor(camera_bp, camera_transform, attach_to=None)
+
         
         # Observation buffer for delayed tracking
         observation_buffer = []
@@ -1991,13 +2367,15 @@ def run_obstacle_only_simulation(config, trajectory_file=None):
     client.set_timeout(10.0)
     world = client.load_world("Town03")
 
-    # Set synchronous mode
+    # Set synchronous mode (ALWAYS use sync mode for trajectory collection)
     original_settings = world.get_settings()
     settings = world.get_settings()
     settings.fixed_delta_seconds = config['simulation']['delta_seconds']
-    settings.synchronous_mode = config['simulation'].get('sync_mode', False)
+    settings.synchronous_mode = True  # Force sync mode for consistent waypoint collection
     settings.no_rendering_mode = False
     world.apply_settings(settings)
+    
+    print(f"Using synchronous mode for obstacle trajectory collection (delta_seconds={settings.fixed_delta_seconds})")
 
     blueprint_library = world.get_blueprint_library()
 
@@ -2028,7 +2406,7 @@ def run_obstacle_only_simulation(config, trajectory_file=None):
         raise RuntimeError("Failed to spawn obstacle vehicle")
 
     try:
-        # Run for the same duration as the full simulation
+        # Use ORIGINAL tick-based control to record accurate waypoints for collision scenarios
         total_ticks = (config['ego_vehicle']['go_straight_ticks'] +
                        config['ego_vehicle']['turn_ticks'] +
                        config['ego_vehicle'].get('after_turn_ticks', 0))
@@ -2036,28 +2414,21 @@ def run_obstacle_only_simulation(config, trajectory_file=None):
         for tick in range(total_ticks):
             world.tick()
 
-            # Apply phase-based control to obstacle vehicle
+            # Apply ORIGINAL tick-based control to obstacle vehicle
             obstacle_control = carla.VehicleControl()
 
             if tick < config['obstacle_vehicle']['go_straight_ticks']:
                 # Initial straight phase
-                obstacle_control.throttle = config['obstacle_vehicle'][
-                    'throttle']['straight']
-                obstacle_control.steer = config['obstacle_vehicle']['steer'][
-                    'straight']
-            elif tick < config['obstacle_vehicle']['go_straight_ticks'] + config[
-                    'obstacle_vehicle']['turn_ticks']:
+                obstacle_control.throttle = config['obstacle_vehicle']['throttle']['straight']
+                obstacle_control.steer = config['obstacle_vehicle']['steer']['straight']
+            elif tick < config['obstacle_vehicle']['go_straight_ticks'] + config['obstacle_vehicle']['turn_ticks']:
                 # Turning phase
-                obstacle_control.throttle = config['obstacle_vehicle'][
-                    'throttle']['turn']
-                obstacle_control.steer = config['obstacle_vehicle']['steer'][
-                    'turn']
+                obstacle_control.throttle = config['obstacle_vehicle']['throttle']['turn']
+                obstacle_control.steer = config['obstacle_vehicle']['steer']['turn']
             else:
                 # After turn straight phase
-                obstacle_control.throttle = config['obstacle_vehicle'][
-                    'throttle']['after_turn']
-                obstacle_control.steer = config['obstacle_vehicle']['steer'][
-                    'after_turn']
+                obstacle_control.throttle = config['obstacle_vehicle']['throttle']['after_turn']
+                obstacle_control.steer = config['obstacle_vehicle']['steer']['after_turn']
 
             obstacle_vehicle.apply_control(obstacle_control)
             save_trajectory(obstacle_vehicle, trajectory_file)
@@ -2104,9 +2475,9 @@ def calculate_collision_probabilities(obstacle_tracker, predicted_positions,
     collision_time = collision_probabilities.index(
         max_collision_prob) if collision_probabilities else 0
 
-    print(
-        f"Tick {tick}: Max collision probability: {max_collision_prob:.4f} at time step {collision_time}"
-    )
+    # print(
+    #     f"Tick {tick}: Max collision probability: {max_collision_prob:.4f} at time step {collision_time}"
+    # )
 
     return max_collision_prob, collision_time, collision_probabilities
 
@@ -2203,16 +2574,17 @@ def run_monte_carlo_simulation(config, num_samples=10, output_dir='./results', u
         #     continue
 
         try:
-            # Generate trajectories
-            run_first_simulation(sample_config)
+            # Generate trajectories for both ego and obstacle vehicles
+            run_first_simulation(sample_config,
+                               ego_trajectory_file=sample_config['trajectories']['ego'],
+                               obstacle_trajectory_file=sample_config['trajectories']['obstacle'])
 
             # Run simulation and check for collision
-            if use_fogsim:
-                has_collided, current_delta_k = run_adaptive_simulation_fogsim(
-                        sample_config, output_dir, no_risk_eval)
-            else:
-                has_collided, current_delta_k = run_adaptive_simulation(
+            has_collided, current_delta_k = run_adaptive_simulation_fogsim(
                     sample_config, output_dir, no_risk_eval)
+            # else:
+            #     has_collided, current_delta_k = run_adaptive_simulation(
+            #         sample_config, output_dir, no_risk_eval)
 
             # Check if collision occurred
             if has_collided:
@@ -2232,11 +2604,6 @@ def run_monte_carlo_simulation(config, num_samples=10, output_dir='./results', u
                 'sample_num': sample,
                 'error': str(e)
             })
-
-        # Clean up trajectory files
-        for trajectory_file in sample_config['trajectories'].values():
-            if os.path.exists(trajectory_file):
-                os.remove(trajectory_file)
 
         if not os.path.exists(
                 os.path.join(output_dir, 'monte_carlo_results/statistics.csv')):
@@ -2366,6 +2733,9 @@ def main():
     
     # Add sync_mode to configuration
     base_config['simulation']['sync_mode'] = args.sync_mode
+    
+    # Add scenario type to configuration for filename generation
+    base_config['scenario_type'] = args.config_type
     
     # Update CARLA port
     base_config['simulation']['port'] = args.carla_port

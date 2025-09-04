@@ -1,0 +1,2 @@
+0902: 
+    - fix steering following issue, trajectory exactly follow to the reference and in sync mode two cars are collide

@@ -719,7 +719,7 @@ if __name__ == "__main__":
                         choices=['right_turn', 'left_turn', 'merge'],
                         default=['merge'],
                         help='Scenario configuration types to test (default: merge)')
-    parser.add_argument('--max_parallel', type=int, default=10,
+    parser.add_argument('--max_parallel', type=int, default=5,
                         help='Maximum number of parallel CARLA instances (default: 4)')
     
     args = parser.parse_args()
