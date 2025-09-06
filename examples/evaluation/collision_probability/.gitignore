@@ -1,3 +1,4 @@
 bev_images/
 __pycache__/
 *.csv
+sync_comparison_high_contention/

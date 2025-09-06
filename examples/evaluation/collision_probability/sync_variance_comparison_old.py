@@ -15,8 +15,6 @@ import threading
 import queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import docker
-import signal
-import sys
 
 class CarlaDockerManager:
     """Manages CARLA Docker containers for parallel execution"""
@@ -58,7 +56,6 @@ class CarlaDockerManager:
                 volumes={'/tmp/.X11-unix': {'bind': '/tmp/.X11-unix', 'mode': 'rw'}},
                 network_mode="host",  # Use host networking - no port mapping needed
                 command=f"/bin/bash ./CarlaUE4.sh -world-port={port} -RenderOffScreen -carla-rpc-port={port} -carla-streaming-port={port+1} -carla-secondary-port={port+2}",
-                # environment={"DISPLAY": ":0"},  # Set display for rendering
                 restart_policy={"Name": "no"}  # Don't restart automatically
             )
             
@@ -290,7 +287,7 @@ class CarlaDockerManager:
             print(f"Port {port} socket check failed: {e}")
             return False
 
-def run_simulation(sync_mode=False, config_type='merge', run_id=0, carla_port=2000):
+def run_simulation(sync_mode=False, config_type='merge', run_id=0, carla_port=2000, tm_port=8000):
     """
     Run a single simulation with specified parameters.
     
@@ -299,6 +296,7 @@ def run_simulation(sync_mode=False, config_type='merge', run_id=0, carla_port=20
         config_type (str): Configuration type ('right_turn', 'left_turn', 'merge')
         run_id (int): Run identifier for output directory
         carla_port (int): CARLA server port
+        tm_port (int): Traffic Manager port
         
     Returns:
         dict: Results including collision tick if collision occurred
@@ -311,10 +309,11 @@ def run_simulation(sync_mode=False, config_type='merge', run_id=0, carla_port=20
         'python', 'main.py',
         '--config_type', config_type,
         '--output_dir', output_dir,
-        '--no_risk_eval',  # Disable risk evaluation for cleaner comparison
+        # '--no_risk_eval',  # Disable risk evaluation for cleaner comparison
         '--use_fogsim',    # This ensures CollisionHandler is used
         # '--cautious_delta_k', '20',
         '--carla_port', str(carla_port),  # Add port specification
+        '--tm_port', str(tm_port),        # Add Traffic Manager port specification
     ]
     
     if sync_mode:
@@ -324,11 +323,19 @@ def run_simulation(sync_mode=False, config_type='merge', run_id=0, carla_port=20
         # Run simulation
         print(f"  Running {'synchronous' if sync_mode else 'asynchronous'} mode, run {run_id}...")
         print(f"  Command: {' '.join(cmd)}")
+        
+        # Add small delay before starting simulation to reduce resource conflicts
+        import time
+        import random
+        time.sleep(random.uniform(1, 3))  # Random delay between 1-3 seconds
+        
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)  # Reduced timeout
         
         if result.returncode != 0:
-            print(f"    Error: {result.stderr[:100]}")
-            return {'success': False, 'error': result.stderr[:100]}
+            print(f"    Return code: {result.returncode}")
+            print(f"    Stdout: {result.stdout[:200]}")
+            print(f"    Stderr: {result.stderr[:200]}")
+            return {'success': False, 'error': result.stderr[:200]}
         
         # Check for collision and extract tick
         collision_tick = extract_collision_tick(output_dir)
@@ -349,7 +356,7 @@ def run_simulation(sync_mode=False, config_type='merge', run_id=0, carla_port=20
         print(f"    Exception: {e}")
         return {'success': False, 'error': str(e)}
 
-def run_parallel_simulations(simulations, docker_manager, max_workers=4, log_file=None):
+def run_parallel_simulations(simulations, docker_manager, max_workers=4):
     """
     Run multiple simulations in parallel using multiple CARLA instances
     
@@ -357,7 +364,6 @@ def run_parallel_simulations(simulations, docker_manager, max_workers=4, log_fil
         simulations (list): List of simulation parameters (sync_mode, config_type, run_id)
         docker_manager (CarlaDockerManager): Docker container manager
         max_workers (int): Maximum number of parallel workers
-        log_file (str): Path to collision log file
         
     Returns:
         list: Results from all simulations
@@ -389,17 +395,12 @@ def run_parallel_simulations(simulations, docker_manager, max_workers=4, log_fil
                         continue
                     return {'success': False, 'error': 'Failed to start CARLA container after retries', 'run_id': run_id}
                 
-                # Run simulation
-                print(f"Running simulation {run_id} on port {carla_port}")
-                result = run_simulation(sync_mode, config_type, run_id, carla_port)
+                # Run simulation with unique Traffic Manager port
+                tm_port = carla_port + 3000  # Use port spacing to avoid conflicts (e.g., 2000->5000, 2010->5010)
+                print(f"Running simulation {run_id} on port {carla_port} with TM port {tm_port}")
+                result = run_simulation(sync_mode, config_type, run_id, carla_port, tm_port)
                 result['run_id'] = run_id
                 result['carla_port'] = carla_port
-                
-                # Log result immediately
-                if log_file:
-                    sync_mode_str = 'sync' if sync_mode else 'async'
-                    log_simulation_result(log_file, config_type, sync_mode_str, run_id, result)
-                
                 print(f"Completed simulation {run_id}: {'Success' if result.get('success', False) else 'Failed'}")
                 return result
                 
@@ -411,12 +412,7 @@ def run_parallel_simulations(simulations, docker_manager, max_workers=4, log_fil
                         docker_manager.return_port(carla_port)
                     time.sleep(10)  # Wait before retry
                 else:
-                    failed_result = {'success': False, 'error': f'Failed after {max_retries} attempts: {str(e)}', 'run_id': run_id}
-                    # Log the failed result
-                    if log_file:
-                        sync_mode_str = 'sync' if sync_mode else 'async'
-                        log_simulation_result(log_file, config_type, sync_mode_str, run_id, failed_result)
-                    return failed_result
+                    return {'success': False, 'error': f'Failed after {max_retries} attempts: {str(e)}', 'run_id': run_id}
             
             finally:
                 # Always cleanup after each simulation
@@ -425,12 +421,7 @@ def run_parallel_simulations(simulations, docker_manager, max_workers=4, log_fil
                     docker_manager.return_port(carla_port)
                     time.sleep(2)  # Give container time to fully stop
         
-        final_failed_result = {'success': False, 'error': 'Unknown error', 'run_id': run_id}
-        # Log the final failed result
-        if log_file:
-            sync_mode_str = 'sync' if sync_mode else 'async'
-            log_simulation_result(log_file, config_type, sync_mode_str, run_id, final_failed_result)
-        return final_failed_result
+        return {'success': False, 'error': 'Unknown error', 'run_id': run_id}
     
     # Use ThreadPoolExecutor for parallel execution
     with ThreadPoolExecutor(max_workers=min(max_workers, len(simulations))) as executor:
@@ -449,15 +440,9 @@ def run_parallel_simulations(simulations, docker_manager, max_workers=4, log_fil
             except Exception as e:
                 sync_mode, config_type, run_id = sim_params
                 print(f"Simulation {run_id} failed with exception: {e}")
-                exception_result = {'success': False, 'error': str(e), 'run_id': run_id}
-                # Log the exception result
-                if log_file:
-                    sync_mode_str = 'sync' if sync_mode else 'async'
-                    log_simulation_result(log_file, config_type, sync_mode_str, run_id, exception_result)
-                results.append(exception_result)
+                results.append({'success': False, 'error': str(e), 'run_id': run_id})
     
     return results
-
 
 def extract_collision_tick(output_dir):
     """
@@ -467,205 +452,70 @@ def extract_collision_tick(output_dir):
         output_dir (str): Directory containing simulation output
         
     Returns:
-        int or None: Collision tick if found, None otherwise
+        int or None: Collision tick if found, None if no collision or simulation failed
     """
-    # Check statistics file first
-    stats_file = Path(output_dir) / 'monte_carlo_results' / 'statistics.csv'
-    if stats_file.exists():
-        try:
-            with open(stats_file, 'r') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    if 'collision' in row and row['collision'].lower() == 'true':
-                        # Found collision, but need to get tick from elsewhere
-                        pass
-        except Exception:
-            pass
-    
-    # Check collision probabilities file
-    for file in Path(output_dir).glob('collision_probabilities*.csv'):
-        try:
-            with open(file, 'r') as f:
-                lines = f.readlines()
-                if len(lines) > 1:  # Has data beyond header
-                    # Get last line before potential collision
-                    last_line = lines[-1].strip()
-                    if last_line:
-                        parts = last_line.split(',')
-                        if len(parts) >= 2:
-                            tick = int(float(parts[1]))
-                            # Heuristic: if simulation stopped early, collision likely occurred
-                            # You may need to adjust this based on your simulation length
-                            if tick < 900:  # Assuming normal simulation is ~1000 ticks
-                                return tick + 1  # Collision likely at next tick
-        except Exception:
-            pass
-    
-    # Check simulation output text file if exists
+    # Check simulation output text file first - this is the most reliable source
     stats_txt = Path(output_dir) / 'monte_carlo_results' / 'statistics.txt'
     if stats_txt.exists():
         try:
             with open(stats_txt, 'r') as f:
                 content = f.read()
+                
+                # Check for bind errors or other simulation failures first
+                if 'bind error' in content or 'trying to create rpc server' in content:
+                    # This is a simulation failure, not a real collision
+                    return None
+                
                 if 'Number of collisions: 1' in content:
-                    # Collision occurred but couldn't extract exact tick
-                    return -1  # Sentinel value for "collision occurred but tick unknown"
+                    # Real collision occurred, now try to find the tick from collision probabilities file
+                    for file in Path(output_dir).glob('collision_probabilities*.csv'):
+                        try:
+                            with open(file, 'r') as csv_f:
+                                lines = csv_f.readlines()
+                                if len(lines) > 1:  # Has data beyond header
+                                    # Get last line - this is when simulation stopped (likely due to collision)
+                                    last_line = lines[-1].strip()
+                                    if last_line:
+                                        parts = last_line.split(',')
+                                        if len(parts) >= 2:
+                                            tick = int(float(parts[1]))
+                                            return tick + 1  # Collision likely occurred at next tick
+                        except Exception:
+                            continue
+                    
+                    # If we couldn't find tick from CSV, return a sentinel value
+                    return -1  # Real collision occurred but tick unknown
         except Exception:
             pass
     
+    # If no collision found in statistics, return None
     return None
-
-def log_simulation_result(log_file, scenario_type, sync_mode, run_id, result):
-    """Log a simulation result to the collision log file"""
-    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
-    success = result.get('success', False)
-    collision_occurred = result.get('collision_occurred', False) if success else False
-    collision_tick = result.get('collision_tick', '') if (success and collision_occurred) else ''
-    error = result.get('error', '') if not success else ''
-    
-    with open(log_file, 'a') as f:
-        f.write(f'{timestamp},{scenario_type},{sync_mode},{run_id},{success},{collision_occurred},{collision_tick},"{error}"\n')
-
-def save_progress(progress_file, config_type, completed_runs):
-    """Save progress to a file"""
-    progress_data = {}
-    if os.path.exists(progress_file):
-        try:
-            with open(progress_file, 'r') as f:
-                progress_data = json.load(f)
-        except:
-            progress_data = {}
-    
-    progress_data[config_type] = completed_runs
-    
-    with open(progress_file, 'w') as f:
-        json.dump(progress_data, f, indent=2)
-
-def load_progress(progress_file, config_type):
-    """Load progress from file"""
-    if not os.path.exists(progress_file):
-        return {'async': set(), 'sync': set()}
-    
-    try:
-        with open(progress_file, 'r') as f:
-            progress_data = json.load(f)
-        
-        config_progress = progress_data.get(config_type, {'async': [], 'sync': []})
-        
-        # Convert lists back to sets
-        return {
-            'async': set(config_progress.get('async', [])),
-            'sync': set(config_progress.get('sync', []))
-        }
-    except:
-        return {'async': set(), 'sync': set()}
-
-def get_completed_runs_from_log(log_file, config_type):
-    """Extract completed runs from collision log"""
-    completed = {'async': set(), 'sync': set()}
-    
-    if not os.path.exists(log_file):
-        return completed
-    
-    try:
-        with open(log_file, 'r') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                if row['scenario_type'] == config_type:
-                    run_id = int(row['run_id'])
-                    sync_mode = row['sync_mode']
-                    if sync_mode in completed:
-                        completed[sync_mode].add(run_id)
-    except Exception as e:
-        print(f"Warning: Could not parse collision log: {e}")
-    
-    return completed
-
-def get_all_results_from_log(log_file, config_type):
-    """Extract all collision ticks and success counts from collision log"""
-    results = {
-        'async_ticks': [],
-        'sync_ticks': [],
-        'async_success_count': 0,
-        'sync_success_count': 0
-    }
-    
-    if not os.path.exists(log_file):
-        return results
-    
-    try:
-        with open(log_file, 'r') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                if row['scenario_type'] == config_type:
-                    success = row['success'].lower() == 'true'
-                    collision_occurred = row['collision_occurred'].lower() == 'true'
-                    sync_mode = row['sync_mode']
-                    
-                    if success:
-                        if sync_mode == 'async':
-                            results['async_success_count'] += 1
-                        elif sync_mode == 'sync':
-                            results['sync_success_count'] += 1
-                        
-                        if collision_occurred and row['collision_tick']:
-                            try:
-                                collision_tick = int(float(row['collision_tick']))
-                                if collision_tick > 0:  # Valid collision tick
-                                    if sync_mode == 'async':
-                                        results['async_ticks'].append(collision_tick)
-                                    elif sync_mode == 'sync':
-                                        results['sync_ticks'].append(collision_tick)
-                            except ValueError:
-                                pass  # Invalid collision tick, skip
-                        
-    except Exception as e:
-        print(f"Warning: Could not parse collision log for results: {e}")
-    
-    return results
-
-def setup_signal_handlers(docker_manager):
-    """Setup signal handlers for graceful shutdown"""
-    def signal_handler(signum, frame):
-        print(f"\nReceived signal {signum}. Cleaning up...")
-        docker_manager.cleanup_all()
-        sys.exit(0)
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
 
 def run_comparison(num_runs=10, config_types=['merge'], max_parallel=4):
     """
     Run comparison between synchronous and asynchronous modes.
+    Modified to run max_parallel instances together for each run iteration,
+    collecting collision tick numbers and collision rates.
     
     Args:
-        num_runs (int): Number of runs for each mode
+        num_runs (int): Number of run iterations
         config_types (list): List of configuration types to test
-        max_parallel (int): Maximum number of parallel CARLA instances
+        max_parallel (int): Number of parallel CARLA instances per run iteration
         
     Returns:
         dict: Comparison results and statistics for all configurations
     """
     print(f"Starting Synchronous vs Asynchronous Mode Comparison")
     print(f"Configurations: {', '.join(config_types)}")
-    print(f"Number of runs per mode: {num_runs}")
+    print(f"Number of run iterations: {num_runs}")
+    print(f"Parallel instances per iteration: {max_parallel}")
     print("=" * 60)
     
-    # Create collision log file
-    collision_log_file = './sync_comparison/collision_log.csv'
-    progress_file = './sync_comparison/progress.json'
-    os.makedirs('./sync_comparison', exist_ok=True)
-    
-    # Initialize collision log with header only if file doesn't exist
-    if not os.path.exists(collision_log_file):
-        with open(collision_log_file, 'w') as f:
-            f.write('timestamp,scenario_type,sync_mode,run_id,success,collision_occurred,collision_tick,error\n')
+    # Clean up previous results
+    os.system('rm -rf ./sync_comparison')
     
     # Initialize Docker manager
     docker_manager = CarlaDockerManager(base_port=2000, max_instances=max_parallel)
-    
-    # Setup signal handlers for graceful shutdown
-    setup_signal_handlers(docker_manager)
     
     try:
         all_results = {}
@@ -678,53 +528,60 @@ def run_comparison(num_runs=10, config_types=['merge'], max_parallel=4):
             os.makedirs(f'./sync_comparison/{config_type}/sync', exist_ok=True)
             os.makedirs(f'./sync_comparison/{config_type}/async', exist_ok=True)
             
-            # Load progress and check which runs are already completed
-            completed_runs = get_completed_runs_from_log(collision_log_file, config_type)
+            # Collect results from all runs
+            async_results = []
+            sync_results = []
             
-            # Filter out completed runs
-            all_async_runs = set(range(num_runs))
-            all_sync_runs = set(range(num_runs))
+            # Run num_runs iterations, each with max_parallel instances
+            for run_iteration in range(num_runs):
+                print(f"\n{'-'*50}")
+                print(f"Run iteration {run_iteration + 1}/{num_runs} for {config_type}")
+                print(f"{'-'*50}")
+                
+                # Prepare simulation tasks for this iteration
+                # Run both sync and async modes in parallel up to max_parallel instances
+                iteration_simulations = []
+                
+                # Add async simulations (half of max_parallel, rounded down)
+                async_count = max_parallel // 2
+                for i in range(async_count):
+                    sim_id = run_iteration * max_parallel + i
+                    iteration_simulations.append((False, config_type, sim_id))
+                
+                # Add sync simulations (remaining slots)
+                sync_count = max_parallel - async_count
+                for i in range(sync_count):
+                    sim_id = run_iteration * max_parallel + async_count + i
+                    iteration_simulations.append((True, config_type, sim_id))
+                
+                print(f"Running {async_count} async and {sync_count} sync simulations in parallel...")
+                
+                # Run all simulations for this iteration in parallel
+                iteration_results = run_parallel_simulations(iteration_simulations, docker_manager, max_parallel)
+                
+                # Separate results by mode
+                for result in iteration_results:
+                    # Determine mode from simulation parameters
+                    sync_mode = None
+                    for sim in iteration_simulations:
+                        if sim[2] == result.get('run_id', -1):
+                            sync_mode = sim[0]
+                            break
+                    
+                    if sync_mode is True:
+                        sync_results.append(result)
+                    elif sync_mode is False:
+                        async_results.append(result)
+                
+                # Print iteration summary
+                iteration_collisions = sum(1 for r in iteration_results if r.get('success', False) and r.get('collision_occurred', False))
+                print(f"Iteration {run_iteration + 1} completed: {len(iteration_results)} simulations, {iteration_collisions} collisions")
             
-            remaining_async_runs = all_async_runs - completed_runs['async']
-            remaining_sync_runs = all_sync_runs - completed_runs['sync']
-            
-            print(f"Progress for {config_type}:")
-            print(f"  Async: {len(completed_runs['async'])}/{num_runs} completed, {len(remaining_async_runs)} remaining")
-            print(f"  Sync: {len(completed_runs['sync'])}/{num_runs} completed, {len(remaining_sync_runs)} remaining")
-            
-            # Prepare simulation tasks for parallel execution (only remaining runs)
-            async_simulations = [(False, config_type, i) for i in remaining_async_runs]
-            sync_simulations = [(True, config_type, i) for i in remaining_sync_runs]
-            
-            # Run asynchronous simulations in parallel
-            if async_simulations:
-                print(f"\nRunning ASYNCHRONOUS mode simulations for {config_type} in parallel...")
-                async_results = run_parallel_simulations(async_simulations, docker_manager, max_parallel, collision_log_file)
-            else:
-                print(f"\nAll ASYNCHRONOUS mode simulations for {config_type} already completed")
-                async_results = []
-            
-            # Run synchronous simulations in parallel  
-            if sync_simulations:
-                print(f"\nRunning SYNCHRONOUS mode simulations for {config_type} in parallel...")
-                sync_results = run_parallel_simulations(sync_simulations, docker_manager, max_parallel, collision_log_file)
-            else:
-                print(f"\nAll SYNCHRONOUS mode simulations for {config_type} already completed")
-                sync_results = []
-            
-            # Update progress
-            new_completed_async = completed_runs['async'] | {r['run_id'] for r in async_results if r.get('success', False)}
-            new_completed_sync = completed_runs['sync'] | {r['run_id'] for r in sync_results if r.get('success', False)}
-            
-            save_progress(progress_file, config_type, {
-                'async': list(new_completed_async),
-                'sync': list(new_completed_sync)
-            })
-            
-            # Extract collision ticks from ALL completed runs (not just current batch)
-            all_results_for_config = get_all_results_from_log(collision_log_file, config_type)
-            async_ticks = all_results_for_config['async_ticks']
-            sync_ticks = all_results_for_config['sync_ticks']
+            # Extract collision ticks
+            async_ticks = [r['collision_tick'] for r in async_results 
+                           if r['success'] and r['collision_occurred'] and r['collision_tick'] > 0]
+            sync_ticks = [r['collision_tick'] for r in sync_results 
+                          if r['success'] and r['collision_occurred'] and r['collision_tick'] > 0]
             
             # Calculate statistics for this configuration
             print(f"\n{'-'*60}")
@@ -737,12 +594,12 @@ def run_comparison(num_runs=10, config_types=['merge'], max_parallel=4):
                 'async': {
                     'collision_ticks': async_ticks,
                     'num_collisions': len(async_ticks),
-                    'success_runs': all_results_for_config['async_success_count']
+                    'success_runs': sum(1 for r in async_results if r['success'])
                 },
                 'sync': {
                     'collision_ticks': sync_ticks,
                     'num_collisions': len(sync_ticks),
-                    'success_runs': all_results_for_config['sync_success_count']
+                    'success_runs': sum(1 for r in sync_results if r['success'])
                 }
             }
             
@@ -828,7 +685,6 @@ def run_comparison(num_runs=10, config_types=['merge'], max_parallel=4):
     with open(results_file, 'w') as f:
         json.dump(final_results, f, indent=2)
     print(f"\nDetailed results saved to: {results_file}")
-    print(f"Collision log saved to: {collision_log_file}")
     
     return final_results
 
@@ -838,13 +694,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description='Compare collision tick variance between sync and async CARLA modes')
     parser.add_argument('--num_runs', type=int, default=10,
-                        help='Number of simulation runs per mode (default: 1)')
+                        help='Number of run iterations, each running max_parallel instances together (default: 20)')
     parser.add_argument('--config_types', type=str, nargs='+',
                         choices=['right_turn', 'left_turn', 'merge'],
-                        default=['right_turn', 'left_turn', 'merge'],
+                        default=['merge'],
                         help='Scenario configuration types to test (default: merge)')
-    parser.add_argument('--max_parallel', type=int, default=1,
-                        help='Maximum number of parallel CARLA instances (default: 4)')
+    parser.add_argument('--max_parallel', type=int, default=5,
+                        help='Number of parallel CARLA instances per iteration (default: 5)')
     
     args = parser.parse_args()
     
